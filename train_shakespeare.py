@@ -4,6 +4,8 @@ import torch.optim as optim
 import numpy as np
 import random
 from src.intelligent_network import IntelligentNetwork
+from src.visualization import plot_attention_matrix
+import os
 
 # --- Configuration ---
 BATCH_SIZE = 32
@@ -129,6 +131,10 @@ def train():
     
     print("Début de l'entraînement...")
     
+    # Création dossier plots
+    if not os.path.exists("plots"):
+        os.makedirs("plots")
+
     # On utilise plus de batches pour que l'entraînement soit plus significatif
     # (dans Colab vous pourrez ajuster si trop long, mais il faut de la donnée)
     batches_per_epoch = 200 
@@ -155,6 +161,15 @@ def train():
                 
         avg_loss = total_loss / batches_per_epoch
         print(f"=== Fin Epoch {epoch+1}, Moyenne Loss: {avg_loss:.4f} ===")
+        
+        # Visualisation
+        if (epoch + 1) % 2 == 0 or epoch == 0: # Un peu plus fréquent pour voir l'évolution au début
+             try:
+                plot_attention_matrix(model, filename=f"plots/attention_epoch_{epoch+1}.png", 
+                                      title=f"Attention Matrix - Epoch {epoch+1}")
+             except Exception as e:
+                 print(f"Erreur visualisation: {e}")
+
         print("Génération de texte :")
         print(generate_text(model, "The ", char2idx, idx2char, vocab_size))
         print("===============================================================")
