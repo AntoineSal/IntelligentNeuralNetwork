@@ -19,13 +19,14 @@ def plot_attention_matrix(model, filename="attention_matrix.png", title="Matrice
         all_keys = []
         
         for neuron in model.neurons:
-            q = neuron.query.unsqueeze(0) 
-            k = neuron.key.unsqueeze(0)
-            all_queries.append(q)
-            all_keys.append(k)
+            # Dynamique : On récupère l'état actuel de l'attention
+            q, k = neuron.get_attention_params(batch_size=1)
             
-        Q_matrix = torch.stack(all_queries, dim=1).to(device)
-        K_matrix = torch.stack(all_keys, dim=1).to(device)
+            all_queries.append(q.unsqueeze(1))
+            all_keys.append(k.unsqueeze(1))
+            
+        Q_matrix = torch.cat(all_queries, dim=1).to(device)
+        K_matrix = torch.cat(all_keys, dim=1).to(device)
         
         scores = torch.bmm(Q_matrix, K_matrix.transpose(1, 2))
         scores = scores / (model.key_query_dim ** 0.5)
@@ -60,4 +61,3 @@ def plot_attention_matrix(model, filename="attention_matrix.png", title="Matrice
     plt.savefig(filename)
     plt.close()
     print(f"Matrice d'attention sauvegardée dans '{filename}'")
-
