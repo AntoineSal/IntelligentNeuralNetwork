@@ -11,15 +11,17 @@ import time
 BATCH_SIZE = 64
 SEQ_LEN = 64
 LEARNING_RATE = 0.001
-EPOCHS = 30
+EPOCHS = 20
 HIDDEN_DIM = 256
 KEY_QUERY_DIM = 256
 SIGNAL_DIM = 256
 
 NUM_INPUT = 5
-NUM_TRANS_STATIC = 40  # Neurones à Key/Query fixes (Piliers)
-NUM_TRANS_DYNAMIC = 20 # Neurones à Key/Query dynamiques (Liquides)
+NUM_TRANS_STATIC = 40
+NUM_TRANS_DYNAMIC = 20
 NUM_ACTION = 5
+
+SPARSITY_WEIGHT = 0.001 # Pénalité d'entropie pour forcer la spécialisation
 
 PRINT_EVERY = 100
 
@@ -98,7 +100,17 @@ def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Utilisation du device : {device}")
     
-    text, chars, char2idx, idx2char, vocab_size = load_data('test/input.txt')
+    # Changement ici : on peut utiliser 'test/input_algo.txt' pour l'expérience Reverse
+    # ou 'test/input2.txt' pour le mixte.
+    # Par défaut, je laisse input2 (mixte) car c'est le setup courant.
+    # L'utilisateur peut changer manuellement le nom du fichier.
+    dataset_file = 'test/input2.txt' 
+    if not os.path.exists(dataset_file):
+        print(f"Attention: {dataset_file} introuvable, fallback sur input.txt")
+        dataset_file = 'test/input.txt'
+        
+    text, chars, char2idx, idx2char, vocab_size = load_data(dataset_file)
+    print(f"Dataset chargé: {dataset_file}")
     
     model = VectorizedIntelligentNetwork(
         input_size=vocab_size,
@@ -117,7 +129,7 @@ def train():
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.CrossEntropyLoss()
     
-    print("Début de l'entraînement HYBRIDE VECTORISÉ...")
+    print("Début de l'entraînement HYBRIDE VECTORISÉ avec Sparsity...")
     if not os.path.exists("plots_vec"): os.makedirs("plots_vec")
 
     batches_per_epoch = 200 
@@ -125,6 +137,7 @@ def train():
     for epoch in range(EPOCHS):
         start_time = time.time()
         total_loss = 0
+        total_entropy = 0
         
         for i in range(batches_per_epoch):
             inputs, targets = get_batch(text, char2idx, BATCH_SIZE, SEQ_LEN, vocab_size)
@@ -132,26 +145,55 @@ def train():
             
             optimizer.zero_grad()
             outputs = model(inputs) 
-            loss = criterion(outputs.reshape(-1, vocab_size), targets.reshape(-1))
+            
+            # 1. Loss de prédiction
+            main_loss = criterion(outputs.reshape(-1, vocab_size), targets.reshape(-1))
+            
+            # 2. Loss de Sparsité (Minimisation de l'Entropie d'Attention)
+            sparsity_loss = 0
+            if model.last_Q is not None and model.last_K is not None:
+                # On prend le premier échantillon du batch pour calculer l'entropie
+                q = model.last_Q[0] # (N, Dim)
+                k = model.last_K[0] # (N, Dim)
+                
+                # Calcul manuel de l'attention (car le modèle ne la retourne pas directement)
+                scores = torch.matmul(q, k.t()) / (KEY_QUERY_DIM ** 0.5)
+                attn = torch.softmax(scores, dim=1) # (N_receivers, N_senders)
+                
+                # Entropie H(p) = - sum(p * log(p))
+                # On veut minimiser H -> rendre la distribution "pointue" (choix clair)
+                entropy = -torch.sum(attn * torch.log(attn + 1e-9)) / attn.size(0) # Moyenne par neurone
+                
+                sparsity_loss = SPARSITY_WEIGHT * entropy
+                total_entropy += entropy.item()
+            
+            loss = main_loss + sparsity_loss
+            
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
             
-            total_loss += loss.item()
+            total_loss += main_loss.item() # On log la loss "pure" pour comparer
             
             if i % PRINT_EVERY == 0:
-                print(f"Batch {i}, Loss: {loss.item():.4f}")
+                print(f"Batch {i}, Loss: {main_loss.item():.4f}, Entropy: {entropy.item() if 'entropy' in locals() else 0:.4f}")
                 
         avg_loss = total_loss / batches_per_epoch
+        avg_entropy = total_entropy / batches_per_epoch
         duration = time.time() - start_time
-        print(f"=== Epoch {epoch+1} terminée en {duration:.2f}s | Moyenne Loss: {avg_loss:.4f} ===")
+        print(f"=== Epoch {epoch+1} en {duration:.2f}s | Loss: {avg_loss:.4f} | Avg Entropy: {avg_entropy:.4f} ===")
         
         if (epoch + 1) % 5 == 0 or epoch == 0:
             plot_attention_matrix(model, filename=f"plots_vec/attention_epoch_{epoch+1}.png", 
-                                  title=f"Hybrid Attention - Epoch {epoch+1}")
+                                  title=f"Sparse Attention (Ent={avg_entropy:.2f}) - Epoch {epoch+1}")
 
         print("Génération :")
-        print(generate_text(model, "The ", char2idx, idx2char, vocab_size))
+        # Pour l'algo Reverse, il faudrait un prompt adapté, ex: "REV: "
+        # Si on est sur input2 (Mixte), on garde "The " ou "MATH: "
+        prompt = "MATH: " if "input2" in dataset_file else "REV: "
+        if "input2" not in dataset_file and "input_algo" not in dataset_file: prompt = "The "
+            
+        print(generate_text(model, prompt, char2idx, idx2char, vocab_size))
         print("="*30)
 
 if __name__ == "__main__":
