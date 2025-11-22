@@ -8,16 +8,19 @@ import os
 import time
 
 # --- Config ---
-BATCH_SIZE = 64      # On peut augmenter car c'est plus efficace
+BATCH_SIZE = 64
 SEQ_LEN = 64
 LEARNING_RATE = 0.001
-EPOCHS = 30          # Poussons un peu plus loin
+EPOCHS = 30
 HIDDEN_DIM = 256
 KEY_QUERY_DIM = 256
 SIGNAL_DIM = 256
+
 NUM_INPUT = 5
-NUM_TRANS = 40
+NUM_TRANS_STATIC = 40  # Neurones à Key/Query fixes (Piliers)
+NUM_TRANS_DYNAMIC = 20 # Neurones à Key/Query dynamiques (Liquides)
 NUM_ACTION = 5
+
 PRINT_EVERY = 100
 
 def load_data(filepath):
@@ -64,7 +67,6 @@ def generate_text(model, start_str, char2idx, idx2char, vocab_size, length=100, 
     generated_str = start_str
     
     with torch.no_grad():
-        # Seed
         seed_tensor = torch.zeros(1, len(start_str), vocab_size).to(device)
         for t, char in enumerate(start_str):
             seed_tensor[0, t, char2idx[char]] = 1.0
@@ -75,7 +77,6 @@ def generate_text(model, start_str, char2idx, idx2char, vocab_size, length=100, 
         probs = torch.softmax(last_output / temperature, dim=1)
         next_idx = torch.multinomial(probs, 1).item()
         
-        # Loop
         current_input = torch.zeros(1, 1, vocab_size).to(device)
         current_input[0, 0, next_idx] = 1.0
         
@@ -103,19 +104,20 @@ def train():
         input_size=vocab_size,
         output_size=vocab_size,
         num_input_neurons=NUM_INPUT,
-        num_transmission_neurons=NUM_TRANS,
+        num_transmission_neurons=NUM_TRANS_STATIC,
+        num_dynamic_neurons=NUM_TRANS_DYNAMIC,
         num_action_neurons=NUM_ACTION,
         neuron_hidden_dim=HIDDEN_DIM,
         key_query_dim=KEY_QUERY_DIM,
         signal_dim=SIGNAL_DIM
     ).to(device)
     
-    print(f"Modèle Vectorisé créé avec {NUM_INPUT + NUM_TRANS + NUM_ACTION} neurones.")
+    print(f"Modèle Hybride créé avec {NUM_INPUT} In, {NUM_TRANS_STATIC} Stat, {NUM_TRANS_DYNAMIC} Dyn, {NUM_ACTION} Act.")
     
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.CrossEntropyLoss()
     
-    print("Début de l'entraînement VECTORISÉ...")
+    print("Début de l'entraînement HYBRIDE VECTORISÉ...")
     if not os.path.exists("plots_vec"): os.makedirs("plots_vec")
 
     batches_per_epoch = 200 
@@ -146,7 +148,7 @@ def train():
         
         if (epoch + 1) % 5 == 0 or epoch == 0:
             plot_attention_matrix(model, filename=f"plots_vec/attention_epoch_{epoch+1}.png", 
-                                  title=f"Vectorized Attention - Epoch {epoch+1}")
+                                  title=f"Hybrid Attention - Epoch {epoch+1}")
 
         print("Génération :")
         print(generate_text(model, "The ", char2idx, idx2char, vocab_size))
@@ -154,4 +156,3 @@ def train():
 
 if __name__ == "__main__":
     train()
-

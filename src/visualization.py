@@ -8,12 +8,6 @@ def plot_attention_matrix(model, filename="attention_matrix.png", title="Matrice
     """
     Version standard (Liste de neurones).
     """
-    # ... Code existant pour la version objet ...
-    # Pour éviter la duplication, on garde juste l'ancienne logique ici si nécessaire, 
-    # mais pour le projet final on peut switcher.
-    # Je laisse l'ancienne logique pour compatibilité ascendante.
-    
-    # Si c'est un modèle vectorisé, on redirige
     if hasattr(model, 'last_Q'):
         return plot_vectorized_attention_matrix(model, filename, title)
         
@@ -41,18 +35,13 @@ def plot_vectorized_attention_matrix(model, filename="attention_matrix.png", tit
     """
     model.eval()
     
-    # On a besoin d'un forward pour avoir last_Q/last_K.
-    # Si c'est vide, on fait un dummy forward sur un batch de 1
     if model.last_Q is None:
-         # On ne peut pas inventer l'input size facilement ici sans l'avoir stocké, 
-         # mais supposons que l'utilisateur l'appelle après un train step.
          print("Attention: Pas de Q/K en cache. Visualisation ignorée.")
          return
 
     with torch.no_grad():
-        # On prend le premier du batch
-        Q = model.last_Q[0:1] # (1, N, Dim)
-        K = model.last_K[0:1] # (1, N, Dim)
+        Q = model.last_Q[0:1] 
+        K = model.last_K[0:1] 
         
         scores = torch.bmm(Q, K.transpose(1, 2)) / (model.key_query_dim ** 0.5)
         attention_weights = torch.nn.functional.softmax(scores, dim=2)
@@ -66,13 +55,25 @@ def _save_plot(matrix, filename, title, model):
     labels = []
     # Detection des nombres de neurones selon le type de modele
     if hasattr(model, 'num_input'): # Vectorized
-        n_in, n_tr, n_act = model.num_input, model.num_trans, model.num_action
+        n_in = model.num_input
+        n_ts = getattr(model, 'num_trans_static', 0)
+        n_td = getattr(model, 'num_trans_dynamic', 0)
+        n_act = model.num_action
+        
+        # Si ancienne version vectorisée sans distinction static/dynamic
+        if n_ts == 0 and n_td == 0:
+             # Fallback sur l'attribut générique num_trans s'il existe
+             n_ts = getattr(model, 'num_trans', 0)
+        
+        for i in range(n_in): labels.append(f"I{i}")
+        for i in range(n_ts): labels.append(f"TS{i}")
+        for i in range(n_act): labels.append(f"A{i}")
+        for i in range(n_td): labels.append(f"TD{i}")
     else: # Standard
         n_in, n_tr, n_act = model.num_input_neurons, model.num_transmission_neurons, model.num_action_neurons
-        
-    for i in range(n_in): labels.append(f"I{i}")
-    for i in range(n_tr): labels.append(f"T{i}")
-    for i in range(n_act): labels.append(f"A{i}")
+        for i in range(n_in): labels.append(f"I{i}")
+        for i in range(n_tr): labels.append(f"T{i}")
+        for i in range(n_act): labels.append(f"A{i}")
         
     sns.heatmap(matrix, xticklabels=labels, yticklabels=labels, cmap="viridis", vmin=0, vmax=1)
     
