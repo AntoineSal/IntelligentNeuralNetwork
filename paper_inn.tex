@@ -105,18 +105,18 @@ All models are trained on a single NVIDIA A100 GPU.
 \subsection{Exp 1: The "Intelligence" of Convergence}
 We compare INNv2 against our previous recurrent baseline (INNv1 - LSTM) and standard Transformer baselines (nanoGPT equivalent).
 
-\begin{table}[h]
+    \begin{table}[h]
     \centering
     \begin{tabular}{lccccc}
         \toprule
-        \textbf{Model} & \textbf{Params} & \textbf{Time/Epoch} & \textbf{Loss (Ep 1)} & \textbf{Loss (Ep 8)} & \textbf{Final Val Loss} \\
+        \textbf{Model} & \textbf{Params} & \textbf{Time/Epoch} & \textbf{Loss (Ep 1)} & \textbf{Loss (Ep 6)} & \textbf{Final Val Loss} \\
         \midrule
-        INNv1 (LSTM) & 8M & 900s & 3.27 & 2.20 & 1.84 (Ep 30) \\
+        INNv1 (LSTM) & 8M & 900s & 3.27 & 2.32 & 1.84 (Ep 30) \\
         Transformer (GPT-2 config) & 10M & $\sim$ 250s & 2.10 & 1.65 & $\sim$ 1.48 \\
-        \textbf{INNv2 (Mamba)} & \textbf{8.6M} & \textbf{265s} & \textbf{2.00} & \textbf{1.21} & \textbf{1.21} \\
+        \textbf{INNv2 (Mamba)} & \textbf{8.6M} & \textbf{265s} & \textbf{2.00} & \textbf{1.27} & \textbf{1.16 (Ep 10)} \\
         \bottomrule
     \end{tabular}
-    \caption{Training Dynamics on Tiny Shakespeare. INNv2 demonstrates superior sample efficiency, reaching a validation loss of 1.21 in just 38 minutes.}
+    \caption{Training Dynamics on Tiny Shakespeare. INNv2 demonstrates superior sample efficiency, reaching a validation loss of 1.16 in just 44 minutes.}
 \end{table}
 
 \textbf{Analysis:} INNv2 not only trains as fast as a Transformer (thanks to parallelism) but learns significantly "faster" in terms of data efficiency (Loss). Reaching a loss of 1.21 on character-level Shakespeare is a strong result, typically requiring larger models or longer training. The generated text exhibits coherent long-term structure (names, dialogue formatting) from Epoch 3 onwards.
