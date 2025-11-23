@@ -16,26 +16,17 @@ class NeuronTokensINN(nn.Module):
         self.d_model = d_model
         self.n_neurons = n_neurons
         
-        # 1. Embedding & Positional Encoding
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.pos_encoder = PositionalEncoding(d_model, dropout, max_len=max_seq_len + n_neurons)
         
-        # 2. Neuron Tokens (Les agents persistants)
+        # Neuron Tokens: Latent agents memory
         self.neuron_tokens = nn.Parameter(torch.randn(1, n_neurons, d_model) * 0.02)
         
-        # 3. Transformer Backbone (Cœur du système)
+        # Transformer Backbone
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_head, dropout=dropout, batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         
-        # 4. Aggregation (Sequence queries Neurons)
-        self.neuron_aggregation = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=n_head,
-            dropout=dropout,
-            batch_first=True
-        )
-        
-        # 5. Output Head
+        # Output Head
         self.norm_final = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size)
         
@@ -51,59 +42,51 @@ class NeuronTokensINN(nn.Module):
             nn.init.zeros_(self.lm_head.bias)
 
     def forward(self, input_ids):
-        # input_ids: (B, L)
         B, L = input_ids.shape
         
-        # 1. Embed Sequence
-        x_seq = self.embedding(input_ids) # (B, L, D)
-        
-        # 2. Expand Neurons
+        x_seq = self.embedding(input_ids)
         x_neurons = self.neuron_tokens.expand(B, -1, -1)
         
-        # 3. Concatenate: [Neurons | Sequence]
-        x_full = torch.cat([x_neurons, x_seq], dim=1) # (B, N+L, D)
-        
-        # 4. Positional Encoding
+        # [Neurons | Sequence]
+        x_full = torch.cat([x_neurons, x_seq], dim=1)
         x_full = self.pos_encoder(x_full)
         
-        # 5. Custom Mask (Hybrid Graph/Causal)
-        mask = self._generate_inn_mask(self.n_neurons, L).to(input_ids.device)
+        # Masque "Prefix Causal"
+        mask = self._generate_prefix_causal_mask(self.n_neurons, L).to(input_ids.device)
         
-        # 6. Transformer Pass
-        # is_causal=False car le masque est custom et fourni manuellement
+        # Transformer Pass
         x_out = self.transformer(x_full, mask=mask)
         
-        # 7. Split
-        neurons_out = x_out[:, :self.n_neurons, :] # (B, N, D)
-        seq_out = x_out[:, self.n_neurons:, :]     # (B, L, D)
+        # Extract Sequence only (Les neurones ont fait leur job en influençant via l'attention)
+        x_seq_out = x_out[:, self.n_neurons:, :]
         
-        # 8. Aggregate: Sequence queries Neurons
-        # Cela permet à chaque token de demander "qu'est-ce que les neurones savent ?"
-        aggregated, _ = self.neuron_aggregation(
-            query=seq_out,
-            key=neurons_out,
-            value=neurons_out
-        )
-        
-        # 9. Residual & Output
-        x_final = seq_out + aggregated
-        x_final = self.norm_final(x_final)
-        logits = self.lm_head(x_final)
+        x_seq_out = self.norm_final(x_seq_out)
+        logits = self.lm_head(x_seq_out)
         
         return logits
 
-    def _generate_inn_mask(self, n_neurons, seq_len):
+    def _generate_prefix_causal_mask(self, n_neurons, seq_len):
         """
-        Masque Hybride Booléen (Plus stable pour PyTorch SDPA)
-        False = Visible, True = Masqué
+        Masque Prefix Causal :
+        - Les N premiers tokens (Neurones) se voient tous entre eux (Fully Connected Prefix).
+        - Les tokens de séquence voient tous les neurones + leur passé causal.
         """
         total_len = n_neurons + seq_len
         mask = torch.zeros(total_len, total_len, dtype=torch.bool)
         
-        # Règle 1: Les neurones ne voient pas les tokens (Look-ahead prevention)
+        # 1. Neurones entre eux : Visible (False) -> Déjà fait par zeros
+        
+        # 2. Neurones vers Tokens : Masqué (True)
+        # Les neurones ne doivent pas voir le futur de la séquence, ni même la séquence actuelle
+        # pour rester une "mémoire d'état" pure ou un "prompt".
+        # MAIS ATTENTION : Si on veut qu'ils apprennent du contexte, ils devraient voir le passé.
+        # Ici, on implémente un "Soft Prompt" apprenable statique (Prefix Tuning style).
+        # Si on veut une mémoire dynamique, il faudrait une architecture récurrente (segment-level).
+        # Pour un modèle causal standard, les neurones sont juste un contexte global constant.
         mask[0:n_neurons, n_neurons:] = True
         
-        # Règle 2: Tokens Causal (Triangulaire)
+        # 3. Tokens vers Neurones : Visible (False) -> Déjà fait par zeros
+        # 4. Tokens vers Tokens : Causal
         token_mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool), diagonal=1)
         mask[n_neurons:, n_neurons:] = token_mask
         
@@ -113,7 +96,6 @@ class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.1, max_len=5000):
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
-
         position = torch.arange(max_len).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
         pe = torch.zeros(max_len, 1, d_model)
