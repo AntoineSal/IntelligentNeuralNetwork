@@ -47,10 +47,14 @@ class MultiMambaBlock(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
+        # Init Mamba plus stable (Kaiming -> Xavier/Normal small)
         nn.init.xavier_uniform_(self.w_in)
         nn.init.xavier_uniform_(self.w_x)
-        nn.init.xavier_uniform_(self.w_dt)
+        
+        # DT Init spéciale (plus petite pour éviter explosion)
+        nn.init.uniform_(self.w_dt, -0.001, 0.001)
         nn.init.zeros_(self.b_dt)
+        
         nn.init.xavier_uniform_(self.w_out)
 
     def forward(self, x):
@@ -96,7 +100,9 @@ class MultiMambaBlock(nn.Module):
         ys = []
         
         for t in range(seq_len):
-            dt_t = F.softplus(dt[:, :, t, :]) 
+            # Clamp dt pour éviter exp(gros chiffre) = inf
+            dt_t = F.softplus(dt[:, :, t, :])
+            dt_t = torch.clamp(dt_t, max=10.0) # Protection NaN
             
             dA = torch.exp(dt_t.unsqueeze(-1) * A.unsqueeze(0))
             dB = dt_t.unsqueeze(-1) * B[:, :, t, :].unsqueeze(2)
@@ -110,4 +116,3 @@ class MultiMambaBlock(nn.Module):
             ys.append(y_t)
             
         return torch.stack(ys, dim=2)
-
