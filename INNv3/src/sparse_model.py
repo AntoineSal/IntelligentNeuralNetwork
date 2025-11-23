@@ -35,9 +35,14 @@ class SparseINN(nn.Module):
             for _ in range(num_layers)
         ])
         
-        # Output: Tous les neurones contribuent (Consensus)
-        self.out_proj = nn.Linear(num_neurons * d_model, vocab_size)
+        # Output: Consensus bottleneck pour réduire les params
+        # (N * D) -> D -> Vocab
+        self.consensus_proj = nn.Linear(num_neurons * d_model, d_model)
+        self.out_proj = nn.Linear(d_model, vocab_size)
         self.norm_f = nn.LayerNorm(d_model)
+        
+        # Tie weights (embedding et output partagent la même matrice = économie massive)
+        self.out_proj.weight = self.embedding.weight
         
         # Init
         self._init_weights()
@@ -45,11 +50,13 @@ class SparseINN(nn.Module):
     def _init_weights(self):
         # Init GPT-style pour la stabilité
         nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.out_proj.weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.out_proj.bias)
+        # out_proj partage les poids, donc on init juste le bias
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
         
-        # Input proj
+        # Input & Consensus proj
         nn.init.xavier_uniform_(self.input_proj.weight)
+        nn.init.xavier_uniform_(self.consensus_proj.weight)
 
     def forward(self, input_ids):
         batch_size, seq_len = input_ids.shape
@@ -66,10 +73,15 @@ class SparseINN(nn.Module):
         for layer in self.layers:
             x = layer(x)
             
-        # 4. Output
-        x = self.norm_f(x)
-        x_flat = x.permute(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
-        logits = self.out_proj(x_flat)
+        # 4. Output avec Consensus
+        x = self.norm_f(x) # Norm par neurone
+        x_flat = x.permute(0, 2, 1, 3).reshape(batch_size, seq_len, -1) # (B, L, N*D)
+        
+        # Bottleneck (Réduction dimensionnelle)
+        x_consensus = self.consensus_proj(x_flat) # (B, L, D)
+        
+        # Projection finale
+        logits = self.out_proj(x_consensus)
         
         return logits
 
