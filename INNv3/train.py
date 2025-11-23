@@ -6,22 +6,25 @@ import os
 import math
 import requests
 from src.model import INNv3
-# Import mixed precision
 from torch.cuda.amp import autocast, GradScaler
 
 # ==============================================================================
-# CONFIGURATION INNv3 (SCALING) - LOW MEMORY PROFILE
+# CONFIGURATION CORRIGÉE - INNv3 SCALING
 # ==============================================================================
 CONFIG = {
-    'batch_size': 8,       # Reduced from 20 to 8 to fit in memory
-    'accum_steps': 4,      # Effective batch size = 32
+    'batch_size': 32,        # Augmenté pour stabilité
+    'accum_steps': 1,        # Plus besoin avec 32 si la mémoire tient, sinon augmenter
     'seq_len': 64,         
-    'epochs': 10,          
+    'epochs': 20,          
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     'd_model': 256,
     'num_layers': 4,
     'max_neurons': 128,    
-    'growth_interval': 2,  
+    'growth_interval': 2,
+    'learning_rate': 5e-4,
+    'dropout': 0.2,          # Crucial pour WikiText
+    'grad_clip': 0.25,       # Agressif pour stabilité
+    'warmup_steps': 1000     # Crucial
 }
 
 # --- DATA LOADING ---
@@ -74,8 +77,28 @@ def get_batch(source, i, seq_len):
     target = source[i+1:i+1+seq_len].view(-1)
     return data, target
 
+def evaluate(model, data_source, criterion, vocab_size, seq_len):
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+    with torch.no_grad():
+        for i in range(0, data_source.size(0) - 1, seq_len):
+            data, targets = get_batch(data_source, i, seq_len)
+            data = data.t()
+            
+            with autocast():
+                logits = model(data)
+                loss = criterion(logits.reshape(-1, vocab_size), targets)
+            
+            # Accumulate correctly by token count
+            n_tokens = data.size(0) * data.size(1)
+            total_loss += loss.item() * n_tokens
+            total_tokens += n_tokens
+            
+    return total_loss / total_tokens
+
 def main():
-    print("=== TRAINING INNv3: SCALING DYNAMIC NETWORKS (Low Mem) ===")
+    print("=== TRAINING INNv3: CORRECTED LOOP ===")
     
     # 1. Data
     data_path = "data/wikitext-2"
@@ -92,7 +115,6 @@ def main():
     print(f"Vocab Size: {vocab_size}")
     
     device = torch.device(CONFIG['device'])
-    # IMPORTANT: Adjust batchify for small physical batch size
     train_data = batchify(corpus.train, CONFIG['batch_size'], device)
     val_data = batchify(corpus.valid, 10, device)
     
@@ -101,12 +123,13 @@ def main():
         vocab_size=vocab_size,
         d_model=CONFIG['d_model'],
         num_layers=CONFIG['num_layers'],
-        max_neurons=CONFIG['max_neurons']
+        max_neurons=CONFIG['max_neurons'],
+        dropout=CONFIG['dropout']
     ).to(device)
     
     print(f"Model Params: {sum(p.numel() for p in model.parameters()):,}")
     
-    # 3. Optimizers (Multi-Scale)
+    # 3. Optimizer & Scheduler
     router_params = []
     decoder_params = []
     neuron_params = []
@@ -121,15 +144,27 @@ def main():
             
     optimizer = optim.AdamW([
         {'params': router_params, 'lr': 1e-3},   
-        {'params': neuron_params, 'lr': 5e-4},   
+        {'params': neuron_params, 'lr': CONFIG['learning_rate']},   
         {'params': decoder_params, 'lr': 1e-4}   
-    ])
+    ], weight_decay=0.1)
+    
+    # OneCycleLR
+    steps_per_epoch = train_data.size(0) // CONFIG['seq_len']
+    total_steps = steps_per_epoch * CONFIG['epochs']
+    
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=[1e-3, CONFIG['learning_rate'], 1e-4],
+        total_steps=total_steps,
+        pct_start=CONFIG['warmup_steps'] / total_steps,
+        anneal_strategy='cos'
+    )
     
     criterion = nn.CrossEntropyLoss()
-    scaler = GradScaler() # For Mixed Precision
+    scaler = GradScaler()
     
     # 4. Train Loop
-    optimizer.zero_grad() # Init
+    optimizer.zero_grad()
     
     for epoch in range(1, CONFIG['epochs'] + 1):
         if epoch > 1 and epoch % CONFIG['growth_interval'] == 0:
@@ -137,46 +172,44 @@ def main():
             
         model.train()
         total_loss = 0
+        total_tokens = 0
         start_time = time.time()
         
         for batch, i in enumerate(range(0, train_data.size(0)-1, CONFIG['seq_len'])):
             data, targets = get_batch(train_data, i, CONFIG['seq_len'])
             data = data.t() # (B, L)
             
-            # Mixed Precision Forward
             with autocast():
                 logits = model(data)
                 loss = criterion(logits.reshape(-1, vocab_size), targets)
-                loss = loss / CONFIG['accum_steps'] # Normalize
             
-            # Backward
             scaler.scale(loss).backward()
             
-            if (batch + 1) % CONFIG['accum_steps'] == 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
+            # Unscale before clipping
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG['grad_clip'])
             
-            total_loss += loss.item() * CONFIG['accum_steps']
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            scheduler.step() # Step per batch
             
-            if batch % (100 * CONFIG['accum_steps']) == 0 and batch > 0:
-                cur_loss = total_loss / (100 * CONFIG['accum_steps'])
+            # Accumulate correctly
+            n_tokens = data.size(0) * data.size(1)
+            total_loss += loss.item() * n_tokens
+            total_tokens += n_tokens
+            
+            if batch % 100 == 0 and batch > 0:
+                cur_loss = total_loss / total_tokens
                 ppl = math.exp(cur_loss)
-                print(f"| epoch {epoch} | batch {batch} | loss {cur_loss:.2f} | ppl {ppl:.2f}")
+                elapsed = time.time() - start_time
+                print(f"| epoch {epoch} | {batch}/{steps_per_epoch} batches | lr {scheduler.get_last_lr()[1]:.2e} | loss {cur_loss:.2f} | ppl {ppl:.2f}")
                 total_loss = 0
+                total_tokens = 0
+                start_time = time.time()
                 
-        # Validation (No Grad, No Checkpointing needed usually)
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for i in range(0, val_data.size(0)-1, CONFIG['seq_len']):
-                data, targets = get_batch(val_data, i, CONFIG['seq_len'])
-                with autocast():
-                    logits = model(data.t())
-                    val_loss += len(data) * criterion(logits.reshape(-1, vocab_size), targets).item()
-        val_loss /= (len(val_data) // CONFIG['seq_len'])
+        # Validation
+        val_loss = evaluate(model, val_data, criterion, vocab_size, CONFIG['seq_len'])
         val_ppl = math.exp(val_loss)
         
         print(f"=== Epoch {epoch} | Val Loss {val_loss:.2f} | Val PPL {val_ppl:.2f} ===")

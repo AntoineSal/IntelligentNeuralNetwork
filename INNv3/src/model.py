@@ -45,9 +45,9 @@ class MixtureOfVocabularies(nn.Module):
         return full_logits
 
 class NeuronAttention(nn.Module):
-    def __init__(self, num_neurons, d_model, n_head=4):
+    def __init__(self, num_neurons, d_model, n_head=4, dropout=0.1):
         super().__init__()
-        self.attn = nn.MultiheadAttention(d_model, n_head, batch_first=True)
+        self.attn = nn.MultiheadAttention(d_model, n_head, batch_first=True, dropout=dropout)
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x):
@@ -55,15 +55,16 @@ class NeuronAttention(nn.Module):
         return self.norm(x + out)
 
 class ProgressiveINNLayer(nn.Module):
-    def __init__(self, max_neurons, d_model, initial_neurons=32):
+    def __init__(self, max_neurons, d_model, initial_neurons=32, dropout=0.1):
         super().__init__()
         self.max_neurons = max_neurons
         self.active_neurons = min(initial_neurons, max_neurons)
         self.d_model = d_model
         self.mamba_block = MultiMambaBlock(max_neurons, d_model)
-        self.attention = NeuronAttention(max_neurons, d_model)
+        self.attention = NeuronAttention(max_neurons, d_model, dropout=dropout)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout) # Dropout for activations
         self.mix_gate = nn.Parameter(torch.tensor(0.0))
         self.highway_proj = nn.Linear(d_model, d_model)
 
@@ -82,6 +83,7 @@ class ProgressiveINNLayer(nn.Module):
         x = x * mask
         res = x
         x = self.mamba_block(x)
+        x = self.dropout(x) # Dropout after Mamba
         x = self.norm1(x + res)
         x = x * mask
         
@@ -100,7 +102,6 @@ class ProgressiveINNLayer(nn.Module):
 
     def forward(self, x, highway):
         # Use checkpointing to save memory
-        # Inputs require grads for checkpointing to work effectively on them
         if self.training:
             return checkpoint(self._forward_impl, x, highway, use_reentrant=False)
         else:
@@ -122,12 +123,12 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 class INNv3(nn.Module):
-    def __init__(self, vocab_size, d_model=256, num_layers=4, max_neurons=256):
+    def __init__(self, vocab_size, d_model=256, num_layers=4, max_neurons=256, dropout=0.2):
         super().__init__()
         self.d_model = d_model
         self.vocab_size = vocab_size
         self.token_embeddings = nn.Embedding(vocab_size, d_model)
-        self.pos_embeddings = PositionalEncoding(d_model, max_len=512)
+        self.pos_embeddings = PositionalEncoding(d_model, dropout=dropout, max_len=512)
         self.router = AdaptiveRouter(vocab_size, num_neurons=max_neurons, d_model=d_model)
         
         self.layers = nn.ModuleList()
@@ -135,7 +136,7 @@ class INNv3(nn.Module):
             layer_max_neurons = max_neurons
             if i >= 2: layer_max_neurons = max_neurons // 2
             if i >= 4: layer_max_neurons = max_neurons // 4
-            self.layers.append(ProgressiveINNLayer(max_neurons=layer_max_neurons, d_model=d_model, initial_neurons=32))
+            self.layers.append(ProgressiveINNLayer(max_neurons=layer_max_neurons, d_model=d_model, initial_neurons=32, dropout=dropout))
         
         self.decoder = MixtureOfVocabularies(d_model, num_experts=4, vocab_size=vocab_size)
         self.highway_norm = nn.LayerNorm(d_model)
