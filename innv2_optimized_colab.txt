@@ -19,20 +19,20 @@ import torch
 
 CONFIG = {
     # --- Architecture ---
-    'd_model': 256,          # Taille standard (ni trop petit, ni trop gros)
-    'num_neurons': 32,       # REDUIT: 64 -> 32 pour sauver la VRAM
-    'n_layers': 4,           # Profondeur
+    'd_model': 512,          # BOOST: 256 -> 512
+    'num_neurons': 8,        # REDUIT: 32 -> 8
+    'n_layers': 6,           # BOOST: 4 -> 6
     'n_head': 4,             # Têtes d'attention inter-neurones
     'dropout': 0.2,          # Crucial pour WikiText
     
     # --- Entraînement ---
-    'batch_size': 8,         # REDUIT: 32 -> 8 (Physique)
-    'accum_steps': 4,        # AJOUTÉ: Simule batch 32
-    'seq_len': 64,           # Contexte
+    'batch_size': 8,         # Physique
+    'accum_steps': 4,        # Simule batch 32
+    'seq_len': 128,          # BOOST: 64 -> 128
     'epochs': 20,
-    'learning_rate': 5e-4,   # LR Standard
+    'learning_rate': 3e-4,   # REDUIT: 5e-4 -> 3e-4 (Safe)
     'warmup_steps': 1000,    # Douceur au démarrage
-    'grad_clip': 0.25,       # Stabilité Mamba
+    'grad_clip': 0.1,        # REDUIT: 0.25 -> 0.1 (Safe)
     
     # --- Système ---
     'device': 'cuda' if torch.cuda.is_available() else 'cpu'
