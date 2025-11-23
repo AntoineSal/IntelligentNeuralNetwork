@@ -28,16 +28,13 @@ class ParallelINN(nn.Module):
         ])
         
         # Output
-        # On utilise tous les neurones pour la décision finale (plus robuste)
-        # Ou juste les 'Action Neurons' comme avant. Gardons Action Neurons pour le principe.
-        self.n_action = max(1, num_neurons // 4) # Augmenté un peu (1/4 au lieu de 1/8)
-        self.out_proj = nn.Linear(self.n_action * d_model, vocab_size)
+        # Modification: On utilise TOUS les neurones pour la sortie pour garantir le flux de gradient
+        self.out_proj = nn.Linear(num_neurons * d_model, vocab_size)
         self.norm_f = nn.LayerNorm(d_model)
         
         self._init_weights()
 
     def _init_weights(self):
-        # Init standard pour Transformer/Mamba
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
@@ -48,26 +45,21 @@ class ParallelINN(nn.Module):
         # 1. Embedding (B, L, D)
         x = self.embedding(input_ids)
         
-        # 2. Projection Différenciée (CRUCIAL)
-        # (B, L, D) -> (B, L, N*D)
+        # 2. Projection Différenciée
         x = self.input_proj(x)
-        # (B, L, N*D) -> (B, L, N, D) -> (B, N, L, D)
         x = x.view(batch_size, seq_len, self.num_neurons, self.d_model)
         x = x.permute(0, 2, 1, 3)
         
-        # 3. Layers
         for layer in self.layers:
             x = layer(x)
             
         x = self.norm_f(x)
         
-        # 4. Action Output
-        # On prend les derniers neurones
-        action_out = x[:, -self.n_action:, :, :] # (B, n_act, L, D)
-        action_out = action_out.permute(0, 2, 1, 3) # (B, L, n_act, D)
-        action_out = action_out.reshape(batch_size, seq_len, -1) # (B, L, n_act*D)
+        # 4. Output Massive (Tous les neurones)
+        # (B, N, L, D) -> (B, L, N, D) -> (B, L, N*D)
+        out_flat = x.permute(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
         
-        logits = self.out_proj(action_out)
+        logits = self.out_proj(out_flat)
         return logits
 
 class INNLayer(nn.Module):
