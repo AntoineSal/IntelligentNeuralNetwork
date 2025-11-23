@@ -94,28 +94,18 @@ class NeuronTokensINN(nn.Module):
 
     def _generate_inn_mask(self, n_neurons, seq_len):
         """
-        Masque Hybride :
-        - Neurons entre eux : Visible (Fully Connected Graph)
-        - Neurons vers Tokens : Invisible (Pas de look-ahead)
-        - Tokens vers Neurons : Visible (Lecture Mémoire)
-        - Tokens entre eux : Causal (Autoregressive)
+        Masque Hybride Booléen (Plus stable pour PyTorch SDPA)
+        False = Visible, True = Masqué
         """
         total_len = n_neurons + seq_len
-        mask = torch.zeros(total_len, total_len)
+        mask = torch.zeros(total_len, total_len, dtype=torch.bool)
         
-        # Règle 1: Les neurones ne voient pas le futur (ni les tokens actuels pour simplifier)
-        # En fait, si on veut que les neurones soient une mémoire, ils ne doivent dépendre que de l'état précédent.
-        # Ici, on est dans un Transformer non-récurrent (sur la dim batch).
-        # Donc les neurones ne voient que les neurones.
-        mask[0:n_neurons, n_neurons:] = float('-inf')
+        # Règle 1: Les neurones ne voient pas les tokens (Look-ahead prevention)
+        mask[0:n_neurons, n_neurons:] = True
         
-        # Règle 2: Tokens voient Neurons + Tokens passés
-        # La partie token-token est triangulaire causale
-        token_mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1)
-        mask[n_neurons:, n_neurons:] = token_mask * float('-inf')
-        
-        # Règle 3: Neurons-Neurons = 0 (Full visible) -> Déjà fait par zeros()
-        # Règle 4: Tokens-Neurons = 0 (Full visible) -> Déjà fait par zeros()
+        # Règle 2: Tokens Causal (Triangulaire)
+        token_mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool), diagonal=1)
+        mask[n_neurons:, n_neurons:] = token_mask
         
         return mask
 
