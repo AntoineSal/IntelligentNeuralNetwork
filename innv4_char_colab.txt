@@ -157,15 +157,33 @@ class MambaCore(nn.Module):
         ys = []
         
         # Pré-calculs vectorisés
+        # dt: (B, L, D) -> (B, L, D, 1)
         dt_unsqueeze = dt.unsqueeze(-1)
-        dA = torch.exp(dt_unsqueeze * A) # (B, L, D, N)
-        dB = dt_unsqueeze * B.unsqueeze(2) # (B, L, D, N)
-        u_unsqueeze = u.unsqueeze(-1) # (B, L, D, 1)
+        
+        # A: (D, N) -> (1, 1, D, N)
+        A_broadcast = A.view(1, 1, d_inner, -1)
+        
+        # dA: (B, L, D, N)
+        dA = torch.exp(dt_unsqueeze * A_broadcast)
+        
+        # B: (B, L, N) -> (B, L, 1, N)
+        B_broadcast = B.unsqueeze(2)
+        
+        # dB: (B, L, D, 1) * (B, L, 1, N) -> (B, L, D, N)
+        dB = dt_unsqueeze * B_broadcast
+        
+        # u: (B, L, D) -> (B, L, D, 1)
+        u_unsqueeze = u.unsqueeze(-1)
+        
+        # C: (B, L, N) -> (B, L, 1, N)
+        C_broadcast = C.unsqueeze(2)
         
         # Boucle optimisée (moins d'ops par tour)
         for t in range(seq_len):
+            # h: (B, D, N)
             h = dA[:, t] * h + dB[:, t] * u_unsqueeze[:, t]
-            y_t = torch.sum(h * C[:, t].unsqueeze(2), dim=-1)
+            # y_t: sum( (B, D, N) * (B, 1, N) ) -> (B, D)
+            y_t = torch.sum(h * C_broadcast[:, t], dim=-1)
             ys.append(y_t)
             
         y = torch.stack(ys, dim=1)
