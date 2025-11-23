@@ -168,8 +168,8 @@ class SparseNeuronAttention(nn.Module):
             # On garde seulement les Top-K valeurs par query
             top_scores, top_indices = torch.topk(scores, self.top_k, dim=-1)
             
-            # On crée un masque de -inf
-            mask = torch.full_as(scores, float('-inf'))
+            # On crée un masque de -inf (Compatible old PyTorch)
+            mask = torch.full_like(scores, float('-inf'))
             
             # On remplit les valeurs aux indices top-k
             mask.scatter_(-1, top_indices, top_scores)
