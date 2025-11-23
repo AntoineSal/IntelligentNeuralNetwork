@@ -1,20 +1,48 @@
 \documentclass[a4paper,11pt]{article}
 
+% --- Packages ---
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
 \usepackage{geometry}
-\usepackage{amsmath}
-\usepackage{amssymb}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
 \usepackage{graphicx}
+\usepackage{booktabs} % Pour les tableaux professionnels
 \usepackage{hyperref}
-\usepackage{booktabs}
-\usepackage{natbib}
-\usepackage{microtype}
+\usepackage{natbib}   % Gestion des citations
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{microtype} % Amélioration typographique
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{xcolor}
 
+% --- Configuration ---
 \geometry{hmargin=2.5cm,vmargin=2.5cm}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
 
+% --- Commandes Mathématiques ---
+\newcommand{\Real}{\mathbb{R}}
+\newcommand{\bx}{\mathbf{x}}
+\newcommand{\bh}{\mathbf{h}}
+\newcommand{\bA}{\mathbf{A}}
+\newcommand{\bB}{\mathbf{B}}
+\newcommand{\bC}{\mathbf{C}}
+\newcommand{\bD}{\mathbf{D}}
+\newcommand{\bW}{\mathbf{W}}
+\newcommand{\softmax}{\text{softmax}}
+
+% --- Titre ---
 \title{\textbf{Intelligence Is All You Need}\\ \large Scaling Dynamic Neural Graphs with State Space Models}
-\author{Antoine Salomon}
+\author{
+  \textbf{Antoine Salomon} \\
+  Independent Researcher \\
+  \texttt{antoine.salomon@example.com}
+}
 \date{\today}
 
 \begin{document}
@@ -22,127 +50,159 @@
 \maketitle
 
 \begin{abstract}
-The dominance of Transformer architectures has shifted the focus of deep learning from modular, biologically-inspired designs to monolithic, static layers optimized for parallel computation. While highly effective, this approach sacrifices the dynamic routing and functional specialization inherent to biological intelligence. In this work, we propose the \textbf{Intelligent Neurons Network (INN)}, a novel architecture that reimagines the neural network as a graph of stateful agents interacting via a differentiable attention mechanism. 
-We introduce \textbf{INNv2}, a scalable implementation leveraging State Space Models (Mamba) to achieve $O(L)$ inference complexity and parallelizable training. We demonstrate that INNv2 converges \textbf{20x faster} than recurrent baselines on character-level language modeling, reaching a validation loss of \textbf{1.21} on the Shakespeare benchmark in under 40 minutes. Furthermore, we show that the architecture naturally exhibits emergent modularity on multi-task arithmetic/literary benchmarks. Our results suggest that "fluid topology" is not only biologically plausible but computationally superior to static baselines at scale.
+The dominance of Transformer architectures has shifted the focus of deep learning from modular, biologically-inspired designs to monolithic, static layers optimized for parallel computation. While highly effective, this approach sacrifices the dynamic routing and functional specialization inherent to biological intelligence ("System 2" thinking). In this work, we propose the \textbf{Intelligent Neurons Network (INN)}, a novel architecture that reimagines the neural network as a graph of stateful agents interacting via a differentiable attention mechanism. 
+We introduce \textbf{INNv2}, a scalable implementation leveraging Selective State Space Models (Mamba) to achieve linear inference complexity $O(L)$ and parallelizable training. We demonstrate that INNv2 converges \textbf{comparably to Transformer baselines} on character-level language modeling tasks (reaching 1.16 validation loss on Tiny Shakespeare), while exhibiting emergent modularity on multi-task arithmetic/literary benchmarks. Our results suggest that decoupling memory (SSM) from routing (Attention) is a viable path toward more interpretable and adaptive architectures.
 \end{abstract}
 
 \section{Introduction}
 
-Biological brains are not static matrices. They are dynamic graphs where functional sub-circuits are recruited on demand ("System 2" thinking) or automated into reflexes ("System 1" thinking) \citep{kahneman2011thinking}. In contrast, current Large Language Models (LLMs) process every token using the full capacity of the network, leading to significant computational redundancy and a lack of interpretability.
+Contemporary Deep Learning is dominated by the Transformer architecture \citep{vaswani2017attention}. While remarkably successful, Transformers operate as static computational graphs: every token is processed by the entire network depth, regardless of the task's complexity. This contrasts with biological neural networks, which exhibit dynamic routing, recruiting specialized sub-circuits on demand \citep{kahneman2011thinking}.
 
-The quest for modular Deep Learning has led to architectures such as Mixture of Experts (MoE) \citep{shazeer2017outrageously} or Routing Networks. However, these approaches often rely on coarse-grained routing (routing between layers or large blocks). We propose a more granular approach: \textbf{The Intelligent Neuron}.
-
-We define an Intelligent Neuron as a computational unit that possesses:
+We argue that the next step in architectural evolution lies in bridging the gap between \textbf{Graph Neural Networks (GNNs)} (modular, dynamic) and \textbf{Sequence Models} (scalable, parallel). We introduce the \textbf{Intelligent Neuron}, a computational unit defined by:
 \begin{enumerate}
-    \item \textbf{Memory:} A compressed state history (via LSTM or SSM) allowing it to track long-term dependencies locally.
-    \item \textbf{Intent:} A query vector ($Q$) determining what information it needs from the network.
-    \item \textbf{Identity:} A key vector ($K$) determining what information it broadcasts to others.
+    \item \textbf{Local Memory:} A compressed history of the signal (via State Space Models).
+    \item \textbf{Selective Communication:} A learnable interface (Keys/Queries) to route information dynamically.
 \end{enumerate}
 
-By connecting these neurons in a learnable graph, we create a "Liquid Network" that rewires itself at every timestep. Our contributions are:
-\begin{itemize}
-    \item A formal definition of the Intelligent Neuron and its dynamic routing protocol.
-    \item \textbf{INNv2}, a fully parallelized implementation using State Space Models (Mamba) to bypass the sequential bottleneck of RNNs.
-    \item Empirical evidence of State-of-the-Art (SOTA) convergence speed and performance on the Tiny Shakespeare benchmark compared to equivalent-sized baselines.
-\end{itemize}
+Our contribution, \textbf{INNv2}, replaces the traditional Multi-Layer Perceptron (MLP) layers of Transformers with a population of these independent Mamba-based neurons, interacting via a global "Neuron Attention" mechanism. This yields an architecture that is both biologically plausible and computationally efficient on modern hardware.
 
 \section{Related Work}
 
-\textbf{Recurrent Neural Networks (RNNs):} Traditional LSTMs \citep{hochreiter1997long} capture temporal dynamics but suffer from sequential training ($O(L)$ time) and limited context windows. Our V1 architecture relied on LSTMs but introduced dynamic routing between units.
+\paragraph{Recurrent Neural Networks (RNNs).}
+Traditional RNNs like LSTM \citep{hochreiter1997long} capture temporal dynamics but suffer from sequential training bottlenecks ($O(L)$ time complexity). Our INNv1 architecture utilized LSTMs, confirming the functional viability of dynamic routing but revealing severe scalability limits.
 
-\textbf{Transformers & Attention:} The Transformer \citep{vaswani2017attention} solved the training bottleneck via parallelism but introduced a quadratic inference cost ($O(L^2)$) and a static layer topology. Our INNv2 keeps the parallelism but moves the attention mechanism from the temporal dimension ("Time-Mixing") to the neuronal dimension ("Channel-Mixing"), similar to the approach in \textit{Synthesizer} or \textit{MLP-Mixer}.
+\paragraph{Transformers and Attention.}
+Transformers solve the training bottleneck via parallelism but incur quadratic inference costs ($O(L^2)$) with respect to sequence length. Several works have attempted to linearize attention (Linear Transformers, Performer) or sparse attention patterns. Our work differs by applying attention \textit{across the neuron dimension} ($N$) rather than the time dimension ($L$).
 
-\textbf{State Space Models (SSMs):} Recent advances like S4 \citep{gu2021efficiently} and Mamba \citep{gu2023mamba} have popularized Linear Recurrent Units that can be trained convolutionally. INNv2 leverages Mamba blocks as the internal "brain" of each neuron, providing the memory capacity of an RNN with the training speed of a Transformer.
+\paragraph{State Space Models (SSMs).}
+Structured State Space Models like S4 \citep{gu2021efficiently} and Mamba \citep{gu2023mamba} offer linear-time scaling ($O(L)$) and parallel training. Mamba introduces input-dependent selection mechanisms. INNv2 adopts Mamba as the internal "engine" of each neuron, effectively parallelizing the memory update.
 
-\section{The Intelligent Neurons Architecture}
+\paragraph{Dynamic Routing & MoE.}
+Mixture of Experts (MoE) \citep{shazeer2017outrageously} introduces sparsity by routing tokens to specific experts. INNv2 can be seen as a fine-grained, differentiable MoE where every neuron is a potential expert, and routing is determined by a continuous attention matrix rather than a discrete router.
+
+\section{Methodology: The INN Architecture}
+
+The INNv2 architecture consists of a stack of $K$ layers. Each layer alternates between two phases: \textbf{Intra-Neuron Processing} (Time-Mixing) and \textbf{Inter-Neuron Communication} (Channel-Mixing).
 
 \subsection{Micro-Architecture: The Mamba Neuron}
-Unlike a perceptron ($y = \sigma(Wx)$), an Intelligent Neuron is a vector processor. Let $h_t \in \mathbb{R}^d$ be the internal state of neuron $i$. In INNv2, the update rule is governed by a Selective State Space Model (Mamba Block).
+Let $N$ be the number of neurons per layer, and $d$ the dimension of each neuron's state.
+Each neuron $i \in \{1, \dots, N\}$ processes its temporal input stream $\bx^{(i)} \in \Real^{L \times d}$ independently using a Mamba Block.
 
-Given an input stream $x$, the neuron computes:
-\begin{align*}
-    h'_t &= \mathbf{A}h'_{t-1} + \mathbf{B}x_t \\
-    y_t &= \mathbf{C}h'_t + \mathbf{D}x_t
-\end{align*}
-where $\mathbf{A, B, C}$ are time-varying parameters learned by the neuron. This allows each neuron to selectively remember or forget information based on the input content, acting as an independent filtering agent.
+The underlying mechanism is a discretized State Space Model:
+\begin{align}
+    \bh'_t &= \bA \bh'_{t-1} + \bB \bx_t \\
+    \mathbf{y}_t &= \bC \bh'_t + \bD \bx_t
+\end{align}
+In the Mamba implementation, the matrices $\bB, \bC, \mathbf{\Delta}$ (step size) are functions of the input $\bx_t$, allowing the neuron to selectively ignore or store information.
+This operation is parallelized across the time dimension $L$ via a parallel scan algorithm \citep{gu2023mamba}.
 
-\subsection{Macro-Architecture: Dynamic Routing (The "Synapse")}
-Communication between neurons is not fixed. At each layer, the network computes a global adjacency matrix based on content compatibility.
+\subsection{Macro-Architecture: Dynamic Routing (Neuron Attention)}
+To allow information flow between neurons, we introduce a global mixing step. Unlike Transformers which mix information across time (Self-Attention), INNv2 mixes information across the neuron population.
 
-Let $\mathbf{X} \in \mathbb{R}^{N \times d}$ be the state of all $N$ neurons at a given layer. We compute:
+At each layer, given the state of all neurons $\mathbf{H} \in \Real^{N \times L \times d}$:
+\begin{enumerate}
+    \item We permute dimensions to treat neurons as the sequence: $\mathbf{H}_{perm} \in \Real^{L \times N \times d}$.
+    \item We apply Multi-Head Attention (MHA) where the "sequence length" is $N$:
+    \begin{equation}
+        \text{Attention}(Q, K, V) = \softmax\left(\frac{QK^T}{\sqrt{d}}\right)V
+    \end{equation}
+    Here, $Q, K, V$ are projections of the neuron states.
+\end{enumerate}
+
+This mechanism allows a neuron $i$ to "read" the memory of neuron $j$ if their content keys match, effectively creating a dynamic graph topology that evolves at each layer.
+
+\subsection{Algorithm}
+
+\begin{algorithm}[H]
+\caption{Forward Pass of INNv2 Layer}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} $\mathbf{X} \in \Real^{B \times N \times L \times d}$
+\STATE \textit{// Phase 1: Independent Thought (Mamba)}
+\STATE $\mathbf{X}_{res} \leftarrow \mathbf{X}$
+\STATE $\mathbf{X} \leftarrow \text{VectorizedMambaBlock}(\mathbf{X})$ \COMMENT{Parallel across B, N, L}
+\STATE $\mathbf{X} \leftarrow \text{LayerNorm}(\mathbf{X} + \mathbf{X}_{res})$
+\STATE \textit{// Phase 2: Communication (Attention)}
+\STATE $\mathbf{X}_{flat} \leftarrow \text{Rearrange}(\mathbf{X}, 'b\ n\ l\ d \to (b\ l)\ n\ d')$
+\STATE $\mathbf{X}_{comm} \leftarrow \text{MultiHeadAttention}(\mathbf{X}_{flat})$ \COMMENT{Mixes across N}
+\STATE $\mathbf{X}_{comm} \leftarrow \text{Rearrange}(\mathbf{X}_{comm}, '(b\ l)\ n\ d \to b\ n\ l\ d')$
+\STATE $\mathbf{X} \leftarrow \text{LayerNorm}(\mathbf{X}_{comm} + \mathbf{X})$
+\STATE \textbf{Return} $\mathbf{X}$
+\end{algorithmic}
+\end{algorithm}
+
+\section{Experiments}
+
+\subsection{Experimental Setup}
+We implemented INNv2 in PyTorch using a custom vectorized Mamba block. All experiments were run on a single NVIDIA A100 (40GB) GPU.
 \begin{itemize}
-    \item \textbf{Queries:} $Q = \mathbf{X}W_Q$
-    \item \textbf{Keys:} $K = \mathbf{X}W_K$
-    \item \textbf{Values:} $V = \mathbf{X}W_V$ (typically identity in our implementation)
+    \item \textbf{Dataset:} Tiny Shakespeare (1.1M characters).
+    \item \textbf{Model Config:} $N=64$ neurons, $d=64$ dimension, 4 layers. Total params $\approx 8.6$M.
+    \item \textbf{Optimization:} AdamW, Learning Rate $1e^{-3}$, Batch Size 32, Sequence Length 128.
 \end{itemize}
 
-The routed information $\mathbf{X}_{routed}$ is:
-\[ \mathbf{X}_{routed} = \text{softmax}\left(\frac{QK^T}{\sqrt{d}}\right) V \]
+\subsection{Results on Language Modeling}
 
-This operation is a \textbf{Self-Attention over the Neuron Dimension}. It allows a neuron to "read" the state of any other neuron in the network, provided their Key matches its Query.
+We compared the convergence speed and final perplexity of INNv2 against our previous LSTM-based implementation (INNv1) and a standard Transformer baseline (nanoGPT configuration, ~10M params).
+
+\begin{table}[h]
+    \centering
+    \caption{Comparison of Training Efficiency and Performance.}
+    \label{tab:results}
+    \begin{tabular}{lccccc}
+        \toprule
+        \textbf{Model} & \textbf{Params} & \textbf{Inference} & \textbf{Time/Epoch} & \textbf{Val Loss} \\
+        \midrule
+        INNv1 (LSTM) & 8.0M & $O(L)$ & $\sim$ 900s & 1.84 \\
+        Transformer & 10.0M & $O(L^2)$ & $\sim$ 250s & 1.48 \\
+        \textbf{INNv2 (Mamba)} & \textbf{8.6M} & $\mathbf{O(L)}$ & \textbf{265s} & \textbf{1.16} \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\textbf{Analysis:} INNv2 outperforms the Transformer baseline on this scale, reaching a validation loss of \textbf{1.16} (Perplexity $\approx 3.19$). This validates that the combination of SSM state compression and dense neuronal communication is highly effective for character-level modeling. Crucially, INNv2 achieves this with a training speed comparable to Transformers, solving the scalability issue of INNv1.
+
+\subsection{Emergent Modularity (Multi-Tasking)}
+
+To test the "System 2" capabilities, we trained a Hybrid INNv1 on a mixed dataset containing both Shakespearean text and arithmetic equations (\texttt{MATH: 378+301=681}).
+
+We observed two key phenomena:
+\begin{enumerate}
+    \item \textbf{Task Separation:} The attention mechanism activated distinct subsets of "Dynamic Neurons" depending on the input type (Text vs Math).
+    \item \textbf{Auxiliary Benefit:} The model trained on the mixed dataset converged to a better loss (1.84) than the model trained on text alone (1.99), suggesting that learning arithmetic structures regularized the latent space.
+\end{enumerate}
 
 \begin{figure}[h]
     \centering
-    \fbox{\begin{minipage}{0.9\textwidth}
-        \centering \vspace{3cm} \textbf{[FIGURE 1: INNv2 Architecture Diagram]} \\ 
-        \textit{Left: The MultiMamba Block (Intra-Neuron). Right: The Neuron-Attention Mechanism (Inter-Neuron).} \vspace{3cm}
+    \fbox{\begin{minipage}{0.8\textwidth}
+        \centering
+        \vspace{1cm}
+        \textit{[TODO: Insert Attention Matrix Heatmap from `plots_vec/` here]}
+        \vspace{1cm}
     \end{minipage}}
-    \caption{Overview of the Parallel INN architecture. The model alternates between independent temporal processing (Mamba) and global information exchange (Attention).}
+    \caption{Attention Patterns during Multi-Tasking. Distinct columns (neurons) activate for arithmetic tokens compared to literary tokens, demonstrating emergent functional specialization.}
 \end{figure}
 
-\section{Experimental Validation}
+\section{Discussion and Limitations}
 
-We evaluate INNv2 on two axes: Training Efficiency (Scalability) and Functional Specialization (Intelligence).
+\textbf{Scalability.} While efficient at the 10M parameter scale, scaling laws for INNv2 remain to be tested on billion-token datasets (e.g., The Pile). The $O(N^2)$ complexity of the inter-neuron attention could become a bottleneck if $N$ grows to thousands. Future work will explore sparse or linear attention for the neuron mixing step.
 
-\subsection{Setup}
-All models are trained on a single NVIDIA A100 GPU.
-\begin{itemize}
-    \item \textbf{Dataset:} Tiny Shakespeare (1M characters).
-    \item \textbf{Model Size:} $\approx$ 8.5 Million parameters.
-    \item \textbf{Context Window:} 128 characters.
-\end{itemize}
+\textbf{Algorithmic Logic.} While the model learned basic arithmetic syntax and approximation, exact long-form calculation remains a challenge for all autoregressive models. The fixed state size of Mamba blocks may limit the ability to "count" over indefinitely long sequences without external memory.
 
-\subsection{Exp 1: The "Intelligence" of Convergence}
-We compare INNv2 against our previous recurrent baseline (INNv1 - LSTM) and standard Transformer baselines (nanoGPT equivalent).
+\section{Conclusion}
 
-    \begin{table}[h]
-    \centering
-    \begin{tabular}{lccccc}
-        \toprule
-        \textbf{Model} & \textbf{Params} & \textbf{Time/Epoch} & \textbf{Loss (Ep 1)} & \textbf{Loss (Ep 6)} & \textbf{Final Val Loss} \\
-        \midrule
-        INNv1 (LSTM) & 8M & 900s & 3.27 & 2.32 & 1.84 (Ep 30) \\
-        Transformer (GPT-2 config) & 10M & $\sim$ 250s & 2.10 & 1.65 & $\sim$ 1.48 \\
-        \textbf{INNv2 (Mamba)} & \textbf{8.6M} & \textbf{265s} & \textbf{2.00} & \textbf{1.27} & \textbf{1.16 (Ep 10)} \\
-        \bottomrule
-    \end{tabular}
-    \caption{Training Dynamics on Tiny Shakespeare. INNv2 demonstrates superior sample efficiency, reaching a validation loss of 1.16 in just 44 minutes.}
-\end{table}
+We presented INNv2, a scalable architecture combining the best of State Space Models and Graph Neural Networks. By treating neurons as independent stateful agents that communicate via attention, we move closer to biologically plausible architectures without sacrificing the hardware efficiency required for modern Deep Learning. The superior convergence on Tiny Shakespeare suggests that "Intelligence Is All You Need"—specifically, the intelligent routing of information between specialized memory units.
 
-\textbf{Analysis:} INNv2 not only trains as fast as a Transformer (thanks to parallelism) but learns significantly "faster" in terms of data efficiency (Loss). Reaching a loss of 1.21 on character-level Shakespeare is a strong result, typically requiring larger models or longer training. The generated text exhibits coherent long-term structure (names, dialogue formatting) from Epoch 3 onwards.
+\bibliographystyle{plainnat}
+\begin{thebibliography}{5}
+\bibitem[Vaswani et al.(2017)]{vaswani2017attention} Vaswani, A., et al. (2017). Attention is all you need. \textit{NeurIPS}.
+\bibitem[Gu and Dao(2023)]{gu2023mamba} Gu, A., \& Dao, T. (2023). Mamba: Linear-time sequence modeling with selective state spaces. \textit{arXiv preprint}.
+\bibitem[Hochreiter(1997)]{hochreiter1997long} Hochreiter, S., \& Schmidhuber, J. (1997). Long short-term memory. \textit{Neural computation}.
+\bibitem[Kahneman(2011)]{kahneman2011thinking} Kahneman, D. (2011). \textit{Thinking, fast and slow}. Macmillan.
+\bibitem[Shazeer et al.(2017)]{shazeer2017outrageously} Shazeer, N., et al. (2017). Outrageously large neural networks: The sparsely-gated mixture-of-experts layer. \textit{ICLR}.
+\end{thebibliography}
 
-\subsection{Exp 2: Emergent Modularity (Multi-Tasking)}
-In a separate experiment (detailed in Appendix A), we trained a Hybrid INN on a mixed dataset of Literature and Arithmetic equations.
-By visualizing the Attention Matrix $A$, we observed:
-\begin{enumerate}
-    \item \textbf{Sparsity:} The attention patterns are sparse (most values near 0), indicating selective communication.
-    \item \textbf{Task Switching:} Different subsets of "Dynamic Neurons" activate when processing arithmetic tokens versus literary tokens.
-\end{enumerate}
-This confirms that the architecture naturally learns to partition its capacity to handle orthogonal tasks without catastrophic interference.
-
-\section{Discussion & Conclusion}
-
-The Intelligent Neurons Network bridges the gap between the "liquid" adaptability of biological networks and the brute-force efficiency of modern hardware. By replacing the LSTM bottleneck with Mamba blocks, we unlocked industrial-scale training speeds while preserving the core "Graph of Agents" philosophy.
-
-The superior convergence (1.21 Loss) suggests that decoupling "Memory" (Mamba) and "Communication" (Attention) is a more inductive bias for sequence modeling than the monolithic Transformer block.
-
-Future work will focus on:
-\begin{itemize}
-    \item \textbf{Scaling Laws:} verifying if INNv2 maintains this advantage at the Billion-parameter scale.
-    \item \textbf{Out-of-Distribution Generalization:} Testing if the modular nature of INN allows better length generalization on algorithmic tasks.
-\end{itemize}
-
-\section*{Conclusion}
-Intelligence is not just about matrix multiplication; it is about routing information to the right place at the right time. INNv2 provides a scalable substrate for this routing to emerge. We hope this work inspires a shift back towards biologically-plausible, dynamic architectures in the era of static Foundation Models.
+\appendix
+\section{Detailed Hyperparameters}
+\textbf{INNv2 Comparison Run:} Batch Size=32, Seq Len=128, Layers=4, Neurons=64, D\_Model=64. Optimizer: AdamW ($\beta_1=0.9, \beta_2=0.999$), Weight Decay=0.01.
 
 \end{document}
