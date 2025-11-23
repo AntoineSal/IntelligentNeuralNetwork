@@ -6,19 +6,22 @@ import os
 import math
 import requests
 from src.model import INNv3
+# Import mixed precision
+from torch.cuda.amp import autocast, GradScaler
 
 # ==============================================================================
-# CONFIGURATION INNv3 (SCALING)
+# CONFIGURATION INNv3 (SCALING) - LOW MEMORY PROFILE
 # ==============================================================================
 CONFIG = {
-    'batch_size': 20,
-    'seq_len': 64,         # Reduced for Mamba/Memory intensity
+    'batch_size': 8,       # Reduced from 20 to 8 to fit in memory
+    'accum_steps': 4,      # Effective batch size = 32
+    'seq_len': 64,         
     'epochs': 10,          
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     'd_model': 256,
     'num_layers': 4,
-    'max_neurons': 128,    # Base pool size
-    'growth_interval': 2,  # Epochs between growth
+    'max_neurons': 128,    
+    'growth_interval': 2,  
 }
 
 # --- DATA LOADING ---
@@ -72,7 +75,7 @@ def get_batch(source, i, seq_len):
     return data, target
 
 def main():
-    print("=== TRAINING INNv3: SCALING DYNAMIC NETWORKS ===")
+    print("=== TRAINING INNv3: SCALING DYNAMIC NETWORKS (Low Mem) ===")
     
     # 1. Data
     data_path = "data/wikitext-2"
@@ -89,6 +92,7 @@ def main():
     print(f"Vocab Size: {vocab_size}")
     
     device = torch.device(CONFIG['device'])
+    # IMPORTANT: Adjust batchify for small physical batch size
     train_data = batchify(corpus.train, CONFIG['batch_size'], device)
     val_data = batchify(corpus.valid, 10, device)
     
@@ -103,7 +107,6 @@ def main():
     print(f"Model Params: {sum(p.numel() for p in model.parameters()):,}")
     
     # 3. Optimizers (Multi-Scale)
-    # Split parameters into groups
     router_params = []
     decoder_params = []
     neuron_params = []
@@ -117,16 +120,18 @@ def main():
             neuron_params.append(param)
             
     optimizer = optim.AdamW([
-        {'params': router_params, 'lr': 1e-3},   # Fast adaptation
-        {'params': neuron_params, 'lr': 5e-4},   # Standard
-        {'params': decoder_params, 'lr': 1e-4}   # Careful with vocab
+        {'params': router_params, 'lr': 1e-3},   
+        {'params': neuron_params, 'lr': 5e-4},   
+        {'params': decoder_params, 'lr': 1e-4}   
     ])
     
     criterion = nn.CrossEntropyLoss()
+    scaler = GradScaler() # For Mixed Precision
     
     # 4. Train Loop
+    optimizer.zero_grad() # Init
+    
     for epoch in range(1, CONFIG['epochs'] + 1):
-        # Progressive Growth
         if epoch > 1 and epoch % CONFIG['growth_interval'] == 0:
             model.grow_network()
             
@@ -138,31 +143,39 @@ def main():
             data, targets = get_batch(train_data, i, CONFIG['seq_len'])
             data = data.t() # (B, L)
             
-            optimizer.zero_grad()
-            logits = model(data)
-            loss = criterion(logits.reshape(-1, vocab_size), targets)
-            loss.backward()
+            # Mixed Precision Forward
+            with autocast():
+                logits = model(data)
+                loss = criterion(logits.reshape(-1, vocab_size), targets)
+                loss = loss / CONFIG['accum_steps'] # Normalize
             
-            # Gradient Clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-            optimizer.step()
+            # Backward
+            scaler.scale(loss).backward()
             
-            total_loss += loss.item()
+            if (batch + 1) % CONFIG['accum_steps'] == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
             
-            if batch % 100 == 0 and batch > 0:
-                cur_loss = total_loss / 100
+            total_loss += loss.item() * CONFIG['accum_steps']
+            
+            if batch % (100 * CONFIG['accum_steps']) == 0 and batch > 0:
+                cur_loss = total_loss / (100 * CONFIG['accum_steps'])
                 ppl = math.exp(cur_loss)
                 print(f"| epoch {epoch} | batch {batch} | loss {cur_loss:.2f} | ppl {ppl:.2f}")
                 total_loss = 0
                 
-        # Validation
+        # Validation (No Grad, No Checkpointing needed usually)
         model.eval()
         val_loss = 0
         with torch.no_grad():
             for i in range(0, val_data.size(0)-1, CONFIG['seq_len']):
                 data, targets = get_batch(val_data, i, CONFIG['seq_len'])
-                logits = model(data.t())
-                val_loss += len(data) * criterion(logits.reshape(-1, vocab_size), targets).item()
+                with autocast():
+                    logits = model(data.t())
+                    val_loss += len(data) * criterion(logits.reshape(-1, vocab_size), targets).item()
         val_loss /= (len(val_data) // CONFIG['seq_len'])
         val_ppl = math.exp(val_loss)
         
@@ -172,4 +185,3 @@ def main():
 if __name__ == "__main__":
     os.makedirs("checkpoints", exist_ok=True)
     main()
-
