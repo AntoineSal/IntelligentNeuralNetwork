@@ -1,0 +1,340 @@
+# ==============================================================================
+# CELLULE 1: INSTALLATION & NETTOYAGE
+# ==============================================================================
+import os
+import signal
+
+# Tuer les processus fantômes
+try:
+    os.kill(os.getpid(), signal.SIGKILL)
+except:
+    print("Runtime redémarré")
+
+# (Attendre le redémarrage)
+
+# ==============================================================================
+# CELLULE 2: HYPERPARAMÈTRES (LE TABLEAU DE BORD)
+# ==============================================================================
+import torch
+
+CONFIG = {
+    # --- Architecture ---
+    'd_model': 256,          # Taille standard (ni trop petit, ni trop gros)
+    'num_neurons': 64,       # Le nombre de neurones indépendants
+    'n_layers': 4,           # Profondeur
+    'n_head': 4,             # Têtes d'attention inter-neurones
+    'dropout': 0.2,          # Crucial pour WikiText
+    
+    # --- Entraînement ---
+    'batch_size': 32,        # Physique
+    'accum_steps': 1,        # Accumulation (si OOM, passer à 2 ou 4)
+    'seq_len': 64,           # Contexte
+    'epochs': 20,
+    'learning_rate': 5e-4,   # LR Standard
+    'warmup_steps': 1000,    # Douceur au démarrage
+    'grad_clip': 0.25,       # Stabilité Mamba
+    
+    # --- Système ---
+    'device': 'cuda' if torch.cuda.is_available() else 'cpu'
+}
+
+print("Configuration chargée :", CONFIG)
+
+# ==============================================================================
+# CELLULE 3: DATA LOADING (ROBUSTE)
+# ==============================================================================
+import os
+import torch
+import requests
+
+class Dictionary:
+    def __init__(self):
+        self.word2idx = {}
+        self.idx2word = []
+    def add_word(self, word):
+        if word not in self.word2idx:
+            self.idx2word.append(word)
+            self.word2idx[word] = len(self.idx2word) - 1
+        return self.word2idx[word]
+    def __len__(self): return len(self.idx2word)
+
+class Corpus:
+    def __init__(self, path):
+        self.dictionary = Dictionary()
+        self.train = self.tokenize(os.path.join(path, 'train.txt'), build_vocab=True)
+        self.valid = self.tokenize(os.path.join(path, 'valid.txt'))
+    
+    def tokenize(self, path, build_vocab=False):
+        if not os.path.exists(path): return torch.LongTensor([])
+        with open(path, 'r', encoding="utf8") as f:
+            tokens = 0
+            for line in f:
+                words = line.split() + ['<eos>']
+                tokens += len(words)
+                if build_vocab:
+                    for word in words: self.dictionary.add_word(word)
+        with open(path, 'r', encoding="utf8") as f:
+            ids = torch.LongTensor(tokens)
+            token = 0
+            for line in f:
+                words = line.split() + ['<eos>']
+                for word in words:
+                    if word in self.dictionary.word2idx:
+                        ids[token] = self.dictionary.word2idx[word]
+                    token += 1
+        return ids
+
+def batchify(data, bsz, device):
+    nbatch = data.size(0) // bsz
+    data = data.narrow(0, 0, nbatch * bsz)
+    data = data.view(bsz, -1).t().contiguous()
+    return data.to(device)
+
+def get_batch(source, i, seq_len):
+    seq_len = min(seq_len, len(source) - 1 - i)
+    data = source[i:i+seq_len]
+    target = source[i+1:i+1+seq_len].view(-1)
+    return data, target
+
+# Téléchargement
+data_path = "data/wikitext-2"
+if not os.path.exists(f"{data_path}/train.txt"):
+    print("Downloading WikiText-2...")
+    os.makedirs(data_path, exist_ok=True)
+    base_url = "https://raw.githubusercontent.com/pytorch/examples/master/word_language_model/data/wikitext-2/"
+    for f in ['train.txt', 'valid.txt', 'test.txt']:
+        r = requests.get(base_url + f)
+        with open(f"{data_path}/{f}", 'w') as out: out.write(r.text)
+
+corpus = Corpus(data_path)
+vocab_size = len(corpus.dictionary)
+print(f"Vocab Size: {vocab_size}")
+
+train_data = batchify(corpus.train, CONFIG['batch_size'], CONFIG['device'])
+val_data = batchify(corpus.valid, 10, CONFIG['device'])
+
+# ==============================================================================
+# CELLULE 4: ARCHITECTURE INNv2 (Optimized)
+# ==============================================================================
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+class MultiMambaBlock(nn.Module):
+    def __init__(self, num_neurons, d_model, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        self.num_neurons = num_neurons
+        self.d_model = d_model
+        self.d_inner = int(expand * d_model)
+        self.dt_rank = math.ceil(d_model / 16)
+        self.d_state = d_state
+        self.d_conv = d_conv
+
+        self.w_in = nn.Parameter(torch.Tensor(num_neurons, d_model, self.d_inner * 2))
+        self.conv1d = nn.Conv1d(
+            in_channels=num_neurons * self.d_inner,
+            out_channels=num_neurons * self.d_inner,
+            bias=True, kernel_size=d_conv, groups=num_neurons * self.d_inner, padding=d_conv - 1,
+        )
+        self.w_x = nn.Parameter(torch.Tensor(num_neurons, self.d_inner, self.dt_rank + d_state * 2))
+        self.w_dt = nn.Parameter(torch.Tensor(num_neurons, self.dt_rank, self.d_inner))
+        self.b_dt = nn.Parameter(torch.Tensor(num_neurons, self.d_inner))
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(num_neurons, self.d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A)) 
+        self.D = nn.Parameter(torch.ones(num_neurons, self.d_inner))
+        self.w_out = nn.Parameter(torch.Tensor(num_neurons, self.d_inner, d_model))
+        self.act = nn.SiLU()
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.w_in)
+        nn.init.xavier_uniform_(self.w_x)
+        nn.init.uniform_(self.w_dt, -0.001, 0.001) # Safe init
+        nn.init.zeros_(self.b_dt)
+        nn.init.xavier_uniform_(self.w_out)
+
+    def forward(self, x):
+        batch_size, num_neurons, seq_len, d_model = x.shape
+        x_and_res = torch.einsum('bnld,ndk->bnlk', x, self.w_in)
+        (x, res) = x_and_res.split(split_size=[self.d_inner, self.d_inner], dim=-1)
+        x = x.permute(0, 1, 3, 2).reshape(batch_size, num_neurons * self.d_inner, seq_len)
+        x = self.conv1d(x)[:, :, :seq_len]
+        x = x.reshape(batch_size, num_neurons, self.d_inner, seq_len).permute(0, 1, 3, 2) 
+        x = self.act(x)
+        x_dbl = torch.einsum('bnli,nip->bnlp', x, self.w_x)
+        (dt, B, C) = x_dbl.split(split_size=[self.dt_rank, self.d_state, self.d_state], dim=-1)
+        dt = torch.einsum('bnlr,nri->bnli', dt, self.w_dt) + self.b_dt.view(1, num_neurons, 1, -1)
+        A = -torch.exp(self.A_log.float()) 
+        y = self.selective_scan(x, dt, A, B, C, self.D)
+        y = y * self.act(res)
+        out = torch.einsum('bnli,nid->bnld', y, self.w_out)
+        return out
+
+    def selective_scan(self, u, dt, A, B, C, D):
+        batch_size, n_neurons, seq_len, d_inner = u.shape
+        d_state = A.shape[2]
+        h = torch.zeros(batch_size, n_neurons, d_inner, d_state, device=u.device)
+        ys = []
+        for t in range(seq_len):
+            dt_t = F.softplus(dt[:, :, t, :]) 
+            dt_t = torch.clamp(dt_t, max=10.0) # Protection
+            dA = torch.exp(dt_t.unsqueeze(-1) * A.unsqueeze(0))
+            dB = dt_t.unsqueeze(-1) * B[:, :, t, :].unsqueeze(2)
+            u_t = u[:, :, t, :].unsqueeze(-1)
+            h = dA * h + dB * u_t
+            y_t = torch.sum(h * C[:, :, t, :].unsqueeze(2), dim=-1)
+            y_t = y_t + D.unsqueeze(0) * u[:, :, t, :]
+            ys.append(y_t)
+        return torch.stack(ys, dim=2)
+
+class MultiHeadNeuronAttention(nn.Module):
+    def __init__(self, num_neurons, d_model, n_head, dropout=0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, n_head, batch_first=True, dropout=dropout)
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x: (B*L, N, D)
+        out, _ = self.attn(x, x, x)
+        return self.norm(x + self.dropout(out))
+
+class INNLayer(nn.Module):
+    def __init__(self, num_neurons, d_model, n_head, dropout=0.1):
+        super().__init__()
+        self.mamba = MultiMambaBlock(num_neurons, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.comm_attention = MultiHeadNeuronAttention(num_neurons, d_model, n_head, dropout)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, N, L, D = x.shape
+        res = x
+        x = self.mamba(x)
+        x = self.norm1(x + self.dropout(res))
+        
+        res = x
+        x_flat = x.permute(0, 2, 1, 3).reshape(B*L, N, D)
+        comm_out = self.comm_attention(x_flat)
+        comm_out = comm_out.reshape(B, L, N, D).permute(0, 2, 1, 3)
+        x = self.norm2(comm_out + self.dropout(res))
+        return x
+
+class ParallelINN(nn.Module):
+    def __init__(self, vocab_size, num_neurons=64, d_model=256, num_layers=4, n_head=4, dropout=0.1):
+        super().__init__()
+        self.num_neurons = num_neurons
+        self.d_model = d_model
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.layers = nn.ModuleList([
+            INNLayer(num_neurons, d_model, n_head, dropout) for _ in range(num_layers)
+        ])
+        self.n_action = max(1, num_neurons // 8)
+        # Output optimisé: Pooling ou Action Neurons seulement ?
+        # On garde Action Neurons comme en V2 original
+        self.out_proj = nn.Linear(self.n_action * d_model, vocab_size, bias=False)
+        # Tie weights (partiel, dimension mismatch donc trick projection)
+        # Pour simplicité V2, pas de tie weight direct ici
+        
+    def forward(self, input_ids):
+        batch_size, seq_len = input_ids.shape
+        x = self.embedding(input_ids) # (B, L, D)
+        x = x.unsqueeze(1).expand(-1, self.num_neurons, -1, -1) # (B, N, L, D)
+        
+        for layer in self.layers:
+            x = layer(x)
+            
+        # Action Neurons (Last N/8)
+        action_out = x[:, -self.n_action:, :, :] # (B, N_act, L, D)
+        action_out = action_out.permute(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
+        logits = self.out_proj(action_out)
+        return logits
+
+# ==============================================================================
+# CELLULE 5: ENTRAÎNEMENT
+# ==============================================================================
+import torch.optim as optim
+from torch.amp import autocast, GradScaler
+import time
+import math
+
+model = ParallelINN(
+    vocab_size, 
+    num_neurons=CONFIG['num_neurons'], 
+    d_model=CONFIG['d_model'], 
+    num_layers=CONFIG['n_layers'],
+    n_head=CONFIG['n_head'],
+    dropout=CONFIG['dropout']
+).to(CONFIG['device'])
+
+print(f"Model Params: {sum(p.numel() for p in model.parameters()):,}")
+
+optimizer = optim.AdamW(model.parameters(), lr=CONFIG['learning_rate'], weight_decay=0.01)
+criterion = nn.CrossEntropyLoss()
+scaler = GradScaler('cuda')
+
+# Scheduler
+steps_per_epoch = train_data.size(0) // CONFIG['seq_len'] // CONFIG['accum_steps']
+total_steps = steps_per_epoch * CONFIG['epochs']
+scheduler = optim.lr_scheduler.OneCycleLR(
+    optimizer, max_lr=CONFIG['learning_rate'], total_steps=total_steps, pct_start=0.1
+)
+
+# Loop
+print("=== STARTING TRAINING INNv2 (OPTIMIZED) ===")
+
+for epoch in range(1, CONFIG['epochs'] + 1):
+    model.train()
+    total_loss = 0
+    total_tokens = 0
+    start_time = time.time()
+    
+    for batch, i in enumerate(range(0, train_data.size(0)-1, CONFIG['seq_len'])):
+        data, targets = get_batch(train_data, i, CONFIG['seq_len'])
+        data = data.t()
+        
+        with autocast('cuda'):
+            logits = model(data)
+            loss = criterion(logits.reshape(-1, vocab_size), targets)
+            loss = loss / CONFIG['accum_steps']
+        
+        scaler.scale(loss).backward()
+        
+        if (batch + 1) % CONFIG['accum_steps'] == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG['grad_clip'])
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            scheduler.step()
+        
+        n_tokens = data.size(0) * data.size(1)
+        total_loss += (loss.item() * CONFIG['accum_steps']) * n_tokens
+        total_tokens += n_tokens
+        
+        if (batch + 1) % (100 * CONFIG['accum_steps']) == 0:
+            cur_loss = total_loss / total_tokens
+            ppl = math.exp(cur_loss)
+            print(f"| epoch {epoch} | batch {batch} | loss {cur_loss:.2f} | ppl {ppl:.2f}")
+            total_loss = 0
+            total_tokens = 0
+    
+    # Validation
+    model.eval()
+    val_loss = 0
+    val_tokens = 0
+    with torch.no_grad():
+        for i in range(0, val_data.size(0)-1, CONFIG['seq_len']):
+            data, targets = get_batch(val_data, i, CONFIG['seq_len'])
+            data = data.t()
+            with autocast('cuda'):
+                logits = model(data)
+                loss = criterion(logits.reshape(-1, vocab_size), targets)
+            
+            n_tokens = data.size(0) * data.size(1)
+            val_loss += loss.item() * n_tokens
+            val_tokens += n_tokens
+            
+    val_loss /= val_tokens
+    print(f"=== Epoch {epoch} | Val Loss {val_loss:.2f} | Val PPL {math.exp(val_loss):.2f} ===")
