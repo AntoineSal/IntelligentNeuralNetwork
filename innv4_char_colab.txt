@@ -1,0 +1,314 @@
+# ==============================================================================
+# CELLULE 1: INSTALLATION & NETTOYAGE
+# ==============================================================================
+import os
+import signal
+
+try:
+    os.kill(os.getpid(), signal.SIGKILL)
+except:
+    print("Runtime redémarré")
+
+# (Attendre redémarrage)
+
+# ==============================================================================
+# CELLULE 2: HYPERPARAMÈTRES INNv4 CHAR-LEVEL
+# ==============================================================================
+import torch
+
+CONFIG = {
+    # --- Architecture Modulaire ---
+    'd_model': 256,          # Capacité par colonie
+    'n_colonies': 4,         # 4 Cerveaux spécialisés
+    'neurons_per_colony': 16,# 16 variations par colonie
+    'n_layers': 4,           # Profondeur
+    'dropout': 0.1,
+    
+    # --- Entraînement ---
+    'batch_size': 8,         # Low VRAM
+    'accum_steps': 4,        # Effective BS = 32
+    'seq_len': 256,          # Long contexte pour caractères
+    'epochs': 10,
+    'learning_rate': 1e-3,   # Agressif
+    'warmup_steps': 1000,
+    'grad_clip': 1.0,
+    
+    'device': 'cuda' if torch.cuda.is_available() else 'cpu'
+}
+
+print("Config INNv4 Char-Level chargée:", CONFIG)
+
+# ==============================================================================
+# CELLULE 3: DATA LOADING CHAR-LEVEL
+# ==============================================================================
+import os
+import torch
+import requests
+
+class Dictionary:
+    def __init__(self):
+        self.char2idx = {}
+        self.idx2char = []
+    def add_char(self, char):
+        if char not in self.char2idx:
+            self.idx2char.append(char)
+            self.char2idx[char] = len(self.idx2char) - 1
+        return self.char2idx[char]
+    def __len__(self): return len(self.idx2char)
+
+class Corpus:
+    def __init__(self, path):
+        self.dictionary = Dictionary()
+        self.train = self.tokenize(os.path.join(path, 'train.txt'), build_vocab=True)
+        self.valid = self.tokenize(os.path.join(path, 'valid.txt'))
+    def tokenize(self, path, build_vocab=False):
+        if not os.path.exists(path): return torch.LongTensor([])
+        with open(path, 'r', encoding="utf8") as f: text = f.read()
+        if build_vocab:
+            for char in sorted(list(set(text))): self.dictionary.add_char(char)
+        ids = torch.LongTensor(len(text))
+        for i, char in enumerate(text):
+            ids[i] = self.dictionary.char2idx.get(char, 0)
+        return ids
+
+def batchify(data, bsz, device):
+    nbatch = data.size(0) // bsz
+    data = data.narrow(0, 0, nbatch * bsz)
+    data = data.view(bsz, -1).t().contiguous()
+    return data.to(device)
+
+def get_batch(source, i, seq_len):
+    seq_len = min(seq_len, len(source) - 1 - i)
+    data = source[i:i+seq_len]
+    target = source[i+1:i+1+seq_len].view(-1)
+    return data, target
+
+data_path = "data/wikitext-2"
+if not os.path.exists(f"{data_path}/train.txt"):
+    os.makedirs(data_path, exist_ok=True)
+    base_url = "https://raw.githubusercontent.com/pytorch/examples/master/word_language_model/data/wikitext-2/"
+    for f in ['train.txt', 'valid.txt', 'test.txt']:
+        r = requests.get(base_url + f)
+        with open(f"{data_path}/{f}", 'w') as out: out.write(r.text)
+
+corpus = Corpus(data_path)
+vocab_size = len(corpus.dictionary)
+print(f"Vocab Size: {vocab_size}")
+
+train_data = batchify(corpus.train, CONFIG['batch_size'], CONFIG['device'])
+val_data = batchify(corpus.valid, 10, CONFIG['device'])
+
+# ==============================================================================
+# CELLULE 4: ARCHITECTURE INNv4 (MAMBA CORE + COLONIES)
+# ==============================================================================
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+# --- Mamba Core (Shared Brain) ---
+class MambaCore(nn.Module):
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        self.d_inner = int(expand * d_model)
+        self.dt_rank = math.ceil(d_model / 16)
+        
+        self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
+        self.conv1d = nn.Conv1d(
+            in_channels=self.d_inner, out_channels=self.d_inner, bias=True,
+            kernel_size=d_conv, groups=self.d_inner, padding=d_conv - 1,
+        )
+        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + d_state * 2, bias=False)
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+        
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        B, L, D = x.shape
+        x_and_res = self.in_proj(x)
+        (x, res) = x_and_res.split(split_size=[self.d_inner, self.d_inner], dim=-1)
+        
+        x = x.transpose(1, 2)
+        x = self.conv1d(x)[:, :, :L]
+        x = x.transpose(1, 2)
+        x = self.act(x)
+        
+        x_dbl = self.x_proj(x)
+        (dt, B_ssm, C_ssm) = x_dbl.split(split_size=[self.dt_rank, 16, 16], dim=-1)
+        dt = self.dt_proj(dt)
+        
+        # Scan
+        dt = F.softplus(dt)
+        dt = torch.clamp(dt, max=10.0) # NaN Fix
+        A = -torch.exp(self.A_log)
+        
+        # Sequential Scan (Python)
+        batch, seq_len, d_inner = x.shape
+        h = torch.zeros(batch, d_inner, 16, device=x.device)
+        ys = []
+        for t in range(seq_len):
+            dt_t = dt[:, t, :].unsqueeze(-1)
+            dA = torch.exp(dt_t * A)
+            dB = dt_t * B_ssm[:, t, :].unsqueeze(1)
+            u_t = x[:, t, :].unsqueeze(-1)
+            h = dA * h + dB * u_t
+            y_t = torch.sum(h * C_ssm[:, t, :].unsqueeze(1), dim=-1)
+            ys.append(y_t + self.D * x[:, t, :])
+            
+        y = torch.stack(ys, dim=1)
+        y = y * self.act(res)
+        return self.out_proj(y)
+
+# --- Neural Colony ---
+class NeuralColony(nn.Module):
+    def __init__(self, d_model, n_neurons, colony_id=0):
+        super().__init__()
+        self.core = MambaCore(d_model)
+        # Adapters
+        self.neuron_biases = nn.Parameter(torch.randn(1, 1, n_neurons, d_model) * 0.01)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x, active_mask=None):
+        # Core processing
+        core_out = self.core(x) # (B, L, D)
+        # Expansion (Colony Consensus)
+        # Simple mean for now + bias
+        colony_out = core_out + self.neuron_biases.mean(dim=2)
+        
+        out = self.norm(x + colony_out)
+        if active_mask is not None:
+            out = out * active_mask.unsqueeze(-1)
+        return out
+
+# --- Global Workspace ---
+class GlobalWorkspace(nn.Module):
+    def __init__(self, d_model, n_colonies):
+        super().__init__()
+        self.n_colonies = n_colonies
+        self.workspace_token = nn.Parameter(torch.randn(1, 1, d_model))
+        self.attn = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
+        self.norm = nn.LayerNorm(d_model)
+        self.dispatch_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, colony_outputs):
+        # Stack: (B, L, N, D)
+        B, L, D = colony_outputs[0].shape
+        stack = torch.stack(colony_outputs, dim=2)
+        flat_stack = stack.view(B*L, self.n_colonies, D)
+        
+        ws_query = self.workspace_token.expand(B*L, -1, -1)
+        ws_out, _ = self.attn(query=ws_query, key=flat_stack, value=flat_stack)
+        ws_out = self.norm(ws_out)
+        
+        return self.dispatch_proj(ws_out).view(B, L, D)
+
+# --- INNv4 Final ---
+class INNv4(nn.Module):
+    def __init__(self, vocab_size, d_model, n_layers, n_colonies, neurons_per_colony):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.router = nn.Linear(d_model, n_colonies)
+        
+        self.colonies = nn.ModuleList([
+            NeuralColony(d_model, neurons_per_colony, colony_id=i) 
+            for i in range(n_colonies)
+        ])
+        
+        self.workspaces = nn.ModuleList([
+            GlobalWorkspace(d_model, n_colonies) for _ in range(n_layers)
+        ])
+        
+        self.n_layers = n_layers
+        self.norm_final = nn.LayerNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size)
+
+    def forward(self, input_ids):
+        x = self.embedding(input_ids)
+        current_state = x
+        
+        for layer_idx in range(self.n_layers):
+            # Router
+            router_logits = self.router(current_state)
+            routing_weights = F.softmax(router_logits, dim=-1)
+            
+            # Colonies
+            colony_outputs = []
+            for i, colony in enumerate(self.colonies):
+                out = colony(current_state, active_mask=routing_weights[:, :, i])
+                colony_outputs.append(out)
+            
+            # Workspace
+            ws_signal = self.workspaces[layer_idx](colony_outputs)
+            
+            # Aggregation
+            weighted_sum = torch.sum(torch.stack(colony_outputs, dim=2), dim=2)
+            current_state = current_state + weighted_sum + ws_signal
+            
+        return self.lm_head(self.norm_final(current_state))
+
+# ==============================================================================
+# CELLULE 5: ENTRAÎNEMENT INNv4
+# ==============================================================================
+import torch.optim as optim
+from torch.amp import autocast, GradScaler
+import time
+import math
+
+model = INNv4(
+    vocab_size, 
+    CONFIG['d_model'], 
+    CONFIG['n_layers'], 
+    CONFIG['n_colonies'], 
+    CONFIG['neurons_per_colony']
+).to(CONFIG['device'])
+
+print(f"Model Params: {sum(p.numel() for p in model.parameters()):,}")
+
+optimizer = optim.AdamW(model.parameters(), lr=CONFIG['learning_rate'])
+scheduler = optim.lr_scheduler.OneCycleLR(
+    optimizer, max_lr=CONFIG['learning_rate'], 
+    total_steps=(train_data.size(0)//CONFIG['seq_len']//CONFIG['accum_steps'])*CONFIG['epochs'],
+    pct_start=0.1
+)
+criterion = nn.CrossEntropyLoss()
+scaler = GradScaler('cuda')
+
+print("=== STARTING TRAINING INNv4 CHAR-LEVEL ===")
+
+for epoch in range(1, CONFIG['epochs'] + 1):
+    model.train()
+    total_loss = 0
+    total_tokens = 0
+    start_time = time.time()
+    
+    for batch, i in enumerate(range(0, train_data.size(0)-1, CONFIG['seq_len'])):
+        data, targets = get_batch(train_data, i, CONFIG['seq_len'])
+        data = data.t()
+        
+        with autocast('cuda'):
+            logits = model(data)
+            loss = criterion(logits.reshape(-1, vocab_size), targets)
+            loss = loss / CONFIG['accum_steps']
+            
+        scaler.scale(loss).backward()
+        
+        if (batch + 1) % CONFIG['accum_steps'] == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG['grad_clip'])
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            scheduler.step()
+            
+        total_loss += (loss.item() * CONFIG['accum_steps']) * data.numel()
+        total_tokens += data.numel()
+        
+        if (batch + 1) % (100 * CONFIG['accum_steps']) == 0:
+            cur_loss = total_loss / total_tokens
+            print(f"| epoch {epoch} | batch {batch} | loss {cur_loss:.2f} | ppl {math.exp(cur_loss):.2f}")
+            total_loss = 0
+            total_tokens = 0
+
