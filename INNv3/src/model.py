@@ -1,211 +1,120 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import math
 
-# ==============================================================================
-# 1. CORE BLOCKS (Mamba Vectorisé)
-# ==============================================================================
-class MultiMambaBlock(nn.Module):
-    """Same as INNv2 but checked for correctness."""
-    def __init__(self, num_neurons, d_model, d_state=16, d_conv=4, expand=2):
-        super().__init__()
-        self.num_neurons = num_neurons
-        self.d_model = d_model
-        self.d_inner = int(expand * d_model)
-        self.dt_rank = math.ceil(d_model / 16)
-        self.d_state = d_state
-        self.d_conv = d_conv
-
-        self.w_in = nn.Parameter(torch.Tensor(num_neurons, d_model, self.d_inner * 2))
-        self.conv1d = nn.Conv1d(
-            in_channels=num_neurons * self.d_inner,
-            out_channels=num_neurons * self.d_inner,
-            bias=True,
-            kernel_size=d_conv,
-            groups=num_neurons * self.d_inner, 
-            padding=d_conv - 1,
-        )
-        self.w_x = nn.Parameter(torch.Tensor(num_neurons, self.d_inner, self.dt_rank + d_state * 2))
-        self.w_dt = nn.Parameter(torch.Tensor(num_neurons, self.dt_rank, self.d_inner))
-        self.b_dt = nn.Parameter(torch.Tensor(num_neurons, self.d_inner))
-
-        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(num_neurons, self.d_inner, 1)
-        self.A_log = nn.Parameter(torch.log(A)) 
-        self.D = nn.Parameter(torch.ones(num_neurons, self.d_inner))
-        self.w_out = nn.Parameter(torch.Tensor(num_neurons, self.d_inner, d_model))
-        
-        self.act = nn.SiLU()
-        self._init_weights()
-
-    def _init_weights(self):
-        nn.init.xavier_uniform_(self.w_in)
-        nn.init.xavier_uniform_(self.w_x)
-        nn.init.xavier_uniform_(self.w_dt)
-        nn.init.zeros_(self.b_dt)
-        nn.init.xavier_uniform_(self.w_out)
-
-    def selective_scan(self, u, dt, A, B, C, D):
-        batch_size, n_neurons, seq_len, d_inner = u.shape
-        d_state = A.shape[2]
-        h = torch.zeros(batch_size, n_neurons, d_inner, d_state, device=u.device)
-        ys = []
-        for t in range(seq_len):
-            dt_t = F.softplus(dt[:, :, t, :]) 
-            dA = torch.exp(dt_t.unsqueeze(-1) * A.unsqueeze(0))
-            dB = dt_t.unsqueeze(-1) * B[:, :, t, :].unsqueeze(2)
-            u_t = u[:, :, t, :].unsqueeze(-1)
-            h = dA * h + dB * u_t
-            y_t = torch.sum(h * C[:, :, t, :].unsqueeze(2), dim=-1)
-            y_t = y_t + D.unsqueeze(0) * u[:, :, t, :]
-            ys.append(y_t)
-        return torch.stack(ys, dim=2)
-
-    def forward(self, x):
-        batch_size, num_neurons, seq_len, d_model = x.shape
-        x_and_res = torch.einsum('bnld,ndk->bnlk', x, self.w_in)
-        (x, res) = x_and_res.split(split_size=[self.d_inner, self.d_inner], dim=-1)
-        
-        x = x.permute(0, 1, 3, 2).reshape(batch_size, num_neurons * self.d_inner, seq_len)
-        x = self.conv1d(x)[:, :, :seq_len]
-        x = x.reshape(batch_size, num_neurons, self.d_inner, seq_len).permute(0, 1, 3, 2) 
-        x = self.act(x)
-
-        x_dbl = torch.einsum('bnli,nip->bnlp', x, self.w_x)
-        (dt, B, C) = x_dbl.split(split_size=[self.dt_rank, self.d_state, self.d_state], dim=-1)
-        dt = torch.einsum('bnlr,nri->bnli', dt, self.w_dt) + self.b_dt.view(1, num_neurons, 1, -1)
-        A = -torch.exp(self.A_log.float()) 
-        y = self.selective_scan(x, dt, A, B, C, self.D)
-        
-        y = y * self.act(res)
-        out = torch.einsum('bnli,nid->bnld', y, self.w_out)
-        return out
-
-
-# ==============================================================================
-# 2. HYBRID ARCHITECTURE (Stem + INN)
-# ==============================================================================
-class HybridINN(nn.Module):
+class NeuronTokensINN(nn.Module):
     def __init__(self, 
                  vocab_size, 
-                 d_model=256,      # Dimension principale (Stem)
-                 inn_d_model=64,   # Dimension par neurone INN
-                 inn_neurons=16,   # Nombre de neurones INN
-                 stem_layers=2,    # Profondeur du tronc commun
-                 inn_layers=2,     # Profondeur de la partie INN
-                 n_head=4):
+                 d_model=256, 
+                 n_neurons=16, 
+                 n_layers=6,       # Un peu plus profond pour WikiText
+                 n_head=4, 
+                 dropout=0.1,
+                 max_seq_len=512):
         super().__init__()
         
         self.d_model = d_model
+        self.n_neurons = n_neurons
+        
+        # 1. Embedding & Positional Encoding
         self.embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_encoder = PositionalEncoding(d_model, dropout, max_len=max_seq_len + n_neurons)
         
-        # --- A. STEM (Tronc Commun) ---
-        # Utilise un Transformer Encoder standard pour construire une représentation contextuelle riche
-        # Cela évite le problème de "Cold Start" des neurones indépendants
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_head, batch_first=True)
-        self.stem = nn.TransformerEncoder(encoder_layer, num_layers=stem_layers)
+        # 2. Neuron Tokens (Les agents persistants)
+        # Initialisés comme des vecteurs latents apprenables
+        self.neuron_tokens = nn.Parameter(torch.randn(1, n_neurons, d_model) * 0.02)
         
-        # --- B. INN INTERFACE ---
-        # Projection vers l'espace neuronal: d_model -> (NumNeurons * InnDim)
-        self.proj_to_inn = nn.Linear(d_model, inn_neurons * inn_d_model)
+        # 3. Transformer Backbone (Cœur du système)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, 
+            nhead=n_head, 
+            dim_feedforward=d_model*4,
+            dropout=dropout, 
+            batch_first=True,
+            norm_first=True # Pre-Norm est plus stable pour la convergence
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         
-        # --- C. INN LAYERS ---
-        self.inn_layers = nn.ModuleList([
-            INNLayer(inn_neurons, inn_d_model, n_head) for _ in range(inn_layers)
-        ])
-        
-        # --- D. OUTPUT ---
-        # On récupère l'info de tous les neurones pour la décision finale
-        self.proj_from_inn = nn.Linear(inn_neurons * inn_d_model, d_model)
+        # 4. Output Head
         self.norm_final = nn.LayerNorm(d_model)
-        self.lm_head = nn.Linear(d_model, vocab_size)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         
-        # Tie weights (Optionnel mais recommandé)
+        # Tie weights (Crucial pour WikiText avec petit modèle)
         self.lm_head.weight = self.embedding.weight
         
         self._init_weights()
 
     def _init_weights(self):
-        # 1. Embedding & Linear Init (Standard GPT-style: N(0, 0.02))
         nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
-        if self.lm_head.bias is not None:
-            nn.init.zeros_(self.lm_head.bias)
-            
-        # 2. Zero-Init de la branche INN pour stabilité (ReZero trick)
-        # Le modèle démarre comme un Stem pur et apprend à utiliser l'INN progressivement
-        nn.init.zeros_(self.proj_from_inn.weight)
-        nn.init.zeros_(self.proj_from_inn.bias)
-        
-        # 3. Autres projections
-        nn.init.xavier_uniform_(self.proj_to_inn.weight)
+        # Les poids sont liés, donc lm_head est déjà init via embedding
+        # Init des neurones
+        nn.init.normal_(self.neuron_tokens, mean=0.0, std=0.02)
 
     def forward(self, input_ids):
+        # input_ids: (B, L)
         B, L = input_ids.shape
         
-        # 1. Stem Processing
-        x = self.embedding(input_ids) # (B, L, D)
-        x = self.stem(x)
+        # 1. Embed Sequence
+        x_seq = self.embedding(input_ids) * math.sqrt(self.d_model)
         
-        # 2. INN Processing
-        # Project to Neurons
-        x_inn = self.proj_to_inn(x) # (B, L, N*D_inn)
-        # Reshape to (B, N, L, D_inn)
-        x_inn = x_inn.view(B, L, self.inn_layers[0].mamba.num_neurons, self.inn_layers[0].mamba.d_model)
-        x_inn = x_inn.permute(0, 2, 1, 3)
+        # 2. Expand Neurons
+        x_neurons = self.neuron_tokens.expand(B, -1, -1)
         
-        # Apply INN Layers
-        for layer in self.inn_layers:
-            x_inn = layer(x_inn)
-            
-        # 3. Output Processing
-        # Aggregate from all neurons
-        x_inn_flat = x_inn.permute(0, 2, 1, 3).reshape(B, L, -1)
-        x_out = self.proj_from_inn(x_inn_flat)
+        # 3. Concatenate: [Neurons | Sequence]
+        x_full = torch.cat([x_neurons, x_seq], dim=1) # (B, N+L, D)
         
-        # Residual connection from Stem (Skip connection géante)
-        # Cela garantit que l'INN ne peut qu'améliorer la performance du Stem, jamais la dégrader
-        x_final = self.norm_final(x + x_out)
+        # 4. Positional Encoding
+        x_full = self.pos_encoder(x_full)
         
-        logits = self.lm_head(x_final)
+        # 5. Custom Mask (Hybrid Graph/Causal)
+        # ATTENTION: PyTorch attend un masque BOOLÉEN où True = Masqué (Ignoré)
+        mask = self._generate_prefix_causal_mask(self.n_neurons, L).to(input_ids.device)
+        
+        # 6. Transformer Pass
+        x_out = self.transformer(x_full, mask=mask)
+        
+        # 7. Extract Sequence Part only
+        # On ignore les N premiers tokens (les neurones mis à jour)
+        x_seq_out = x_out[:, self.n_neurons:, :]
+        
+        x_seq_out = self.norm_final(x_seq_out)
+        logits = self.lm_head(x_seq_out)
+        
         return logits
 
-class INNLayer(nn.Module):
-    def __init__(self, num_neurons, d_model, n_head):
+    def _generate_prefix_causal_mask(self, n_neurons, seq_len):
+        """
+        Masque Booléen (True = Ignoré/Masqué).
+        - Block [0:N, 0:N] (Neurons->Neurons) : False (Visible)
+        - Block [0:N, N:] (Neurons->Tokens)   : True (Masqué, pas de lookahead)
+        - Block [N:, 0:N] (Tokens->Neurons)   : False (Visible, mémoire)
+        - Block [N:, N:] (Tokens->Tokens)     : Causal (Triangulaire)
+        """
+        total_len = n_neurons + seq_len
+        mask = torch.zeros(total_len, total_len, dtype=torch.bool)
+        
+        # 1. Neurones ne voient pas le futur (Tokens)
+        mask[0:n_neurons, n_neurons:] = True
+        
+        # 2. Tokens Causal
+        # triu(..., 1) met des True au-dessus de la diagonale -> Masqué
+        token_mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool), diagonal=1)
+        mask[n_neurons:, n_neurons:] = token_mask
+        
+        return mask
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
         super().__init__()
-        self.mamba = MultiMambaBlock(num_neurons, d_model)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.comm_attention = MultiHeadNeuronAttention(num_neurons, d_model, n_head)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model),
-            nn.GELU(),
-            nn.Linear(4 * d_model, d_model)
-        )
-        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(p=dropout)
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
 
     def forward(self, x):
-        B, N, L, D = x.shape
-        res = x
-        x = self.mamba(x)
-        x = self.norm1(x + res)
-        
-        res = x
-        x_flat = x.permute(0, 2, 1, 3).reshape(B*L, N, D)
-        comm_out = self.comm_attention(x_flat)
-        comm_out = comm_out.reshape(B, L, N, D).permute(0, 2, 1, 3)
-        x = self.norm2(comm_out + res)
-        
-        res = x
-        x = self.ffn(x)
-        x = self.norm3(x + res)
-        return x
-
-class MultiHeadNeuronAttention(nn.Module):
-    def __init__(self, num_neurons, d_model, n_head):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(d_model, n_head, batch_first=True)
-    def forward(self, x):
-        attn_out, _ = self.attn(x, x, x)
-        return attn_out
+        x = x + self.pe[:x.size(1)].transpose(0, 1)
+        return self.dropout(x)
 
