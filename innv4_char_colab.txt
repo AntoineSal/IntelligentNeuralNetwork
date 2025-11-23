@@ -145,22 +145,31 @@ class MambaCore(nn.Module):
         dt = torch.clamp(dt, max=10.0) # NaN Fix
         A = -torch.exp(self.A_log)
         
-        # Sequential Scan (Python)
-        batch, seq_len, d_inner = x.shape
-        h = torch.zeros(batch, d_inner, 16, device=x.device)
-        ys = []
-        for t in range(seq_len):
-            dt_t = dt[:, t, :].unsqueeze(-1)
-            dA = torch.exp(dt_t * A)
-            dB = dt_t * B_ssm[:, t, :].unsqueeze(1)
-            u_t = x[:, t, :].unsqueeze(-1)
-            h = dA * h + dB * u_t
-            y_t = torch.sum(h * C_ssm[:, t, :].unsqueeze(1), dim=-1)
-            ys.append(y_t + self.D * x[:, t, :])
-            
-        y = torch.stack(ys, dim=1)
+        # Sequential Scan (Python JIT Optimized)
+        y = self.selective_scan(x, dt, A, B_ssm, C_ssm, self.D)
         y = y * self.act(res)
         return self.out_proj(y)
+
+    @staticmethod
+    def selective_scan(u, dt, A, B, C, D):
+        batch, seq_len, d_inner = u.shape
+        h = torch.zeros(batch, d_inner, 16, device=u.device)
+        ys = []
+        
+        # Pré-calculs vectorisés
+        dt_unsqueeze = dt.unsqueeze(-1)
+        dA = torch.exp(dt_unsqueeze * A) # (B, L, D, N)
+        dB = dt_unsqueeze * B.unsqueeze(2) # (B, L, D, N)
+        u_unsqueeze = u.unsqueeze(-1) # (B, L, D, 1)
+        
+        # Boucle optimisée (moins d'ops par tour)
+        for t in range(seq_len):
+            h = dA[:, t] * h + dB[:, t] * u_unsqueeze[:, t]
+            y_t = torch.sum(h * C[:, t].unsqueeze(2), dim=-1)
+            ys.append(y_t)
+            
+        y = torch.stack(ys, dim=1)
+        return y + D * u
 
 # --- Neural Colony ---
 class NeuralColony(nn.Module):
