@@ -4,35 +4,28 @@ import torch.optim as optim
 import time
 import os
 import math
-import json
 import requests
-from collections import Counter
-from src.model import NeuronTokensINN
+from src.model import INNv3
 
 # ==============================================================================
-# CONFIGURATION FINALE - "GOLDEN RUN"
+# CONFIGURATION INNv3 (SCALING)
 # ==============================================================================
 CONFIG = {
     'batch_size': 20,
-    'seq_len': 128,
-    'learning_rate': 5e-4, # LR robuste pour cette taille
-    'epochs': 20,          # WikiText a besoin de temps
+    'seq_len': 64,         # Reduced for Mamba/Memory intensity
+    'epochs': 10,          
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    
-    # Architecture (Optimisée pour WikiText ~10M params)
     'd_model': 256,
-    'n_neurons': 16,
-    'n_layers': 6,         # Plus profond = Meilleure abstraction
-    'n_head': 4,
-    'dropout': 0.1
+    'num_layers': 4,
+    'max_neurons': 128,    # Base pool size
+    'growth_interval': 2,  # Epochs between growth
 }
 
-# --- DATA LOADING (Standard & Robuste) ---
+# --- DATA LOADING ---
 class Dictionary:
     def __init__(self):
         self.word2idx = {}
         self.idx2word = []
-        self.counter = Counter()
     def add_word(self, word):
         if word not in self.word2idx:
             self.idx2word.append(word)
@@ -43,10 +36,8 @@ class Dictionary:
 class Corpus:
     def __init__(self, path):
         self.dictionary = Dictionary()
-        # Train sert à construire le vocabulaire
         self.train = self.tokenize(os.path.join(path, 'train.txt'), build_vocab=True)
         self.valid = self.tokenize(os.path.join(path, 'valid.txt'))
-        self.test = self.tokenize(os.path.join(path, 'test.txt'))
     
     def tokenize(self, path, build_vocab=False):
         if not os.path.exists(path): return torch.LongTensor([])
@@ -57,15 +48,12 @@ class Corpus:
                 tokens += len(words)
                 if build_vocab:
                     for word in words: self.dictionary.add_word(word)
-        
         with open(path, 'r', encoding="utf8") as f:
             ids = torch.LongTensor(tokens)
             token = 0
             for line in f:
                 words = line.split() + ['<eos>']
                 for word in words:
-                    # Gestion <unk> implicite : on ignore si pas dans vocab (ou on map au dernier)
-                    # Pour WikiText standard, le vocab train couvre tout.
                     if word in self.dictionary.word2idx:
                         ids[token] = self.dictionary.word2idx[word]
                     token += 1
@@ -84,9 +72,9 @@ def get_batch(source, i, seq_len):
     return data, target
 
 def main():
-    print("=== TRAINING INNv3 (NEURON TOKENS) ===")
+    print("=== TRAINING INNv3: SCALING DYNAMIC NETWORKS ===")
     
-    # 1. Data Check
+    # 1. Data
     data_path = "data/wikitext-2"
     if not os.path.exists(f"{data_path}/train.txt"):
         print("Downloading WikiText-2...")
@@ -105,37 +93,43 @@ def main():
     val_data = batchify(corpus.valid, 10, device)
     
     # 2. Model
-    model = NeuronTokensINN(
+    model = INNv3(
         vocab_size=vocab_size,
         d_model=CONFIG['d_model'],
-        n_neurons=CONFIG['n_neurons'],
-        n_layers=CONFIG['n_layers'],
-        n_head=CONFIG['n_head'],
-        dropout=CONFIG['dropout'],
-        max_seq_len=CONFIG['seq_len']
+        num_layers=CONFIG['num_layers'],
+        max_neurons=CONFIG['max_neurons']
     ).to(device)
     
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f"Model Params: {num_params:,} ({num_params/1e6:.2f}M)")
+    print(f"Model Params: {sum(p.numel() for p in model.parameters()):,}")
     
-    # 3. Optimize
-    optimizer = optim.AdamW(model.parameters(), lr=CONFIG['learning_rate'], weight_decay=0.01)
+    # 3. Optimizers (Multi-Scale)
+    # Split parameters into groups
+    router_params = []
+    decoder_params = []
+    neuron_params = []
+    
+    for name, param in model.named_parameters():
+        if 'router' in name:
+            router_params.append(param)
+        elif 'decoder' in name:
+            decoder_params.append(param)
+        else:
+            neuron_params.append(param)
+            
+    optimizer = optim.AdamW([
+        {'params': router_params, 'lr': 1e-3},   # Fast adaptation
+        {'params': neuron_params, 'lr': 5e-4},   # Standard
+        {'params': decoder_params, 'lr': 1e-4}   # Careful with vocab
+    ])
+    
     criterion = nn.CrossEntropyLoss()
     
-    # Scheduler OneCycle pour convergence rapide
-    steps_per_epoch = train_data.size(0) // CONFIG['seq_len']
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer, 
-        max_lr=CONFIG['learning_rate'],
-        steps_per_epoch=steps_per_epoch,
-        epochs=CONFIG['epochs'],
-        pct_start=0.1
-    )
-    
-    # 4. Train
-    best_val_loss = float('inf')
-    
-    for epoch in range(1, CONFIG['epochs']+1):
+    # 4. Train Loop
+    for epoch in range(1, CONFIG['epochs'] + 1):
+        # Progressive Growth
+        if epoch > 1 and epoch % CONFIG['growth_interval'] == 0:
+            model.grow_network()
+            
         model.train()
         total_loss = 0
         start_time = time.time()
@@ -149,18 +143,18 @@ def main():
             loss = criterion(logits.reshape(-1, vocab_size), targets)
             loss.backward()
             
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # Gradient Clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             optimizer.step()
-            scheduler.step()
             
             total_loss += loss.item()
             
             if batch % 100 == 0 and batch > 0:
                 cur_loss = total_loss / 100
                 ppl = math.exp(cur_loss)
-                print(f"| epoch {epoch} | batch {batch} | loss {cur_loss:.2f} | ppl {ppl:.2f} | lr {scheduler.get_last_lr()[0]:.2e}")
+                print(f"| epoch {epoch} | batch {batch} | loss {cur_loss:.2f} | ppl {ppl:.2f}")
                 total_loss = 0
-        
+                
         # Validation
         model.eval()
         val_loss = 0
@@ -173,10 +167,7 @@ def main():
         val_ppl = math.exp(val_loss)
         
         print(f"=== Epoch {epoch} | Val Loss {val_loss:.2f} | Val PPL {val_ppl:.2f} ===")
-        
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), "checkpoints/innv3_best.pt")
+        torch.save(model.state_dict(), "checkpoints/innv3_scaling.pt")
 
 if __name__ == "__main__":
     os.makedirs("checkpoints", exist_ok=True)
