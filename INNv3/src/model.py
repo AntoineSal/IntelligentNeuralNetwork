@@ -122,6 +122,23 @@ class HybridINN(nn.Module):
         
         # Tie weights (Optionnel mais recommandé)
         self.lm_head.weight = self.embedding.weight
+        
+        self._init_weights()
+
+    def _init_weights(self):
+        # 1. Embedding & Linear Init (Standard GPT-style: N(0, 0.02))
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
+        if self.lm_head.bias is not None:
+            nn.init.zeros_(self.lm_head.bias)
+            
+        # 2. Zero-Init de la branche INN pour stabilité (ReZero trick)
+        # Le modèle démarre comme un Stem pur et apprend à utiliser l'INN progressivement
+        nn.init.zeros_(self.proj_from_inn.weight)
+        nn.init.zeros_(self.proj_from_inn.bias)
+        
+        # 3. Autres projections
+        nn.init.xavier_uniform_(self.proj_to_inn.weight)
 
     def forward(self, input_ids):
         B, L = input_ids.shape
