@@ -20,14 +20,14 @@ import torch
 CONFIG = {
     # --- Architecture ---
     'd_model': 256,          # Taille standard (ni trop petit, ni trop gros)
-    'num_neurons': 64,       # Le nombre de neurones indépendants
+    'num_neurons': 32,       # REDUIT: 64 -> 32 pour sauver la VRAM
     'n_layers': 4,           # Profondeur
     'n_head': 4,             # Têtes d'attention inter-neurones
     'dropout': 0.2,          # Crucial pour WikiText
     
     # --- Entraînement ---
-    'batch_size': 32,        # Physique
-    'accum_steps': 1,        # Accumulation (si OOM, passer à 2 ou 4)
+    'batch_size': 8,         # REDUIT: 32 -> 8 (Physique)
+    'accum_steps': 4,        # AJOUTÉ: Simule batch 32
     'seq_len': 64,           # Contexte
     'epochs': 20,
     'learning_rate': 5e-4,   # LR Standard
