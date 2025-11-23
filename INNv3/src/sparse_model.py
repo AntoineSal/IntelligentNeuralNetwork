@@ -6,82 +6,89 @@ import math
 # On réutilise le bloc Mamba de v2 qui est sain
 from INNv2.src.mamba import MultiMambaBlock
 
-class SparseINN(nn.Module):
+class OptimizedINN(nn.Module):
     def __init__(self, 
                  vocab_size, 
-                 d_model=256,      # Dimension "Thick" (au lieu de 64)
-                 num_neurons=16,   # Moins de neurones (au lieu de 64)
+                 d_embed=128,      # Petit embedding
+                 d_model=256,      # Core dimension
+                 num_neurons=12,   # N=12 (Suffisant & léger)
                  num_layers=4,
                  n_head=4,
-                 top_k=4,          # Sparsité : on n'écoute que 4 voisins
-                 num_static=4):    # Ancrages : 4 neurones ont des clés statiques
+                 top_k=4,
+                 num_static=4,
+                 max_seq_len=256):
         super().__init__()
         
         self.num_neurons = num_neurons
         self.d_model = d_model
-        self.top_k = top_k
-        self.num_static = num_static
         
-        # Embedding
-        self.embedding = nn.Embedding(vocab_size, d_model)
+        # --- 1. EMBEDDING STAGE ---
+        self.token_embedding = nn.Embedding(vocab_size, d_embed)
+        self.embed_proj = nn.Linear(d_embed, d_model, bias=False)
         
-        # Input Projection: (B, L, D) -> (B, N, L, D)
-        # On projette vers N sous-espaces différents
-        self.input_proj = nn.Linear(d_model, num_neurons * d_model)
+        # Positional Encoding (Simple learned)
+        self.pos_embedding = nn.Parameter(torch.randn(1, max_seq_len, d_model) * 0.02)
+        self.input_norm = nn.LayerNorm(d_model)
         
-        # Layers
+        # --- 2. DISTRIBUTION STAGE ---
+        # Projette le vecteur de contexte vers N neurones indépendants
+        self.neuron_dist = nn.Linear(d_model, num_neurons * d_model)
+        
+        # --- 3. INN LAYERS ---
         self.layers = nn.ModuleList([
             SparseINNLayer(num_neurons, d_model, n_head, top_k, num_static) 
             for _ in range(num_layers)
         ])
         
-        # Output: Consensus bottleneck pour réduire les params
-        # (N * D) -> D -> Vocab
-        self.consensus_proj = nn.Linear(num_neurons * d_model, d_model)
-        self.out_proj = nn.Linear(d_model, vocab_size)
-        self.norm_f = nn.LayerNorm(d_model)
+        # --- 4. AGGREGATION STAGE ---
+        # Mean Pooling (pas de params) + Final Norm
+        self.final_norm = nn.LayerNorm(d_model)
         
-        # Tie weights (embedding et output partagent la même matrice = économie massive)
-        self.out_proj.weight = self.embedding.weight
+        # --- 5. OUTPUT STAGE (TIED) ---
+        # On inverse la projection d'embedding: 256 -> 128
+        self.output_proj = nn.Linear(d_model, d_embed, bias=False)
+        # LM Head: 128 -> Vocab (Tied with token_embedding)
+        self.lm_head = nn.Linear(d_embed, vocab_size, bias=False)
+        self.lm_head.weight = self.token_embedding.weight
         
-        # Init
         self._init_weights()
 
     def _init_weights(self):
-        # Init GPT-style pour la stabilité
-        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
-        # out_proj partage les poids, donc on init juste le bias
-        if self.out_proj.bias is not None:
-            nn.init.zeros_(self.out_proj.bias)
+        # Standard GPT initialization
+        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.embed_proj.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.neuron_dist.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.output_proj.weight, mean=0.0, std=0.02)
         
-        # Input & Consensus proj
-        nn.init.xavier_uniform_(self.input_proj.weight)
-        nn.init.xavier_uniform_(self.consensus_proj.weight)
+        # Zero bias for stability
+        if self.neuron_dist.bias is not None: nn.init.zeros_(self.neuron_dist.bias)
 
     def forward(self, input_ids):
-        batch_size, seq_len = input_ids.shape
+        B, L = input_ids.shape
         
         # 1. Embedding
-        x = self.embedding(input_ids) # (B, L, D)
+        x = self.token_embedding(input_ids) # (B, L, 128)
+        x = self.embed_proj(x)              # (B, L, 256)
+        x = x + self.pos_embedding[:, :L, :]
+        x = self.input_norm(x)
         
-        # 2. Projection vers les neurones
-        x = self.input_proj(x)
-        x = x.view(batch_size, seq_len, self.num_neurons, self.d_model)
-        x = x.permute(0, 2, 1, 3) # (B, N, L, D)
+        # 2. Distribution
+        x = self.neuron_dist(x)             # (B, L, N*D)
+        x = x.view(B, L, self.num_neurons, self.d_model)
+        x = x.permute(0, 2, 1, 3)           # (B, N, L, D)
         
         # 3. Layers
         for layer in self.layers:
             x = layer(x)
             
-        # 4. Output avec Consensus
-        x = self.norm_f(x) # Norm par neurone
-        x_flat = x.permute(0, 2, 1, 3).reshape(batch_size, seq_len, -1) # (B, L, N*D)
+        # 4. Aggregation (Mean Pooling over Neurons)
+        # (B, N, L, D) -> (B, L, D)
+        x = x.mean(dim=1) 
+        x = self.final_norm(x)
         
-        # Bottleneck (Réduction dimensionnelle)
-        x_consensus = self.consensus_proj(x_flat) # (B, L, D)
-        
-        # Projection finale
-        logits = self.out_proj(x_consensus)
+        # 5. Output
+        x = self.output_proj(x)             # (B, L, 128)
+        logits = self.lm_head(x)            # (B, L, Vocab)
         
         return logits
 
@@ -89,46 +96,51 @@ class SparseINNLayer(nn.Module):
     def __init__(self, num_neurons, d_model, n_head, top_k, num_static):
         super().__init__()
         
-        # Phase 1: Intra-Neuron (Time Mixing via Mamba)
-        self.mamba = MultiMambaBlock(num_neurons, d_model)
+        # Mamba (Intra-Neuron)
         self.norm1 = nn.LayerNorm(d_model)
+        self.mamba = MultiMambaBlock(num_neurons, d_model)
         
-        # Phase 2: Inter-Neuron (Space Mixing via Sparse Attention)
-        self.comm_attention = SparseNeuronAttention(num_neurons, d_model, n_head, top_k, num_static)
+        # Attention (Inter-Neuron)
         self.norm2 = nn.LayerNorm(d_model)
+        self.comm_attention = SparseNeuronAttention(num_neurons, d_model, n_head, top_k, num_static)
         
-        # Phase 3: Computation (FFN)
+        # FFN
+        self.norm3 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
             nn.GELU(),
             nn.Linear(4 * d_model, d_model)
         )
-        self.norm3 = nn.LayerNorm(d_model)
 
     def forward(self, x):
-        # x: (B, N, L, D)
-        
-        # 1. Mamba
+        # 1. Mamba (Pre-Norm)
+        # Note: Mamba paper uses Pre-Norm logic usually
         res = x
-        x = self.mamba(x)
-        x = self.norm1(x + res)
+        x_norm = self.norm1(x) 
+        # Appliquer Mamba sur x_norm ??? 
+        # INNv2 faisait post-norm. Gardons post-norm pour compatibilité MultiMambaBlock
+        # Ou suivons standard Pre-Norm.
+        # Le MultiMambaBlock actuel n'a pas de Norm interne.
+        # Faisons Pre-Norm standard : x = x + f(norm(x))
         
-        # 2. Sparse Attention
+        x = res + self.mamba(self.norm1(x))
+        
+        # 2. Attention
         res = x
-        # (B, N, L, D) -> (B, L, N, D) -> (B*L, N, D)
+        x_norm = self.norm2(x)
+        
+        # Reshape for attention: (B, N, L, D) -> (B*L, N, D)
         B, N, L, D = x.shape
-        x_flat = x.permute(0, 2, 1, 3).reshape(B*L, N, D)
+        x_flat = x_norm.permute(0, 2, 1, 3).reshape(B*L, N, D)
         
         comm_out = self.comm_attention(x_flat)
-        
-        # (B*L, N, D) -> (B, L, N, D) -> (B, N, L, D)
         comm_out = comm_out.reshape(B, L, N, D).permute(0, 2, 1, 3)
-        x = self.norm2(comm_out + res)
+        
+        x = res + comm_out
         
         # 3. FFN
         res = x
-        x = self.ffn(x)
-        x = self.norm3(x + res)
+        x = res + self.ffn(self.norm3(x))
         
         return x
 
@@ -139,7 +151,7 @@ class SparseNeuronAttention(nn.Module):
         self.d_model = d_model
         self.n_head = n_head
         self.head_dim = d_model // n_head
-        self.top_k = min(top_k, num_neurons) # Sécurité
+        self.top_k = min(top_k, num_neurons)
         self.num_static = num_static
         
         self.q_proj = nn.Linear(d_model, d_model)
@@ -147,51 +159,31 @@ class SparseNeuronAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
         
-        # STATIC ANCHORS: Clés fixes pour les premiers neurones
-        # Ils agissent comme des "topics" fixes que les autres peuvent requêter
         if num_static > 0:
             self.static_keys = nn.Parameter(torch.randn(num_static, d_model))
 
     def forward(self, x):
-        # x: (Batch, N, D) where Batch = RealBatch * SeqLen
         B, N, D = x.shape
-        
-        Q = self.q_proj(x).view(B, N, self.n_head, self.head_dim).transpose(1, 2) # (B, H, N, Dh)
+        Q = self.q_proj(x).view(B, N, self.n_head, self.head_dim).transpose(1, 2)
         K = self.k_proj(x).view(B, N, self.n_head, self.head_dim).transpose(1, 2)
         V = self.v_proj(x).view(B, N, self.n_head, self.head_dim).transpose(1, 2)
         
-        # Override K for static neurons (Hybrid Static/Dynamic)
-        # Si num_static > 0, les K des premiers neurones sont remplacés par les K statiques
         if self.num_static > 0:
-            # On projette les clés statiques pour avoir les têtes
             K_stat = self.static_keys.view(1, self.num_static, self.n_head, self.head_dim).transpose(1, 2)
-            # On remplace dans le tenseur K global
-            # K[:, :, :self.num_static, :] = K_stat.expand(B, -1, -1, -1) 
-            # Attention: In-place modif sur expand peut être risqué pour autograd -> concatenation
             K_dyn = K[:, :, self.num_static:, :]
             K_stat_exp = K_stat.expand(B, -1, -1, -1)
             K = torch.cat([K_stat_exp, K_dyn], dim=2)
             
-        # Attention Scores
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim) # (B, H, N, N)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
         
-        # --- SPARSITY: TOP-K GATING ---
         if self.top_k < N:
-            # On garde seulement les Top-K valeurs par query
             top_scores, top_indices = torch.topk(scores, self.top_k, dim=-1)
-            
-            # On crée un masque de -inf (Compatible old PyTorch)
             mask = torch.full_like(scores, float('-inf'))
-            
-            # On remplit les valeurs aux indices top-k
             mask.scatter_(-1, top_indices, top_scores)
             scores = mask
             
         attn = torch.softmax(scores, dim=-1)
-        
-        # Aggregation
-        out = torch.matmul(attn, V) # (B, H, N, Dh)
+        out = torch.matmul(attn, V)
         out = out.transpose(1, 2).contiguous().view(B, N, D)
         
         return self.out_proj(out)
-

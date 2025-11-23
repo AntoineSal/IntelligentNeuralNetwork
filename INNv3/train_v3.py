@@ -7,28 +7,29 @@ import math
 import json
 import requests
 from collections import Counter
-from src.sparse_model import SparseINN
+from src.sparse_model import OptimizedINN
 
 # ==============================================================================
-# CONFIGURATION INNv3 - "THICK & SPARSE"
+# CONFIGURATION INNv3 - "LEAN & MEAN"
 # ==============================================================================
 CONFIG = {
     'batch_size': 20,
-    'seq_len': 64,
-    'learning_rate': 5e-4, # Un peu plus doux
+    'seq_len': 128,        # Augmenté un peu pour le contexte word-level
+    'learning_rate': 5e-4,
     'epochs': 15,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     
-    # Model Params
-    'd_model': 256,        # GRANDE DIMENSION (Crucial pour les mots)
-    'num_neurons': 16,     # PEU DE NEURONES (Experts)
+    # Optimized Params (Target ~9.5M)
+    'd_embed': 128,        # Petit embedding
+    'd_model': 256,        # Core dimension
+    'num_neurons': 12,     # 12 Neurones
     'num_layers': 4,
     'n_head': 4,
-    'top_k': 4,            # SPARSITY (Chaque neurone écoute 4 experts)
-    'num_static': 4        # ANCHORS (4 neurones sont des registres fixes)
+    'top_k': 4,
+    'num_static': 4
 }
 
-# --- DATA LOADING (WikiText-2 Word-Level) ---
+# --- DATA LOADING (Identique) ---
 class Dictionary:
     def __init__(self):
         self.word2idx = {}
@@ -83,7 +84,7 @@ def get_batch(source, i, seq_len):
     return data, target
 
 def main():
-    print("=== TRAINING INNv3 (SPARSE) on WikiText-2 ===")
+    print("=== TRAINING INNv3 (OPTIMIZED) on WikiText-2 ===")
     
     # 1. Data Check
     if not os.path.exists("data/wikitext-2/train.txt"):
@@ -103,8 +104,9 @@ def main():
     val_data = batchify(corpus.valid, 10, device)
     
     # 2. Model
-    model = SparseINN(
+    model = OptimizedINN(
         vocab_size=vocab_size,
+        d_embed=CONFIG['d_embed'],
         d_model=CONFIG['d_model'],
         num_neurons=CONFIG['num_neurons'],
         num_layers=CONFIG['num_layers'],
@@ -113,7 +115,11 @@ def main():
         num_static=CONFIG['num_static']
     ).to(device)
     
-    print(f"Model Params: {sum(p.numel() for p in model.parameters()):,}")
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"Model Params: {num_params:,} ({num_params/1e6:.2f}M)")
+    
+    if num_params > 12000000:
+        print("⚠️ WARNING: Params > 12M. Check configuration.")
     
     # 3. Optimize
     optimizer = optim.AdamW(model.parameters(), lr=CONFIG['learning_rate'], weight_decay=0.1)
@@ -125,7 +131,7 @@ def main():
         optimizer, 
         max_lr=CONFIG['learning_rate'],
         total_steps=total_steps,
-        pct_start=0.1 # 10% Warmup
+        pct_start=0.05 # 5% Warmup (Rapide)
     )
     
     # 4. Train
@@ -175,4 +181,3 @@ def main():
 if __name__ == "__main__":
     os.makedirs("checkpoints", exist_ok=True)
     main()
-
