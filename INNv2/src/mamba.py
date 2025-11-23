@@ -7,10 +7,6 @@ class MultiMambaBlock(nn.Module):
     def __init__(self, num_neurons, d_model, d_state=16, d_conv=4, expand=2):
         """
         MultiMambaBlock: Version vectorisée pour gérer N neurones indépendants en parallèle.
-        
-        Args:
-            num_neurons (int): Nombre de neurones INN.
-            d_model (int): Dimension par neurone.
         """
         super().__init__()
         self.num_neurons = num_neurons
@@ -90,7 +86,7 @@ class MultiMambaBlock(nn.Module):
 
     def selective_scan(self, u, dt, A, B, C, D):
         """
-        Multi-Neuron Scan.
+        Multi-Neuron Scan (Python Ref).
         """
         batch_size, n_neurons, seq_len, d_inner = u.shape
         d_state = A.shape[2]

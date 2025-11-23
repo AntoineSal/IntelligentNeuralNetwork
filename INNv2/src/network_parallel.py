@@ -18,31 +18,54 @@ class ParallelINN(nn.Module):
         # Embedding
         self.embedding = nn.Embedding(vocab_size, d_model)
         
+        # Projection d'entrée différenciée par neurone (Brise la symétrie)
+        # Transforme l'embedding global en une entrée spécifique pour chaque neurone
+        self.input_proj = nn.Linear(d_model, num_neurons * d_model)
+        
         # Stack
         self.layers = nn.ModuleList([
             INNLayer(num_neurons, d_model, n_head) for _ in range(num_layers)
         ])
         
         # Output
-        self.n_action = max(1, num_neurons // 8)
+        # On utilise tous les neurones pour la décision finale (plus robuste)
+        # Ou juste les 'Action Neurons' comme avant. Gardons Action Neurons pour le principe.
+        self.n_action = max(1, num_neurons // 4) # Augmenté un peu (1/4 au lieu de 1/8)
         self.out_proj = nn.Linear(self.n_action * d_model, vocab_size)
         self.norm_f = nn.LayerNorm(d_model)
+        
+        self._init_weights()
+
+    def _init_weights(self):
+        # Init standard pour Transformer/Mamba
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
 
     def forward(self, input_ids):
         batch_size, seq_len = input_ids.shape
         
-        # (B, L) -> (B, L, D) -> (B, N, L, D)
+        # 1. Embedding (B, L, D)
         x = self.embedding(input_ids)
-        x = x.unsqueeze(1).expand(-1, self.num_neurons, -1, -1)
         
+        # 2. Projection Différenciée (CRUCIAL)
+        # (B, L, D) -> (B, L, N*D)
+        x = self.input_proj(x)
+        # (B, L, N*D) -> (B, L, N, D) -> (B, N, L, D)
+        x = x.view(batch_size, seq_len, self.num_neurons, self.d_model)
+        x = x.permute(0, 2, 1, 3)
+        
+        # 3. Layers
         for layer in self.layers:
             x = layer(x)
             
         x = self.norm_f(x)
         
-        # Action Neurons (Last N)
-        action_out = x[:, -self.n_action:, :, :]
-        action_out = action_out.permute(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
+        # 4. Action Output
+        # On prend les derniers neurones
+        action_out = x[:, -self.n_action:, :, :] # (B, n_act, L, D)
+        action_out = action_out.permute(0, 2, 1, 3) # (B, L, n_act, D)
+        action_out = action_out.reshape(batch_size, seq_len, -1) # (B, L, n_act*D)
         
         logits = self.out_proj(action_out)
         return logits
@@ -67,19 +90,20 @@ class INNLayer(nn.Module):
     def forward(self, x):
         B, N, L, D = x.shape
         
-        # 1. Mamba (Temps)
+        # 1. Mamba (Temps - Intra Neuron)
         res = x
         x = self.mamba(x)
         x = self.norm1(x + res)
         
-        # 2. Attention (Espace/Neurones)
+        # 2. Attention (Espace - Inter Neuron)
         res = x
-        # On mixe sur N : (B*L, N, D)
+        # (B, N, L, D) -> (B, L, N, D) -> (B*L, N, D)
         x_flat = x.permute(0, 2, 1, 3).reshape(B*L, N, D)
         
         comm_out = self.comm_attention(x_flat)
-        comm_out = comm_out.reshape(B, L, N, D).permute(0, 2, 1, 3)
         
+        # (B*L, N, D) -> (B, L, N, D) -> (B, N, L, D)
+        comm_out = comm_out.reshape(B, L, N, D).permute(0, 2, 1, 3)
         x = self.norm2(comm_out + res)
         
         # 3. FFN (Calcul)
@@ -95,6 +119,7 @@ class MultiHeadNeuronAttention(nn.Module):
         self.attn = nn.MultiheadAttention(d_model, n_head, batch_first=True)
         
     def forward(self, x):
+        # x: (Batch*L, Num_Neurons, D_Model)
+        # Attention is applied over the Num_Neurons dimension (as sequence length)
         attn_out, _ = self.attn(x, x, x)
         return attn_out
-
