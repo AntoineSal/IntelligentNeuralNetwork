@@ -20,7 +20,7 @@ class INNv4(nn.Module):
         
         # 3. Colonies (Les Départements)
         self.colonies = nn.ModuleList([
-            NeuralColony(d_model, neurons_per_colony, id=i)
+            NeuralColony(d_model, neurons_per_colony, colony_id=i)
             for i in range(n_colonies)
         ])
         
