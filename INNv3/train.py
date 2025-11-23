@@ -12,8 +12,8 @@ from torch.cuda.amp import autocast, GradScaler
 # CONFIGURATION CORRIGÉE - INNv3 SCALING
 # ==============================================================================
 CONFIG = {
-    'batch_size': 32,        # Augmenté pour stabilité
-    'accum_steps': 1,        # Plus besoin avec 32 si la mémoire tient, sinon augmenter
+    'batch_size': 8,         # Réduit physiquement pour la mémoire
+    'accum_steps': 4,        # Simule un batch_size de 32 (8 * 4)
     'seq_len': 64,         
     'epochs': 20,          
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
@@ -22,9 +22,9 @@ CONFIG = {
     'max_neurons': 128,    
     'growth_interval': 2,
     'learning_rate': 5e-4,
-    'dropout': 0.2,          # Crucial pour WikiText
-    'grad_clip': 0.25,       # Agressif pour stabilité
-    'warmup_steps': 1000     # Crucial
+    'dropout': 0.2,
+    'grad_clip': 0.25,
+    'warmup_steps': 1000
 }
 
 # --- DATA LOADING ---
@@ -149,7 +149,9 @@ def main():
     ], weight_decay=0.1)
     
     # OneCycleLR
-    steps_per_epoch = train_data.size(0) // CONFIG['seq_len']
+    # Ajustement pour l'accumulation de gradient
+    effective_batch_size = CONFIG['batch_size'] * CONFIG['accum_steps']
+    steps_per_epoch = train_data.size(0) // CONFIG['seq_len'] // CONFIG['accum_steps']
     total_steps = steps_per_epoch * CONFIG['epochs']
     
     scheduler = optim.lr_scheduler.OneCycleLR(
@@ -182,28 +184,32 @@ def main():
             with autocast():
                 logits = model(data)
                 loss = criterion(logits.reshape(-1, vocab_size), targets)
+                loss = loss / CONFIG['accum_steps'] # Normalize for accumulation
             
             scaler.scale(loss).backward()
             
-            # Unscale before clipping
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG['grad_clip'])
-            
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-            scheduler.step() # Step per batch
+            # Accumulate gradients
+            if (batch + 1) % CONFIG['accum_steps'] == 0:
+                # Unscale before clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG['grad_clip'])
+                
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                scheduler.step() # Step once per effective batch
             
             # Accumulate correctly
+            # Note: loss.item() is already divided by accum_steps, so we multiply back for logging
             n_tokens = data.size(0) * data.size(1)
-            total_loss += loss.item() * n_tokens
+            total_loss += (loss.item() * CONFIG['accum_steps']) * n_tokens
             total_tokens += n_tokens
             
-            if batch % 100 == 0 and batch > 0:
+            if (batch + 1) % (100 * CONFIG['accum_steps']) == 0:
                 cur_loss = total_loss / total_tokens
                 ppl = math.exp(cur_loss)
                 elapsed = time.time() - start_time
-                print(f"| epoch {epoch} | {batch}/{steps_per_epoch} batches | lr {scheduler.get_last_lr()[1]:.2e} | loss {cur_loss:.2f} | ppl {ppl:.2f}")
+                print(f"| epoch {epoch} | {batch}/{train_data.size(0)//CONFIG['seq_len']} batches | lr {scheduler.get_last_lr()[1]:.2e} | loss {cur_loss:.2f} | ppl {ppl:.2f}")
                 total_loss = 0
                 total_tokens = 0
                 start_time = time.time()
