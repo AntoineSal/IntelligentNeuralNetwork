@@ -6,7 +6,7 @@ import os
 import math
 import requests
 from src.model import INNv3
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 # ==============================================================================
 # CONFIGURATION CORRIGÉE - INNv3 SCALING
@@ -86,7 +86,7 @@ def evaluate(model, data_source, criterion, vocab_size, seq_len):
             data, targets = get_batch(data_source, i, seq_len)
             data = data.t()
             
-            with autocast():
+            with autocast('cuda'):
                 logits = model(data)
                 loss = criterion(logits.reshape(-1, vocab_size), targets)
             
@@ -163,7 +163,7 @@ def main():
     )
     
     criterion = nn.CrossEntropyLoss()
-    scaler = GradScaler()
+    scaler = GradScaler('cuda')
     
     # 4. Train Loop
     optimizer.zero_grad()
@@ -181,7 +181,7 @@ def main():
             data, targets = get_batch(train_data, i, CONFIG['seq_len'])
             data = data.t() # (B, L)
             
-            with autocast():
+            with autocast('cuda'):
                 logits = model(data)
                 loss = criterion(logits.reshape(-1, vocab_size), targets)
                 loss = loss / CONFIG['accum_steps'] # Normalize for accumulation
