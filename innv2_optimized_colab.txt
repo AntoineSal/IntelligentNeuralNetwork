@@ -19,20 +19,20 @@ import torch
 
 CONFIG = {
     # --- Architecture ---
-    'd_model': 256,          # Suffisant pour Char-Level (vocab < 300)
-    'num_neurons': 32,       # Retour à 32 pour la capacité parallèle
+    'd_model': 128,          # REDUIT: 256 -> 128 (Suffisant pour char-level)
+    'num_neurons': 32,       # On garde la capacité parallèle
     'n_layers': 4,           
     'n_head': 4,             
-    'dropout': 0.1,          # Moins de dropout nécessaire en char-level
+    'dropout': 0.1,          
     
     # --- Entraînement ---
-    'batch_size': 32,        # Physique
+    'batch_size': 8,         # Physique
     'accum_steps': 1,        
-    'seq_len': 256,          # BOOST: Contexte long pour capturer des mots entiers
-    'epochs': 10,            # Char-Level apprend plus lentement (plus de pas)
-    'learning_rate': 1e-3,   # LR plus agressif possible
+    'seq_len': 128,          # REDUIT: 256 -> 128 (Pour passer en VRAM)
+    'epochs': 10,            
+    'learning_rate': 1e-3,   
     'warmup_steps': 1000,    
-    'grad_clip': 1.0,        # Clip standard
+    'grad_clip': 1.0,        
     
     # --- Système ---
     'device': 'cuda' if torch.cuda.is_available() else 'cpu'
