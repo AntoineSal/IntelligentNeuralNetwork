@@ -13,35 +13,35 @@ except:
 # (Attendre le redémarrage)
 
 # ==============================================================================
-# CELLULE 2: HYPERPARAMÈTRES (LE TABLEAU DE BORD)
+# CELLULE 2: HYPERPARAMÈTRES (CHAR-LEVEL CONFIG)
 # ==============================================================================
 import torch
 
 CONFIG = {
     # --- Architecture ---
-    'd_model': 512,          # BOOST: 256 -> 512
-    'num_neurons': 8,        # REDUIT: 32 -> 8
-    'n_layers': 6,           # BOOST: 4 -> 6
-    'n_head': 4,             # Têtes d'attention inter-neurones
-    'dropout': 0.2,          # Crucial pour WikiText
+    'd_model': 256,          # Suffisant pour Char-Level (vocab < 300)
+    'num_neurons': 32,       # Retour à 32 pour la capacité parallèle
+    'n_layers': 4,           
+    'n_head': 4,             
+    'dropout': 0.1,          # Moins de dropout nécessaire en char-level
     
     # --- Entraînement ---
-    'batch_size': 8,         # Physique
-    'accum_steps': 4,        # Simule batch 32
-    'seq_len': 128,          # BOOST: 64 -> 128
-    'epochs': 20,
-    'learning_rate': 3e-4,   # REDUIT: 5e-4 -> 3e-4 (Safe)
-    'warmup_steps': 1000,    # Douceur au démarrage
-    'grad_clip': 0.1,        # REDUIT: 0.25 -> 0.1 (Safe)
+    'batch_size': 32,        # Physique
+    'accum_steps': 1,        
+    'seq_len': 256,          # BOOST: Contexte long pour capturer des mots entiers
+    'epochs': 10,            # Char-Level apprend plus lentement (plus de pas)
+    'learning_rate': 1e-3,   # LR plus agressif possible
+    'warmup_steps': 1000,    
+    'grad_clip': 1.0,        # Clip standard
     
     # --- Système ---
     'device': 'cuda' if torch.cuda.is_available() else 'cpu'
 }
 
-print("Configuration chargée :", CONFIG)
+print("Configuration Char-Level chargée :", CONFIG)
 
 # ==============================================================================
-# CELLULE 3: DATA LOADING (ROBUSTE)
+# CELLULE 3: DATA LOADING (CHAR-LEVEL)
 # ==============================================================================
 import os
 import torch
@@ -49,39 +49,46 @@ import requests
 
 class Dictionary:
     def __init__(self):
-        self.word2idx = {}
-        self.idx2word = []
-    def add_word(self, word):
-        if word not in self.word2idx:
-            self.idx2word.append(word)
-            self.word2idx[word] = len(self.idx2word) - 1
-        return self.word2idx[word]
-    def __len__(self): return len(self.idx2word)
+        self.char2idx = {}
+        self.idx2char = []
+        
+    def add_char(self, char):
+        if char not in self.char2idx:
+            self.idx2char.append(char)
+            self.char2idx[char] = len(self.idx2char) - 1
+        return self.char2idx[char]
+        
+    def __len__(self): return len(self.idx2char)
 
 class Corpus:
     def __init__(self, path):
         self.dictionary = Dictionary()
+        # On lit en mode binaire ou utf-8 caractère par caractère
         self.train = self.tokenize(os.path.join(path, 'train.txt'), build_vocab=True)
         self.valid = self.tokenize(os.path.join(path, 'valid.txt'))
     
     def tokenize(self, path, build_vocab=False):
         if not os.path.exists(path): return torch.LongTensor([])
+        
+        # Lecture complète du fichier en une chaîne
         with open(path, 'r', encoding="utf8") as f:
-            tokens = 0
-            for line in f:
-                words = line.split() + ['<eos>']
-                tokens += len(words)
-                if build_vocab:
-                    for word in words: self.dictionary.add_word(word)
-        with open(path, 'r', encoding="utf8") as f:
-            ids = torch.LongTensor(tokens)
-            token = 0
-            for line in f:
-                words = line.split() + ['<eos>']
-                for word in words:
-                    if word in self.dictionary.word2idx:
-                        ids[token] = self.dictionary.word2idx[word]
-                    token += 1
+            text = f.read()
+            
+        if build_vocab:
+            # Ajouter tous les caractères uniques au vocab
+            chars = sorted(list(set(text)))
+            for char in chars:
+                self.dictionary.add_char(char)
+                
+        # Tokenization
+        ids = torch.LongTensor(len(text))
+        for i, char in enumerate(text):
+            if char in self.dictionary.char2idx:
+                ids[i] = self.dictionary.char2idx[char]
+            else:
+                # Fallback (ne devrait pas arriver si vocab construit sur train)
+                ids[i] = 0 
+                
         return ids
 
 def batchify(data, bsz, device):
@@ -106,9 +113,10 @@ if not os.path.exists(f"{data_path}/train.txt"):
         r = requests.get(base_url + f)
         with open(f"{data_path}/{f}", 'w') as out: out.write(r.text)
 
+print("Tokenizing corpus (Char-Level)...")
 corpus = Corpus(data_path)
 vocab_size = len(corpus.dictionary)
-print(f"Vocab Size: {vocab_size}")
+print(f"Vocab Size: {vocab_size} characters") # Devrait être ~200-300
 
 train_data = batchify(corpus.train, CONFIG['batch_size'], CONFIG['device'])
 val_data = batchify(corpus.valid, 10, CONFIG['device'])
@@ -282,7 +290,7 @@ scheduler = optim.lr_scheduler.OneCycleLR(
 )
 
 # Loop
-print("=== STARTING TRAINING INNv2 (OPTIMIZED) ===")
+print("=== STARTING TRAINING INNv2 CHAR-LEVEL ===")
 
 for epoch in range(1, CONFIG['epochs'] + 1):
     model.train()
