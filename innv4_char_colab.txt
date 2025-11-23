@@ -333,7 +333,7 @@ for epoch in range(1, CONFIG['epochs'] + 1):
         total_loss += (loss.item() * CONFIG['accum_steps']) * data.numel()
         total_tokens += data.numel()
         
-        if (batch + 1) % (100 * CONFIG['accum_steps']) == 0:
+        if (batch + 1) % (10 * CONFIG['accum_steps']) == 0:
             cur_loss = total_loss / total_tokens
             print(f"| epoch {epoch} | batch {batch} | loss {cur_loss:.2f} | ppl {math.exp(cur_loss):.2f}")
             total_loss = 0
