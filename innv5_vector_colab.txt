@@ -16,16 +16,16 @@ import torch
 
 CONFIG = {
     # --- Architecture "Vector Neuron" ---
-    'd_model': 256,          # Dimension du vecteur pensée
-    'num_neurons': 1024,     # MASSIF: 1024 neurones (car ils sont légers)
-    'top_k': 64,             # SELECTION: Seuls 64 bossent à la fois
+    'd_model': 128,          # REDUIT: 256 -> 128
+    'num_neurons': 256,      # REDUIT: 1024 -> 256 (Safe VRAM)
+    'top_k': 32,             # Top 32 actifs
     'n_layers': 4,
     'dropout': 0.1,
     
     # --- Entraînement ---
-    'batch_size': 32,        # On peut augmenter car c'est sparse !
+    'batch_size': 32,        
     'accum_steps': 1,
-    'seq_len': 128,          # Shakespeare
+    'seq_len': 128,          
     'epochs': 5,
     'learning_rate': 1e-3,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu'
