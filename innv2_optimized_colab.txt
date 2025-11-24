@@ -80,10 +80,10 @@ corpus = Corpus('data/ptb')
 vocab_size = len(corpus.dictionary)
 print(f"Vocab size: {vocab_size}")
 
-# === CELL 3: INNv2 Architecture (Robust) ===
+# === CELL 3: INNv2 Architecture (Regularized) ===
 
 class MultiMambaBlock(nn.Module):
-    def __init__(self, num_neurons, d_model, d_state=16, d_conv=4, expand=2):
+    def __init__(self, num_neurons, d_model, d_state=16, d_conv=4, expand=2, dropout=0.1):
         super().__init__()
         self.num_neurons = num_neurons
         self.d_model = d_model
@@ -105,11 +105,12 @@ class MultiMambaBlock(nn.Module):
         self.x_proj = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False)
         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
 
-        # Initialize A to be negative to ensure stability
         A = torch.arange(1, self.d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
         self.A_log = nn.Parameter(torch.log(A))
         self.D = nn.Parameter(torch.ones(self.d_inner))
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+        
+        self.dropout = nn.Dropout(dropout) # Added Dropout
 
     def forward(self, x):
         B, N, L, D = x.shape
@@ -124,10 +125,10 @@ class MultiMambaBlock(nn.Module):
         y = self.ssm(x_conv)
         y = y * F.silu(res)
         out = self.out_proj(y)
-        return out
+        return self.dropout(out) # Apply Dropout
 
     def ssm(self, x):
-        # Robust SSM Implementation
+        # Robust FP32 SSM
         x_flat = x.reshape(-1, x.size(2), x.size(3)) 
         dt_rank_state = self.x_proj(x_flat) 
         dt, B, C = torch.split(dt_rank_state, [self.dt_rank, self.d_state, self.d_state], dim=-1)
@@ -154,26 +155,28 @@ class MultiMambaBlock(nn.Module):
         return y.reshape(x.shape)
 
 class MultiHeadNeuronAttention(nn.Module):
-    def __init__(self, num_neurons, d_model, n_head):
+    def __init__(self, num_neurons, d_model, n_head, dropout=0.1):
         super().__init__()
-        self.attn = nn.MultiheadAttention(d_model, n_head, batch_first=True)
+        self.attn = nn.MultiheadAttention(d_model, n_head, dropout=dropout, batch_first=True)
         self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         res = x
         x, _ = self.attn(x, x, x)
-        return self.norm(res + x)
+        return self.norm(res + self.dropout(x))
 
 class ParallelINN(nn.Module):
-    def __init__(self, vocab_size, num_neurons, d_model, num_layers, n_head=4):
+    def __init__(self, vocab_size, num_neurons, d_model, num_layers, n_head=4, dropout=0.1):
         super().__init__()
         self.num_neurons = num_neurons
         self.embedding = nn.Embedding(vocab_size, d_model)
+        self.dropout = nn.Dropout(dropout) # Embedding dropout
         
         self.layers = nn.ModuleList([])
         for _ in range(num_layers):
-            mamba = MultiMambaBlock(num_neurons, d_model)
-            attn = MultiHeadNeuronAttention(num_neurons, d_model, n_head)
+            mamba = MultiMambaBlock(num_neurons, d_model, dropout=dropout)
+            attn = MultiHeadNeuronAttention(num_neurons, d_model, n_head, dropout=dropout)
             self.layers.append(nn.ModuleList([mamba, attn]))
             
         self.norm_f = nn.LayerNorm(d_model)
@@ -192,7 +195,9 @@ class ParallelINN(nn.Module):
 
     def forward(self, input_ids):
         B, L = input_ids.shape
-        x = self.embedding(input_ids) 
+        x = self.embedding(input_ids)
+        x = self.dropout(x) # Apply dropout to embeddings
+        
         x = x.unsqueeze(1).expand(-1, self.num_neurons, -1, -1).contiguous()
         
         for mamba, attn in self.layers:
@@ -205,34 +210,35 @@ class ParallelINN(nn.Module):
         out = self.norm_f(out)
         return self.head(out)
 
-# === CELL 4: Configuration & Training (Manual Mode) ===
+# === CELL 4: Configuration & Training (Regularized) ===
 
-# FIXED HYPERPARAMETERS (SAFE MODE)
 CONFIG = {
     'd_model': 256,
     'num_neurons': 16,
     'num_layers': 4,
-    'lr': 3e-4,          # Safe Karpathy Constant
-    'batch_size': 16,    # Safe Batch Size
-    'seq_len': 64,       # Moderate Context
-    'epochs': 20,        # PTB is small, needs epochs
-    'grad_clip': 1.0     # Safety Lock
+    'lr': 3e-4,
+    'batch_size': 16,
+    'seq_len': 64,
+    'epochs': 20,
+    'grad_clip': 1.0,
+    'dropout': 0.3,      # HIGH DROPOUT FOR PTB
+    'weight_decay': 0.1  # STRONG REGULARIZATION
 }
 
-print(f"=== STARTING TRAINING: INNv2 MANUAL MODE ===")
+print(f"=== STARTING TRAINING: INNv2 REGULARIZED MODE ===")
 print(f"Config: {CONFIG}")
 
 model = ParallelINN(
     vocab_size, 
     CONFIG['num_neurons'], 
     CONFIG['d_model'], 
-    CONFIG['num_layers']
+    CONFIG['num_layers'],
+    dropout=CONFIG['dropout']
 ).to(device)
 
 print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG['lr'])
-# Simple Scheduler: Decay on plateau or just flat cosine
+optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG['lr'], weight_decay=CONFIG['weight_decay'])
 scheduler = torch.optim.lr_scheduler.OneCycleLR(
     optimizer, max_lr=CONFIG['lr'], 
     steps_per_epoch=len(corpus.train) // (CONFIG['batch_size']*CONFIG['seq_len']), 
@@ -263,7 +269,6 @@ try:
         for batch, i in enumerate(range(0, train_data.size(0) - 1, CONFIG['seq_len'])):
             data, targets = get_batch(train_data, i, CONFIG['seq_len'])
             
-            # NO AUTOCAST - PURE FP32
             output = model(data)
             loss = criterion(output.reshape(-1, vocab_size), targets)
             
@@ -277,11 +282,9 @@ try:
             
             if batch % 50 == 0 and batch > 0:
                 cur_loss = total_loss / 50
-                elapsed = time.time() - start_time
                 print(f'| epoch {epoch} | {batch}/{num_batches} | lr {scheduler.get_last_lr()[0]:.5f} | '
                       f'loss {cur_loss:.2f} | ppl {math.exp(cur_loss):.2f}')
                 total_loss = 0
-                start_time = time.time()
                 
         val_loss = evaluate(val_data)
         print(f'-' * 89)
