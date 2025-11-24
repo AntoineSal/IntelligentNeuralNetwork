@@ -230,26 +230,24 @@ class MonolithicINNv5(nn.Module):
         
         # Layer-by-Layer Processing (Stacked)
         for l in range(self.num_layers):
-            if self.training:
-                # Checkpointing saves VRAM by recomputing forward pass during backward
-                x = checkpoint(self.forward_layer, x, torch.tensor(l), use_reentrant=False)
-            else:
-                x = self.forward_layer(x, l)
+            # Checkpointing removed to fix Metadata mismatch error.
+            # We rely on reduced config dimensions to fit in VRAM.
+            x = self.forward_layer(x, l)
             
-        return self.lm_head(self.norm_final(x)) # Final Norm before head
+        return self.lm_head(self.norm_final(x))
 
 # === CELL 4: Training Configuration ===
 CONFIG = {
-    'd_model': 512,      # SOTA Standard for small models
-    'num_layers': 6,
-    'num_neurons': 128,  # 128 Vector Neurons
-    'top_k': 32,         # 32 Active per token
-    'lr': 1e-3,
-    'batch_size': 8,     # Smaller batch for 512 d_model
-    'seq_len': 64,       # Word level context is denser
+    'd_model': 256,      # Reduced for stability and memory
+    'num_layers': 4,     # Reduced layers
+    'num_neurons': 64,   # Reduced neurons
+    'top_k': 16,         # Reduced sparsity
+    'lr': 5e-4,          # Lower LR for stability
+    'batch_size': 16,    
+    'seq_len': 64,       # Kept reasonable
     'epochs': 10,
-    'accum_steps': 4,    # Effective batch size = 32
-    'grad_clip': 1.0
+    'accum_steps': 2,    
+    'grad_clip': 0.5     # Tighter clipping
 }
 
 batch_size = CONFIG['batch_size']
