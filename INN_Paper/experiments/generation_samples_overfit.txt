@@ -1,0 +1,24 @@
+=== INNv2 Generation Samples (Overfit Run) ===
+Model: INNv2 Manual Mode (No Dropout)
+Train PPL: ~31.16
+Valid PPL: ~640
+Epochs: 20
+
+--- Sample 1 ---
+Prompt: 'the market'
+Generated: the market later on the securities <eos> the year earlier <eos> i do is <unk> and chief officer of the personnel projects that it <eos> in the $ N <eos> but extended its hands mr. <unk> to ward d. calif <eos> <unk> of $ N <eos> as <unk> is over the san
+
+--- Sample 2 ---
+Prompt: 'investors are'
+Generated: investors are designed by both on <unk> <unk> <unk> <unk> if <unk> in the boom that the most controversial or N N <eos> the biggest problem without the <unk> <eos> the embarrassing embarrassing systems maturing s.a the <unk> parts got it is a share in the <unk> the federal court 's vax
+
+--- Sample 3 ---
+Prompt: 'despite the loss'
+Generated: despite the loss of the recent months ago and more <unk> to N N N million to rise to japan harris upham & sons <unk> <eos> the latest period <eos> reserves in cash and would be a <unk> <unk> for a bit more attractive to the same as a share <eos> the third
+
+--- Analysis ---
+- Syntax: Excellent (complex structures like "despite the loss of..." handled correctly).
+- Semantics: Strong financial context coherence ("loss" -> "million", "securities", "chief officer").
+- Tokenization: Correctly learned PTB artifacts like 'N' for numbers and '<unk>' usage.
+- Overfitting Signs: Specific proper nouns ("harris upham & sons", "ward d. calif") suggest memorization of training examples.
+
