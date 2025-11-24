@@ -100,7 +100,13 @@ class MultiMambaBlock(nn.Module):
         x_and_res = self.in_proj(x)
         (x_in, res) = x_and_res.split(split_size=[self.d_inner, self.d_inner], dim=-1)
         x_conv = self.conv1d(x_in.permute(0, 1, 3, 2).reshape(B, N*self.d_inner, L))[:, :, :L].reshape(B, N, self.d_inner, L).permute(0, 1, 3, 2)
-        y = self.ssm(F.silu(x_conv))
+        
+        # Use Checkpointing to save memory on the heavy SSM loop
+        if self.training:
+            y = torch.utils.checkpoint.checkpoint(self.ssm, F.silu(x_conv), use_reentrant=False)
+        else:
+            y = self.ssm(F.silu(x_conv))
+            
         return self.dropout(self.out_proj(y * F.silu(res)))
 
     def ssm(self, x):
