@@ -16,7 +16,7 @@ class AdaptiveRouter(nn.Module):
         # (B, L) -> (B, L, N)
         routing_logits = self.token_router(input_ids) / self.temperature
         # Softmax replaces Sigmoid for competitive routing
-        routing_weights = F.softmax(routing_logits, dim=-1)
+        routing_weights = F.softmax(routing_logits / 2.0, dim=-1)
         
         # (B, L, D) * (B, L, N) -> (B, N, L, D)
         neuron_inputs = torch.einsum('bld,bln->bnld', embeddings, routing_weights)
