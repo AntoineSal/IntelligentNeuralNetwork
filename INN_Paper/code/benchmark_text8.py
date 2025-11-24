@@ -17,10 +17,10 @@ CONFIG = {
     'd_hid': 1024,     
     'dropout': 0.1,
     'lr': 1e-3,
-    'batch_size': 32,      # Increased for GPU efficiency
-    'seq_len': 256,        # Increased for better context
-    'epochs': 1,           # 1 epoch enough for trend
-    'subset_size': 1000000 # 1M chars = fast but representative
+    'batch_size': 8,       # ULTRA SAFE BATCH SIZE
+    'seq_len': 128,        # REDUCED SEQ LEN for memory safety
+    'epochs': 1,           
+    'subset_size': 1000000 
 }
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -37,12 +37,10 @@ class CharCorpus:
         with open(path, 'r') as f:
             text = f.read()
         
-        # Apply subset
         if subset_size:
             text = text[:subset_size]
             print(f"Using subset: {len(text):,} chars")
         
-        # Split 90/5/5
         n = len(text)
         train_end = int(n * 0.9)
         val_end = int(n * 0.95)
@@ -81,16 +79,36 @@ def get_batch(source, i, seq_len):
     target = source[i+1:i+1+seq_len].view(-1)
     return data, target
 
-# === OPTIMIZED MODELS ===
+# === JIT OPTIMIZED SSM ===
+# Compile this function to TorchScript for speed + low memory
+@torch.jit.script
+def ssm_jit(x, dt, A, B, C, D):
+    # x: (B, L, D_in)
+    # dt: (B, L, D_in)
+    # A: (D_in, D_state)
+    # B: (B, L, D_in, D_state)
+    # C: (B, L, D_in, D_state)
+    # D: (D_in)
+    
+    dA = torch.exp(torch.einsum('bld,ds->blds', dt, A))
+    dB = torch.einsum('bld,bls->blds', dt, B)
+    
+    # Sequential scan (JIT compiled loop is fast)
+    h = torch.zeros(x.size(0), x.size(2), A.size(1), device=x.device, dtype=x.dtype)
+    ys = []
+    
+    # Iterate over time L
+    for t in range(x.size(1)):
+        # h_t = dA_t * h_{t-1} + dB_t * x_t
+        h = dA[:, t, :, :] * h + dB[:, t, :, :] * x[:, t, :].unsqueeze(-1)
+        # y_t = C_t * h_t
+        y_t = torch.einsum('bds,bs->bd', h, C[:, t, :, :])
+        ys.append(y_t)
+        
+    y = torch.stack(ys, dim=1)
+    return y + x * D
 
-# 1. INNv2 with PARALLEL SSM (same behavior, much faster)
-class MultiMambaBlockOptimized(nn.Module):
-    """
-    OPTIMIZED VERSION: Parallelized SSM computation
-    - Replaces sequential for-loop with parallel operations
-    - 10-20x faster while maintaining exact same mathematical behavior
-    - Uses associative scan approximation (cumulative operations)
-    """
+class MultiMambaBlockJIT(nn.Module):
     def __init__(self, num_neurons, d_model, d_state=16, d_conv=4, expand=2, dropout=0.1):
         super().__init__()
         self.d_inner = int(expand * d_model)
@@ -113,96 +131,47 @@ class MultiMambaBlockOptimized(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):  # x: (B, N, L, D)
+    def forward(self, x):
         B, N, L, D = x.shape
         x_and_res = self.in_proj(x)
         (x_in, res) = x_and_res.split(split_size=[self.d_inner, self.d_inner], dim=-1)
         
         x_conv = x_in.permute(0, 1, 3, 2).reshape(B, N*self.d_inner, L)
-        x_conv = self.conv1d(x_conv)[:, :, :L]
-        x_conv = x_conv.reshape(B, N, self.d_inner, L).permute(0, 1, 3, 2)
+        x_conv = self.conv1d(x_conv)[:, :, :L].reshape(B, N, self.d_inner, L).permute(0, 1, 3, 2)
         x_conv = F.silu(x_conv)
         
-        y = self.ssm_parallel(x_conv)
-        y = y * F.silu(res)
-        return self.dropout(self.out_proj(y))
-
-    def ssm_parallel(self, x):
-        """
-        PARALLELIZED SSM - maintains exact mathematical behavior as original
+        # Prepare for JIT function
+        # Flatten N into Batch for parallel processing
+        x_flat = x_conv.reshape(B*N, L, self.d_inner)
         
-        Original sequential version:
-            for t in range(L):
-                h[t] = dA[t] * h[t-1] + dB[t] * x[t]
-                y[t] = C[t] @ h[t] + D * x[t]
-        
-        This parallel version computes the same result using cumulative operations
-        """
-        x_flat = x.reshape(-1, x.size(2), x.size(3))  # (B*N, L, D)
         dt_rank_state = self.x_proj(x_flat)
-        dt, B, C = torch.split(dt_rank_state, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        dt, B_ssm, C_ssm = torch.split(dt_rank_state, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        dt = F.softplus(self.dt_proj(dt))
+        A = -torch.exp(self.A_log.float())
         
-        dt = F.softplus(self.dt_proj(dt))  # (B*N, L, D_inner)
-        A = -torch.exp(self.A_log.float())  # (D_inner, D_state)
+        # Reshape B and C for JIT
+        # (B*N, L, D_state) -> (B*N, L, D_inner, D_state) via broadcasting or repeat?
+        # Actually B and C in Mamba are usually (Batch, Length, D_state) and broadcasted across D_inner
+        # But our JIT expects (B, L, D_in, D_state). Let's adjust JIT or inputs.
+        # Standard Mamba: B, C are (B, L, N) where N=d_state. They modulate ALL D_inner channels.
         
-        # Compute discretized matrices
-        dA = torch.exp(torch.einsum('bld,ds->blds', dt, A))  # (B*N, L, D_inner, D_state)
-        dB = torch.einsum('bld,bls->blds', dt, B)            # (B*N, L, D_inner, D_state)
+        # Expand B_ssm, C_ssm to match D_inner
+        # B_ssm: (Batch, L, d_state) -> (Batch, L, d_inner, d_state)
+        B_ssm = B_ssm.unsqueeze(2).expand(-1, -1, self.d_inner, -1)
+        C_ssm = C_ssm.unsqueeze(2).expand(-1, -1, self.d_inner, -1)
         
-        # Parallel scan approximation using cumulative operations
-        # This maintains the recurrence relation: h[t] = dA[t]*h[t-1] + dB[t]*u[t]
+        y = ssm_jit(x_flat, dt, A, B_ssm, C_ssm, self.D)
         
-        # Compute cumulative product of dA (state transition)
-        # log-space for numerical stability
-        log_dA = torch.log(dA.clamp(min=1e-10))  # (B*N, L, D_inner, D_state)
-        cumsum_log_dA = torch.cumsum(log_dA, dim=1)
-        
-        # For each position, we need the product of all previous dA's
-        # We use a trick: shift and compute relative products
-        cumsum_log_dA_shifted = torch.cat([
-            torch.zeros_like(cumsum_log_dA[:, :1]), 
-            cumsum_log_dA[:, :-1]
-        ], dim=1)
-        
-        # Compute state contributions
-        # h[t] = sum_{i=0}^{t} (prod_{j=i+1}^{t} dA[j]) * dB[i] * u[i]
-        dB_u = dB * x_flat.unsqueeze(-1)  # (B*N, L, D_inner, D_state)
-        
-        # We approximate the associative scan with a cumulative sum weighted by exponentials
-        # This is mathematically equivalent to the sequential version for linear systems
-        contributions = []
-        for t in range(x_flat.size(1)):
-            # Compute contribution of all previous timesteps to current h[t]
-            if t == 0:
-                h_t = dB_u[:, 0]  # First timestep: h[0] = dB[0] * u[0]
-            else:
-                # h[t] = dA[t] * h[t-1] + dB[t] * u[t]
-                # We compute this by accumulating weighted past inputs
-                log_weights = cumsum_log_dA[:, t:t+1] - cumsum_log_dA_shifted[:, :t+1]
-                weights = torch.exp(log_weights)  # (B*N, t+1, D_inner, D_state)
-                h_t = (weights * dB_u[:, :t+1]).sum(dim=1)  # (B*N, D_inner, D_state)
-            contributions.append(h_t)
-        
-        h = torch.stack(contributions, dim=1)  # (B*N, L, D_inner, D_state)
-        
-        # Compute output: y[t] = C[t] @ h[t] + D * x[t]
-        y = torch.einsum('blds,bls->bld', h, C)  # (B*N, L, D_inner)
-        y = y + x_flat * self.D  # Skip connection
-        
-        return y.reshape(x.shape)  # (B, N, L, D)
+        y = y.reshape(B, N, L, self.d_inner)
+        return self.dropout(self.out_proj(y * F.silu(res)))
 
-class INNv2Optimized(nn.Module):
-    """
-    OPTIMIZED INNv2: Same architecture, parallel SSM
-    - Behavior: IDENTICAL to original INN v2
-    - Performance: 10-50x faster
-    """
+class INNv2JIT(nn.Module):
     def __init__(self, vocab_size, num_neurons, d_model, num_layers, dropout=0.1):
         super().__init__()
         self.num_neurons = num_neurons
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.layers = nn.ModuleList([nn.ModuleList([
-            MultiMambaBlockOptimized(num_neurons, d_model, dropout=dropout),
+            MultiMambaBlockJIT(num_neurons, d_model, dropout=dropout),
             nn.MultiheadAttention(d_model, 4, dropout=dropout, batch_first=True)
         ]) for _ in range(num_layers)])
         self.norm_f = nn.LayerNorm(d_model)
@@ -219,67 +188,25 @@ class INNv2Optimized(nn.Module):
             x = x_flat.view(B, L, self.num_neurons, -1).permute(0, 2, 1, 3)
         return self.head(self.norm_f(x.mean(dim=1)))
 
-# 2. LSTM Baseline (unchanged)
-class LSTMBaseline(nn.Module):
-    def __init__(self, vocab_size, d_model, n_layers, dropout=0.1):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, d_model)
-        self.lstm = nn.LSTM(d_model, d_model, n_layers, dropout=dropout, batch_first=True)
-        self.fc = nn.Linear(d_model, vocab_size)
-        self.fc.weight = self.embedding.weight
-
-    def forward(self, x):
-        return self.fc(self.lstm(self.embedding(x))[0])
-
-# 3. Transformer Baseline (unchanged but with proper init)
-class TransformerBaseline(nn.Module):
-    def __init__(self, vocab_size, d_model, n_head, d_hid, n_layers, dropout=0.1):
-        super().__init__()
-        self.d_model = d_model
-        self.embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_encoder = nn.Parameter(torch.zeros(1, 5000, d_model))
-        nn.init.normal_(self.pos_encoder, mean=0.0, std=0.02)
-        
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model, n_head, d_hid, dropout, 
-            batch_first=True,
-            norm_first=True  # Pre-LN for stability
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, n_layers)
-        self.fc = nn.Linear(d_model, vocab_size)
-        self.fc.weight = self.embedding.weight
-
-    def forward(self, x):
-        x = self.embedding(x) * math.sqrt(self.d_model) + self.pos_encoder[:, :x.size(1)]
-        mask = nn.Transformer.generate_square_subsequent_mask(x.size(1)).to(x.device)
-        return self.fc(self.transformer(x, mask, is_causal=True))
-
-# === BENCHMARK ENGINE ===
+# === TRAINING LOOP ===
 def train(model, name, corpus):
     print(f"\n>>> Training {name}")
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     torch.cuda.empty_cache()
-    opt = torch.optim.AdamW(model.parameters(), lr=CONFIG['lr'], weight_decay=0.01)
-    
+    opt = torch.optim.AdamW(model.parameters(), lr=CONFIG['lr'])
     train_data = batchify(corpus.train, CONFIG['batch_size'])
     valid_data = batchify(corpus.valid, CONFIG['batch_size'])
     
     num_batches = (len(train_data) - 1) // CONFIG['seq_len']
-    sched = torch.optim.lr_scheduler.OneCycleLR(
-        opt, 
-        max_lr=CONFIG['lr'], 
-        steps_per_epoch=num_batches, 
-        epochs=CONFIG['epochs']
-    )
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=CONFIG['lr'], steps_per_epoch=num_batches, epochs=CONFIG['epochs'])
     crit = nn.CrossEntropyLoss()
     
-    history = []
     for epoch in range(CONFIG['epochs']):
         model.train()
         total_loss = 0
         start = time.time()
-        num_tokens = 0
+        tokens = 0
         
         for batch, i in enumerate(range(0, train_data.size(0)-1, CONFIG['seq_len'])):
             x, y = get_batch(train_data, i, CONFIG['seq_len'])
@@ -292,13 +219,10 @@ def train(model, name, corpus):
             sched.step()
             
             total_loss += loss.item() * len(x)
-            num_tokens += len(x) * x.size(1)
+            tokens += len(x) * x.size(1)
             
-            if (batch + 1) % 50 == 0:
-                elapsed = time.time() - start
-                print(f"  Batch {batch+1}/{num_batches} | "
-                      f"Loss: {total_loss/num_tokens:.3f} | "
-                      f"Speed: {num_tokens/elapsed:.0f} tok/s")
+            if (batch+1) % 50 == 0:
+                print(f"Batch {batch+1}/{num_batches} | Loss: {total_loss/tokens:.3f} | Speed: {tokens/(time.time()-start):.0f} tok/s")
         
         # Validation
         model.eval()
@@ -307,87 +231,17 @@ def train(model, name, corpus):
         with torch.no_grad():
             for i in range(0, valid_data.size(0)-1, CONFIG['seq_len']):
                 x, y = get_batch(valid_data, i, CONFIG['seq_len'])
-                loss = crit(model(x).view(-1, CONFIG['vocab_size']), y)
-                val_loss += loss.item() * len(x) * x.size(1)
+                val_loss += len(x) * x.size(1) * crit(model(x).view(-1, CONFIG['vocab_size']), y).item()
                 val_tokens += len(x) * x.size(1)
         
-        val_loss /= val_tokens
-        bpc = val_loss / math.log(2)  # Bits Per Character
-        
-        elapsed = time.time() - start
-        print(f"Epoch {epoch+1} | Valid Loss: {val_loss:.3f} | Valid BPC: {bpc:.3f} | Time: {elapsed:.1f}s")
-        history.append(bpc)
-    
-    return history[-1]
+        bpc = (val_loss / val_tokens) / math.log(2)
+        print(f"Epoch {epoch+1} Valid BPC: {bpc:.3f}")
+        return bpc
 
 if __name__ == "__main__":
-    print("="*60)
-    print("TEXT8 BENCHMARK - OPTIMIZED VERSION")
-    print("="*60)
-    print(f"Configuration:")
-    for k, v in CONFIG.items():
-        print(f"  {k}: {v}")
-    print("="*60)
-    
     download_text8()
     corpus = CharCorpus("data/text8", subset_size=CONFIG['subset_size'])
     
-    results = {}
-    
-    # INNv2 (Optimized)
-    print("\n" + "="*60)
-    inn = INNv2Optimized(
-        CONFIG['vocab_size'], 
-        num_neurons=16, 
-        d_model=CONFIG['d_model'], 
-        num_layers=CONFIG['n_layers'], 
-        dropout=CONFIG['dropout']
-    ).to(device)
-    results['INN v2'] = train(inn, "INN v2 (Optimized)", corpus)
-    del inn
-    torch.cuda.empty_cache()
-    
-    # LSTM
-    print("\n" + "="*60)
-    lstm = LSTMBaseline(
-        CONFIG['vocab_size'], 
-        d_model=CONFIG['d_model'], 
-        n_layers=6,  # 6 layers to roughly match params
-        dropout=CONFIG['dropout']
-    ).to(device)
-    results['LSTM'] = train(lstm, "LSTM Baseline", corpus)
-    del lstm
-    torch.cuda.empty_cache()
-    
-    # Transformer
-    print("\n" + "="*60)
-    tf = TransformerBaseline(
-        CONFIG['vocab_size'], 
-        d_model=CONFIG['d_model'], 
-        n_head=CONFIG['n_head'], 
-        d_hid=CONFIG['d_hid'], 
-        n_layers=CONFIG['n_layers'], 
-        dropout=CONFIG['dropout']
-    ).to(device)
-    results['Transformer'] = train(tf, "Transformer Baseline", corpus)
-    del tf
-    torch.cuda.empty_cache()
-    
-    # Final Results
-    print("\n" + "="*60)
-    print("FINAL RESULTS (Bits Per Character)")
-    print("="*60)
-    sorted_results = sorted(results.items(), key=lambda x: x[1])
-    for i, (name, bpc) in enumerate(sorted_results, 1):
-        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉"
-        print(f"{medal} {name:20s}: {bpc:.3f} BPC")
-    print("="*60)
-    
-    # Analysis
-    print("\nKey Observations:")
-    if results['INN v2'] < results['Transformer']:
-        print(f"✓ INN v2 outperforms Transformer by {results['Transformer']-results['INN v2']:.3f} BPC")
-    if results['INN v2'] < 1.4:
-        print(f"✓ INN v2 achieves competitive BPC < 1.4 on char-level")
-    print("\nNote: This is a subset (1M chars) for fast benchmarking.")
-    print("Full Text8 (100M chars) would give more stable results but take longer.")
+    # INNv2 ONLY for now
+    inn = INNv2JIT(CONFIG['vocab_size'], 16, CONFIG['d_model'], CONFIG['n_layers'], CONFIG['dropout']).to(device)
+    train(inn, "INNv2 (JIT Safe)", corpus)
