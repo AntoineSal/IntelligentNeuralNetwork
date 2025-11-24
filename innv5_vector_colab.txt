@@ -1,0 +1,232 @@
+# ==============================================================================
+# CELLULE 1: INSTALLATION & NETTOYAGE
+# ==============================================================================
+import os
+import signal
+
+try:
+    os.kill(os.getpid(), signal.SIGKILL)
+except:
+    print("Runtime redémarré")
+
+# ==============================================================================
+# CELLULE 2: HYPERPARAMÈTRES INNv5 (MASSIVE)
+# ==============================================================================
+import torch
+
+CONFIG = {
+    # --- Architecture "Vector Neuron" ---
+    'd_model': 256,          # Dimension du vecteur pensée
+    'num_neurons': 1024,     # MASSIF: 1024 neurones (car ils sont légers)
+    'top_k': 64,             # SELECTION: Seuls 64 bossent à la fois
+    'n_layers': 4,
+    'dropout': 0.1,
+    
+    # --- Entraînement ---
+    'batch_size': 32,        # On peut augmenter car c'est sparse !
+    'accum_steps': 1,
+    'seq_len': 128,          # Shakespeare
+    'epochs': 5,
+    'learning_rate': 1e-3,
+    'device': 'cuda' if torch.cuda.is_available() else 'cpu'
+}
+
+print("Config INNv5 Loaded:", CONFIG)
+
+# ==============================================================================
+# CELLULE 3: DATA LOADING (SHAKESPEARE)
+# ==============================================================================
+import requests
+import torch
+import os
+
+class CharCorpus:
+    def __init__(self):
+        if not os.path.exists('input.txt'):
+            url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+            with open('input.txt', 'w') as f:
+                f.write(requests.get(url).text)
+        
+        with open('input.txt', 'r') as f: self.text = f.read()
+        
+        chars = sorted(list(set(self.text)))
+        self.vocab_size = len(chars)
+        self.char2idx = {ch:i for i,ch in enumerate(chars)}
+        self.idx2char = {i:ch for i,ch in enumerate(chars)}
+        
+        self.data = torch.tensor([self.char2idx[ch] for ch in self.text], dtype=torch.long)
+        
+        # Split
+        n = int(0.9*len(self.data))
+        self.train_data = self.data[:n]
+        self.val_data = self.data[n:]
+
+corpus = CharCorpus()
+print(f"Vocab: {corpus.vocab_size}, Train: {len(corpus.train_data)}")
+
+def get_batch(split, batch_size=32, seq_len=128):
+    data = corpus.train_data if split == 'train' else corpus.val_data
+    ix = torch.randint(len(data) - seq_len, (batch_size,))
+    x = torch.stack([data[i:i+seq_len] for i in ix])
+    y = torch.stack([data[i+1:i+seq_len+1] for i in ix])
+    return x.to(CONFIG['device']), y.to(CONFIG['device'])
+
+# ==============================================================================
+# CELLULE 4: ARCHITECTURE VECTOR NEURON
+# ==============================================================================
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+class VectorNeuronLayer(nn.Module):
+    def __init__(self, d_model, n_neurons, top_k):
+        super().__init__()
+        self.d_model = d_model
+        self.n_neurons = n_neurons
+        self.top_k = top_k
+        
+        # --- 1. Le "Router" (Qui travaille ?) ---
+        # (N, D) - Chaque neurone a une signature
+        self.neuron_embeddings = nn.Parameter(torch.randn(n_neurons, d_model) * 0.02)
+        
+        # --- 2. Le "Cerveau" (SSM Pur Vectorisé) ---
+        # On vectorise TOUT: (N, D) au lieu de boucler
+        # A: Decay rate (N, D)
+        self.A_log = nn.Parameter(torch.log(torch.rand(n_neurons, d_model)))
+        # B: Input Gate (N, D)
+        self.B = nn.Parameter(torch.randn(n_neurons, d_model) * 0.02)
+        # C: Output Gate (N, D)
+        self.C = nn.Parameter(torch.randn(n_neurons, d_model) * 0.02)
+        # D: Passthrough (N, D)
+        self.D = nn.Parameter(torch.ones(n_neurons, d_model))
+        
+        # Mixer global (pour mélanger les infos après)
+        self.out_mix = nn.Linear(d_model, d_model)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        """
+        x: (Batch, Seq, D_Model)
+        """
+        B, L, D = x.shape
+        
+        # 1. Routing (Top-K)
+        # On compare Input (B, L, D) avec Neurons (N, D) -> Scores (B, L, N)
+        scores = torch.einsum('bld,nd->bln', x, self.neuron_embeddings)
+        
+        # Top-K Hard Routing
+        topk_scores, topk_indices = torch.topk(scores, self.top_k, dim=-1)
+        # Softmax sur les Top-K pour pondération
+        routing_weights = F.softmax(topk_scores, dim=-1) # (B, L, K)
+        
+        # 2. Sparse Processing (Le défi)
+        # Pour vectoriser efficacement, on triche un peu:
+        # On calcule le SSM pour TOUT le monde (rapide car element-wise)
+        # Mais on ne propage que les Top-K.
+        # (Optimisation future: Kernel CUDA pour ne calculer que les K)
+        
+        # SSM Vectorisé (Parallèle sur N neurones)
+        # x: (B, L, D) -> (B, L, 1, D)
+        u = x.unsqueeze(2)
+        
+        # Paramètres SSM: (1, 1, N, D)
+        A = -torch.exp(self.A_log).view(1, 1, self.n_neurons, D)
+        B_param = self.B.view(1, 1, self.n_neurons, D)
+        C_param = self.C.view(1, 1, self.n_neurons, D)
+        D_param = self.D.view(1, 1, self.n_neurons, D)
+        
+        # Scan (Element-wise, très rapide)
+        # h_t = A*h_{t-1} + B*u_t
+        # y_t = C*h_t
+        
+        # Scan Loop (Optimized)
+        h = torch.zeros(B, self.n_neurons, D, device=x.device)
+        ys = []
+        
+        # Note: Ici on scanne sur tout N car en Python l'indexing dynamique est lent
+        # Mais comme c'est element-wise, c'est léger.
+        for t in range(L):
+            # u_t: (B, 1, D)
+            u_t = u[:, t, :, :]
+            
+            # h: (B, N, D)
+            h = A.squeeze(1) * h + B_param.squeeze(1) * u_t
+            y_t = C_param.squeeze(1) * h + D_param.squeeze(1) * u_t
+            ys.append(y_t)
+            
+        # Stack: (B, L, N, D)
+        y_all = torch.stack(ys, dim=1) 
+        
+        # 3. Gather Top-K (Sparsity)
+        # On récupère juste les résultats des neurones élus
+        # indices: (B, L, K) -> expand à (B, L, K, D)
+        gather_indices = topk_indices.unsqueeze(-1).expand(-1, -1, -1, D)
+        
+        # y_selected: (B, L, K, D)
+        y_selected = torch.gather(y_all, 2, gather_indices)
+        
+        # 4. Aggregate
+        # Somme pondérée par les poids du routeur
+        # (B, L, K, D) * (B, L, K, 1) -> sum(K) -> (B, L, D)
+        out = torch.sum(y_selected * routing_weights.unsqueeze(-1), dim=2)
+        
+        # 5. Global Mix & Residual
+        return self.norm(x + self.out_mix(out))
+
+class INNv5(nn.Module):
+    def __init__(self, vocab_size, d_model, n_layers, num_neurons, top_k):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.layers = nn.ModuleList([
+            VectorNeuronLayer(d_model, num_neurons, top_k)
+            for _ in range(n_layers)
+        ])
+        self.norm_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size)
+
+    def forward(self, idx):
+        x = self.embedding(idx)
+        for layer in self.layers:
+            x = layer(x)
+        return self.head(self.norm_f(x))
+
+# ==============================================================================
+# CELLULE 5: ENTRAÎNEMENT
+# ==============================================================================
+model = INNv5(
+    corpus.vocab_size, 
+    CONFIG['d_model'], 
+    CONFIG['n_layers'], 
+    CONFIG['num_neurons'], 
+    CONFIG['top_k']
+).to(CONFIG['device'])
+
+print(f"INNv5 Params: {sum(p.numel() for p in model.parameters()):,} (dont {CONFIG['num_neurons']} neurones)")
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG['learning_rate'])
+criterion = nn.CrossEntropyLoss()
+
+print("=== STARTING TRAINING INNv5 ===")
+for epoch in range(CONFIG['epochs']):
+    model.train()
+    for step in range(500): # 500 steps per epoch
+        x, y = get_batch('train', CONFIG['batch_size'], CONFIG['seq_len'])
+        
+        logits = model(x)
+        loss = criterion(logits.view(-1, corpus.vocab_size), y.view(-1))
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        if step % 100 == 0:
+            print(f"Epoch {epoch} | Step {step} | Loss {loss.item():.4f}")
+            
+    # Eval
+    model.eval()
+    x, y = get_batch('val')
+    with torch.no_grad():
+        logits = model(x)
+        val_loss = criterion(logits.view(-1, corpus.vocab_size), y.view(-1))
+    print(f"--- Epoch {epoch} Val Loss: {val_loss.item():.4f} ---")
+
