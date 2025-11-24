@@ -6,17 +6,16 @@ import time
 import os
 import requests
 
-# === CONFIGURATION TO MATCH INNv2 (5.5M Params) ===
-# INNv2: d_model=256, n_layers=4, vocab=10000
+# === CONFIGURATION ===
 CONFIG = {
     'vocab_size': 10000,
     'd_model': 256,
-    'n_layers': 4,    # Transformer layers
+    'n_layers': 4,    
     'n_head': 4,
-    'd_hid': 512,     # Transformer FFN dim
-    'lstm_layers': 2, # LSTM needs fewer layers to match params usually
+    'd_hid': 1024,     # Standard FFN ratio
+    'lstm_layers': 2, 
     'dropout': 0.1,
-    'lr': 3e-4,
+    'lr': 3e-4,       # Standard Adam LR
     'batch_size': 16,
     'seq_len': 64,
     'epochs': 20
@@ -24,7 +23,7 @@ CONFIG = {
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# === DATA LOADING (Same as INN) ===
+# === DATA LOADING ===
 class Dictionary:
     def __init__(self):
         self.word2idx = {}
@@ -86,30 +85,47 @@ class LSTMBaseline(nn.Module):
         self.lstm = nn.LSTM(d_model, d_model, n_layers, dropout=dropout, batch_first=True)
         self.fc = nn.Linear(d_model, vocab_size)
         self.dropout = nn.Dropout(dropout)
-        
-        # Weight tying
-        self.fc.weight = self.embedding.weight
-        
+        self.fc.weight = self.embedding.weight # Tying
+        self.init_weights()
+
+    def init_weights(self):
+        initrange = 0.1
+        self.embedding.weight.data.uniform_(-initrange, initrange)
+        self.fc.bias.data.zero_()
+        self.fc.weight.data.uniform_(-initrange, initrange)
+
     def forward(self, x):
         emb = self.dropout(self.embedding(x))
         out, _ = self.lstm(emb)
         return self.fc(out)
 
+# STANDARD TRANSFORMER (FIXED INIT)
 class TransformerBaseline(nn.Module):
     def __init__(self, vocab_size, d_model, n_head, d_hid, n_layers, dropout=0.1):
         super().__init__()
+        self.d_model = d_model
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.pos_encoder = PositionalEncoding(d_model, dropout)
-        encoder_layers = nn.TransformerEncoderLayer(d_model, n_head, d_hid, dropout, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, n_layers)
+        
+        # Standard PyTorch Transformer Layer
+        encoder_layer = nn.TransformerEncoderLayer(d_model, n_head, d_hid, dropout, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, n_layers)
         self.fc = nn.Linear(d_model, vocab_size)
         
-        # Weight tying
-        self.fc.weight = self.embedding.weight
+        self.fc.weight = self.embedding.weight # Tying
+        self.init_weights()
+
+    def init_weights(self):
+        initrange = 0.1
+        self.embedding.weight.data.uniform_(-initrange, initrange)
+        self.fc.bias.data.zero_()
+        self.fc.weight.data.uniform_(-initrange, initrange)
 
     def forward(self, src):
+        # Mask for causality (crucial for LM)
         mask = nn.Transformer.generate_square_subsequent_mask(src.size(1)).to(src.device)
-        src = self.embedding(src) * math.sqrt(CONFIG['d_model'])
+        
+        src = self.embedding(src) * math.sqrt(self.d_model)
         src = self.pos_encoder(src)
         output = self.transformer_encoder(src, mask, is_causal=True)
         return self.fc(output)
@@ -130,17 +146,25 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 # === TRAINING LOOP ===
-def train_model(model, name, corpus):
-    print(f"\n=== Training {name} Baseline ===")
-    print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
+def run_benchmark(model_class, name, **kwargs):
+    print(f"\n>>> STARTING BENCHMARK: {name}")
+    model = model_class(CONFIG['vocab_size'], CONFIG['d_model'], **kwargs).to(device)
+    params = sum(p.numel() for p in model.parameters())
+    print(f"Model Params: {params:,}")
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG['lr'])
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=CONFIG['lr'], 
+        steps_per_epoch=len(corpus.train) // (CONFIG['batch_size']*CONFIG['seq_len']), 
+        epochs=CONFIG['epochs']
+    )
     criterion = nn.CrossEntropyLoss()
+    
     train_data = batchify(corpus.train, CONFIG['batch_size'])
     val_data = batchify(corpus.valid, CONFIG['batch_size'])
     
-    model.train()
     for epoch in range(1, CONFIG['epochs'] + 1):
+        model.train()
         total_loss = 0
         start_time = time.time()
         
@@ -151,26 +175,32 @@ def train_model(model, name, corpus):
             
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            
+            scheduler.step()
             total_loss += loss.item()
             
-        avg_loss = total_loss / (len(train_data) // CONFIG['seq_len'])
-        print(f"Epoch {epoch} | Loss: {avg_loss:.2f} | PPL: {math.exp(avg_loss):.2f}")
+        # Validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for i in range(0, val_data.size(0) - 1, CONFIG['seq_len']):
+                data, targets = get_batch(val_data, i, CONFIG['seq_len'])
+                output = model(data)
+                val_loss += len(data) * criterion(output.reshape(-1, CONFIG['vocab_size']), targets).item()
+        val_loss /= (len(val_data) - 1)
+        
+        train_ppl = math.exp(total_loss / (len(train_data) // CONFIG['seq_len']))
+        valid_ppl = math.exp(val_loss)
+        
+        print(f"| Epoch {epoch:2d} | Train PPL: {train_ppl:6.2f} | Valid PPL: {valid_ppl:6.2f} | Time: {time.time() - start_time:.0f}s")
 
 if __name__ == "__main__":
     download_ptb()
     corpus = Corpus('data/ptb')
     
-    # Run LSTM
-    lstm = LSTMBaseline(CONFIG['vocab_size'], CONFIG['d_model'], CONFIG['lstm_layers']).to(device)
-    train_model(lstm, "LSTM", corpus)
+    # 1. LSTM (6 layers -> ~5.6M Params)
+    # run_benchmark(LSTMBaseline, "LSTM Baseline", n_layers=6)
     
-    # Run Transformer
-    transformer = TransformerBaseline(
-        CONFIG['vocab_size'], CONFIG['d_model'], CONFIG['n_head'], 
-        CONFIG['d_hid'], CONFIG['n_layers']
-    ).to(device)
-    train_model(transformer, "Transformer", corpus)
-
+    # 2. Transformer (4 layers, 1024 FFN -> ~5.8M Params)
+    run_benchmark(TransformerBaseline, "Transformer Baseline (FIXED)", n_layers=4, n_head=4, d_hid=1024)
