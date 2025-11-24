@@ -276,10 +276,11 @@ def train():
     start_time = time.time()
     ntokens = len(corpus.dictionary)
     
-    num_batches = train_data.size(1) // CONFIG['seq_len']
+    # Corrected: iterate over dimension 0 (sequence length), not 1 (batch size)
+    num_batches = train_data.size(0) // CONFIG['seq_len']
     print(f"Starting epoch {epoch}... Num batches: {num_batches}")
     
-    for batch, i in enumerate(range(0, train_data.size(1) - 1, CONFIG['seq_len'])):
+    for batch, i in enumerate(range(0, train_data.size(0) - 1, CONFIG['seq_len'])):
         data, targets = get_batch(train_data, i, CONFIG['seq_len'])
         
         with autocast('cuda'):
