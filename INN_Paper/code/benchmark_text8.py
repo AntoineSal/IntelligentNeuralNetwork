@@ -6,6 +6,8 @@ import time
 import os
 import requests
 import zipfile
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # === CONFIGURATION ===
 CONFIG = {
@@ -84,7 +86,6 @@ def get_batch(source, i, seq_len):
 def ssm_jit(x, dt, A, B, C, D):
     dt = torch.clamp(dt, max=4.0) # Clamp for stability
     dA = torch.exp(torch.einsum('bld,ds->blds', dt, A))
-    # Broadcasting fix: dt (B,L,D,1) * B (B,L,1,S) -> (B,L,D,S)
     dB = dt.unsqueeze(-1) * B.unsqueeze(2)
     
     h = torch.zeros(x.size(0), x.size(2), A.size(1), device=x.device, dtype=x.dtype)
@@ -192,7 +193,6 @@ def train(model, name, corpus):
     train_data = batchify(corpus.train, CONFIG['batch_size'])
     valid_data = batchify(corpus.valid, CONFIG['batch_size'])
     
-    # Scheduler fix: use exact number of steps
     total_steps = (train_data.size(0) // CONFIG['seq_len']) * CONFIG['epochs']
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=CONFIG['lr'], total_steps=total_steps)
     crit = nn.CrossEntropyLoss()
@@ -212,14 +212,13 @@ def train(model, name, corpus):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             
-            # Safe stepping
             if sched.last_epoch < total_steps:
                 sched.step()
             
             total_loss += loss.item() * len(x)
             tokens += len(x) * x.size(1)
             
-            if (batch+1) % 50 == 0:
+            if (batch+1) % 100 == 0:
                 print(f"Batch {batch+1} | Loss: {total_loss/tokens:.3f} | Speed: {tokens/(time.time()-start):.0f} tok/s")
         
         model.eval()
@@ -235,7 +234,35 @@ def train(model, name, corpus):
         print(f"Epoch {epoch+1} Valid BPC: {bpc:.3f}")
         return bpc
 
+# === VISUALIZATION ===
+def visualize_inn(model, corpus, text_sample="the quick brown fox jumps over the lazy dog"):
+    print("\n🧠 Generating Neuron Activity Heatmap...")
+    model.eval()
+    ids = corpus.tokenize(text_sample).to(device).unsqueeze(0)
+    activations = {}
+    def get_activation(name):
+        def hook(model, input, output):
+            if len(output.shape) == 4:
+                act = output.norm(dim=-1).squeeze(0).detach().cpu().numpy()
+                activations[name] = act
+        return hook
+    
+    handle = model.layers[-1][0].register_forward_hook(get_activation("mamba_last"))
+    with torch.no_grad():
+        model(ids)
+    handle.remove()
+    
+    plt.figure(figsize=(15, 6))
+    sns.heatmap(activations["mamba_last"], cmap="magma", 
+                xticklabels=list(text_sample), 
+                yticklabels=[f"N{i}" for i in range(model.num_neurons)])
+    plt.title(f"INNv2 Neuron Specialization (Character Level)\nInput: '{text_sample}'")
+    plt.tight_layout()
+    plt.savefig("inn_text8_heatmap.png")
+    print("✓ Saved inn_text8_heatmap.png")
+
 if __name__ == "__main__":
+    os.makedirs("models", exist_ok=True)
     download_text8()
     corpus = CharCorpus("data/text8", subset_size=CONFIG['subset_size'])
     
@@ -244,16 +271,20 @@ if __name__ == "__main__":
     # 1. INNv2
     inn = INNv2JIT(CONFIG['vocab_size'], 16, CONFIG['d_model'], CONFIG['n_layers'], CONFIG['dropout']).to(device)
     results['INNv2'] = train(inn, "INNv2 (JIT Safe)", corpus)
+    torch.save(inn.state_dict(), "models/inn_text8.pth")
+    visualize_inn(inn, corpus) # Visualize BEFORE deleting
     del inn
     
     # 2. LSTM
     lstm = LSTMBaseline(CONFIG['vocab_size'], CONFIG['d_model'], 6, CONFIG['dropout']).to(device)
     results['LSTM'] = train(lstm, "LSTM Baseline", corpus)
+    torch.save(lstm.state_dict(), "models/lstm_text8.pth")
     del lstm
     
     # 3. Transformer
     tf = TransformerBaseline(CONFIG['vocab_size'], CONFIG['d_model'], CONFIG['n_head'], CONFIG['d_hid'], CONFIG['n_layers'], CONFIG['dropout']).to(device)
     results['Transformer'] = train(tf, "Transformer Baseline", corpus)
+    torch.save(tf.state_dict(), "models/transformer_text8.pth")
     del tf
     
     print("\n=== FINAL LEADERBOARD (BPC) ===")
