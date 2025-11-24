@@ -137,18 +137,19 @@ class MonolithicINNv5(nn.Module):
         
         self.routers = nn.ModuleList([nn.Linear(d_model, num_neurons) for _ in range(num_layers)])
         
+        self.norm_input = nn.LayerNorm(d_model) # Added Input Norm
         self.norm_final = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.lm_head.weight = self.embedding.weight
         self.dropout = nn.Dropout(dropout)
         self._init_weights()
-        
+
     def _init_weights(self):
         # Stabilization: Smaller init for recurrent weights
-        nn.init.xavier_uniform_(self.A, gain=0.1)
-        nn.init.xavier_uniform_(self.B, gain=0.1)
-        nn.init.xavier_uniform_(self.C, gain=0.1)
-        # dt must be small positive
+        nn.init.xavier_uniform_(self.A, gain=0.01) # Very small init
+        nn.init.xavier_uniform_(self.B, gain=0.01)
+        nn.init.xavier_uniform_(self.C, gain=0.01)
+        nn.init.constant_(self.D, 1.0) # Passthrough identity
         nn.init.uniform_(self.dt, 0.001, 0.01)
 
     def forward_layer(self, layer_input, layer_idx):
@@ -156,12 +157,13 @@ class MonolithicINNv5(nn.Module):
         Process the entire sequence for a SINGLE layer.
         This function is checkpoint-able.
         """
+        layer_input = self.norm_input(layer_input) # Pre-norm stabilization
         B, L, D = layer_input.shape
         
         # Static Params for this layer
         l = layer_idx
         # Clamp dt to avoid explosion
-        dt_soft = F.softplus(self.dt[l]).clamp(max=1.0) # (N, D)
+        dt_soft = F.softplus(self.dt[l]).clamp(min=0.001, max=0.1) # Forced small dt
         
         dA = torch.exp(-dt_soft.unsqueeze(-1) * self.A[l].abs()) # (N, D, d_state)
         dB = dt_soft.unsqueeze(-1) * self.B[l] # (N, D, d_state)
@@ -209,17 +211,20 @@ class MonolithicINNv5(nn.Module):
             
             # Aggregate and Normalize !
             # Dividing by top_k stabilizes the sum
-            layer_out = y_neurons.sum(dim=1) / math.sqrt(self.top_k) # (B, D)
+            layer_out = y_neurons.sum(dim=1) / self.top_k # Divide by K, not sqrt(K) to be safe
             
-            # Residual + Norm + Dropout
-            out_t = self.norm_final(current_input + self.dropout(layer_out))
+            # Residual + Norm + Dropout handled outside? No, inside layer block usually.
+            # We do: Input + Layer(Norm(Input)) -> Pre-Norm Architecture
+            # But here we did Norm(Input + Layer(Input)). 
+            # Let's stick to simple Residual here.
+            out_t = current_input + self.dropout(layer_out)
             outputs.append(out_t)
             
         return torch.stack(outputs, dim=1) # (B, L, D)
         
     def forward(self, input_ids):
         B, L = input_ids.shape
-        x = self.embedding(input_ids) * math.sqrt(self.d_model)
+        x = self.embedding(input_ids) # Removed sqrt(d_model) scaling
         x = x.permute(1, 0, 2) # (L, B, D)
         x = self.pos_encoder(x.permute(1, 0, 2)).permute(1, 0, 2) 
         
@@ -231,7 +236,7 @@ class MonolithicINNv5(nn.Module):
             else:
                 x = self.forward_layer(x, l)
             
-        return self.lm_head(x)
+        return self.lm_head(self.norm_final(x)) # Final Norm before head
 
 # === CELL 4: Training Configuration ===
 CONFIG = {
