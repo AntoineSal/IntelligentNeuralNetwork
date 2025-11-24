@@ -17,8 +17,8 @@ CONFIG = {
     'd_hid': 1024,     
     'dropout': 0.1,
     'lr': 1e-3,
-    'batch_size': 8,       # ULTRA SAFE BATCH SIZE
-    'seq_len': 128,        # REDUCED SEQ LEN for memory safety
+    'batch_size': 8,       # SAFE BATCH SIZE
+    'seq_len': 128,        # SAFE SEQ LEN
     'epochs': 1,           
     'subset_size': 1000000 
 }
@@ -80,43 +80,18 @@ def get_batch(source, i, seq_len):
     return data, target
 
 # === JIT OPTIMIZED SSM ===
-# Compile this function to TorchScript for speed + low memory
 @torch.jit.script
 def ssm_jit(x, dt, A, B, C, D):
-    # x: (B, L, D_in)
-    # dt: (B, L, D_in)
-    # A: (D_in, D_state)
-    # B: (B, L, D_state)  <-- Note: 3 dims
-    # C: (B, L, D_state)  <-- Note: 3 dims
-    # D: (D_in)
-    
-    # Discretization
-    # Clamp dt for stability (crucial for long sequences/char-level)
-    dt = torch.clamp(dt, max=4.0) 
-    
-    # dA: (B, L, D_in, D_state)
+    dt = torch.clamp(dt, max=4.0) # Clamp for stability
     dA = torch.exp(torch.einsum('bld,ds->blds', dt, A))
-    
-    # dB: (B, L, D_in, D_state) via broadcasting
-    # dt: (B, L, D_in, 1) * B: (B, L, 1, D_state)
+    # Broadcasting fix: dt (B,L,D,1) * B (B,L,1,S) -> (B,L,D,S)
     dB = dt.unsqueeze(-1) * B.unsqueeze(2)
     
-    # Sequential scan (JIT compiled loop is fast)
     h = torch.zeros(x.size(0), x.size(2), A.size(1), device=x.device, dtype=x.dtype)
     ys = []
     
-    # Iterate over time L
     for t in range(x.size(1)):
-        # h_t = dA_t * h_{t-1} + dB_t * x_t
-        # x[t]: (B, D_in) -> (B, D_in, 1)
-        # dB[t]: (B, D_in, D_state)
-        # Result: (B, D_in, D_state)
         h = dA[:, t, :, :] * h + dB[:, t, :, :] * x[:, t, :].unsqueeze(-1)
-        
-        # y_t = C_t * h_t
-        # C[t]: (B, D_state) -> (B, 1, D_state)
-        # h: (B, D_in, D_state)
-        # We want (B, D_in). Sum over state dim.
         y_t = (h * C[:, t, :].unsqueeze(1)).sum(dim=-1)
         ys.append(y_t)
         
@@ -131,14 +106,7 @@ class MultiMambaBlockJIT(nn.Module):
         self.d_state = d_state
         
         self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
-        self.conv1d = nn.Conv1d(
-            num_neurons * self.d_inner, 
-            num_neurons * self.d_inner, 
-            bias=True, 
-            kernel_size=d_conv, 
-            groups=num_neurons * self.d_inner, 
-            padding=d_conv - 1
-        )
+        self.conv1d = nn.Conv1d(num_neurons * self.d_inner, num_neurons * self.d_inner, bias=True, kernel_size=d_conv, groups=num_neurons * self.d_inner, padding=d_conv - 1)
         self.x_proj = nn.Linear(self.d_inner, self.dt_rank + d_state * 2, bias=False)
         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
         self.A_log = nn.Parameter(torch.log(torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)))
@@ -155,18 +123,13 @@ class MultiMambaBlockJIT(nn.Module):
         x_conv = self.conv1d(x_conv)[:, :, :L].reshape(B, N, self.d_inner, L).permute(0, 1, 3, 2)
         x_conv = F.silu(x_conv)
         
-        # Prepare for JIT function
-        # Flatten N into Batch for parallel processing
         x_flat = x_conv.reshape(B*N, L, self.d_inner)
-        
         dt_rank_state = self.x_proj(x_flat)
         dt, B_ssm, C_ssm = torch.split(dt_rank_state, [self.dt_rank, self.d_state, self.d_state], dim=-1)
         dt = F.softplus(self.dt_proj(dt))
         A = -torch.exp(self.A_log.float())
         
-        # Call JIT with correct shapes (B and C are 3D: Batch, Length, D_state)
         y = ssm_jit(x_flat, dt, A, B_ssm, C_ssm, self.D)
-        
         y = y.reshape(B, N, L, self.d_inner)
         return self.dropout(self.out_proj(y * F.silu(res)))
 
@@ -193,18 +156,45 @@ class INNv2JIT(nn.Module):
             x = x_flat.view(B, L, self.num_neurons, -1).permute(0, 2, 1, 3)
         return self.head(self.norm_f(x.mean(dim=1)))
 
+# === BASELINES ===
+class LSTMBaseline(nn.Module):
+    def __init__(self, vocab_size, d_model, n_layers, dropout=0.1):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.lstm = nn.LSTM(d_model, d_model, n_layers, dropout=dropout, batch_first=True)
+        self.fc = nn.Linear(d_model, vocab_size)
+        self.fc.weight = self.embedding.weight
+    def forward(self, x):
+        return self.fc(self.lstm(self.embedding(x))[0])
+
+class TransformerBaseline(nn.Module):
+    def __init__(self, vocab_size, d_model, n_head, d_hid, n_layers, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_encoder = nn.Parameter(torch.zeros(1, 5000, d_model))
+        nn.init.normal_(self.pos_encoder, mean=0.0, std=0.02)
+        encoder_layer = nn.TransformerEncoderLayer(d_model, n_head, d_hid, dropout, batch_first=True, norm_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, n_layers)
+        self.fc = nn.Linear(d_model, vocab_size)
+        self.fc.weight = self.embedding.weight
+    def forward(self, x):
+        x = self.embedding(x) * math.sqrt(self.d_model) + self.pos_encoder[:, :x.size(1)]
+        mask = nn.Transformer.generate_square_subsequent_mask(x.size(1)).to(x.device)
+        return self.fc(self.transformer(x, mask, is_causal=True))
+
 # === TRAINING LOOP ===
 def train(model, name, corpus):
-    print(f"\n>>> Training {name}")
-    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
+    print(f"\n>>> Training {name} ({sum(p.numel() for p in model.parameters()):,} params)")
     torch.cuda.empty_cache()
     opt = torch.optim.AdamW(model.parameters(), lr=CONFIG['lr'])
+    
     train_data = batchify(corpus.train, CONFIG['batch_size'])
     valid_data = batchify(corpus.valid, CONFIG['batch_size'])
     
-    num_batches = (len(train_data) - 1) // CONFIG['seq_len']
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=CONFIG['lr'], steps_per_epoch=num_batches, epochs=CONFIG['epochs'])
+    # Scheduler fix: use exact number of steps
+    total_steps = (train_data.size(0) // CONFIG['seq_len']) * CONFIG['epochs']
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=CONFIG['lr'], total_steps=total_steps)
     crit = nn.CrossEntropyLoss()
     
     for epoch in range(CONFIG['epochs']):
@@ -221,15 +211,17 @@ def train(model, name, corpus):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-            sched.step()
+            
+            # Safe stepping
+            if sched.last_epoch < total_steps:
+                sched.step()
             
             total_loss += loss.item() * len(x)
             tokens += len(x) * x.size(1)
             
             if (batch+1) % 50 == 0:
-                print(f"Batch {batch+1}/{num_batches} | Loss: {total_loss/tokens:.3f} | Speed: {tokens/(time.time()-start):.0f} tok/s")
+                print(f"Batch {batch+1} | Loss: {total_loss/tokens:.3f} | Speed: {tokens/(time.time()-start):.0f} tok/s")
         
-        # Validation
         model.eval()
         val_loss = 0
         val_tokens = 0
@@ -247,6 +239,23 @@ if __name__ == "__main__":
     download_text8()
     corpus = CharCorpus("data/text8", subset_size=CONFIG['subset_size'])
     
-    # INNv2 ONLY for now
+    results = {}
+    
+    # 1. INNv2
     inn = INNv2JIT(CONFIG['vocab_size'], 16, CONFIG['d_model'], CONFIG['n_layers'], CONFIG['dropout']).to(device)
-    train(inn, "INNv2 (JIT Safe)", corpus)
+    results['INNv2'] = train(inn, "INNv2 (JIT Safe)", corpus)
+    del inn
+    
+    # 2. LSTM
+    lstm = LSTMBaseline(CONFIG['vocab_size'], CONFIG['d_model'], 6, CONFIG['dropout']).to(device)
+    results['LSTM'] = train(lstm, "LSTM Baseline", corpus)
+    del lstm
+    
+    # 3. Transformer
+    tf = TransformerBaseline(CONFIG['vocab_size'], CONFIG['d_model'], CONFIG['n_head'], CONFIG['d_hid'], CONFIG['n_layers'], CONFIG['dropout']).to(device)
+    results['Transformer'] = train(tf, "Transformer Baseline", corpus)
+    del tf
+    
+    print("\n=== FINAL LEADERBOARD (BPC) ===")
+    for k, v in sorted(results.items(), key=lambda item: item[1]):
+        print(f"{k}: {v:.3f}")
