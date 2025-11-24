@@ -144,10 +144,12 @@ class MonolithicINNv5(nn.Module):
         self._init_weights()
         
     def _init_weights(self):
-        nn.init.xavier_uniform_(self.A)
-        nn.init.xavier_uniform_(self.B)
-        nn.init.xavier_uniform_(self.C)
-        nn.init.uniform_(self.dt, 0.001, 0.1)
+        # Stabilization: Smaller init for recurrent weights
+        nn.init.xavier_uniform_(self.A, gain=0.1)
+        nn.init.xavier_uniform_(self.B, gain=0.1)
+        nn.init.xavier_uniform_(self.C, gain=0.1)
+        # dt must be small positive
+        nn.init.uniform_(self.dt, 0.001, 0.01)
 
     def forward_layer(self, layer_input, layer_idx):
         """
@@ -158,7 +160,9 @@ class MonolithicINNv5(nn.Module):
         
         # Static Params for this layer
         l = layer_idx
-        dt_soft = F.softplus(self.dt[l]) # (N, D)
+        # Clamp dt to avoid explosion
+        dt_soft = F.softplus(self.dt[l]).clamp(max=1.0) # (N, D)
+        
         dA = torch.exp(-dt_soft.unsqueeze(-1) * self.A[l].abs()) # (N, D, d_state)
         dB = dt_soft.unsqueeze(-1) * self.B[l] # (N, D, d_state)
         C_l = self.C[l] # (N, D, d_state)
@@ -203,8 +207,9 @@ class MonolithicINNv5(nn.Module):
             # Update state (not in-place for safety within checkpoint)
             curr_state = next_state
             
-            # Aggregate
-            layer_out = y_neurons.sum(dim=1) # (B, D)
+            # Aggregate and Normalize !
+            # Dividing by top_k stabilizes the sum
+            layer_out = y_neurons.sum(dim=1) / math.sqrt(self.top_k) # (B, D)
             
             # Residual + Norm + Dropout
             out_t = self.norm_final(current_input + self.dropout(layer_out))
