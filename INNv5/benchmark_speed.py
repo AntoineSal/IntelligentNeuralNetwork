@@ -39,13 +39,13 @@ def benchmark_inference(model, input_ids, steps=50):
     end_time = time.time()
     return steps / (end_time - start_time)
 
-# --- CONFIGURATION DU DUEL ---
-VOCAB_SIZE = 256 # Char level
-D_MODEL = 256
+# --- CONFIGURATION DU DUEL (WORD LEVEL) ---
+VOCAB_SIZE = 33278 # WikiText-2 Word Level
+D_MODEL = 512
 SEQ_LEN = 64
 BATCH_SIZE = 1 # Inférence temps réel
 
-print(f"⚔️ DUEL: INNv5 vs TRANSFORMER ⚔️")
+print(f"⚔️ DUEL: INNv5 vs TRANSFORMER (Word-Level) ⚔️")
 print(f"Config: d_model={D_MODEL}, seq_len={SEQ_LEN}, vocab={VOCAB_SIZE}")
 print("-" * 50)
 
@@ -55,7 +55,7 @@ print(f"Running on: {device}")
 input_ids = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN)).to(device)
 
 # 1. TRANSFORMER (Le Champion en titre)
-transformer = SimpleTransformer(VOCAB_SIZE, D_MODEL, nhead=4, num_layers=6).to(device)
+transformer = SimpleTransformer(VOCAB_SIZE, D_MODEL, nhead=8, num_layers=6).to(device)
 params_trans = count_parameters(transformer)
 print(f"🤖 Transformer Baseline instantiated.")
 speed_trans = benchmark_inference(transformer, input_ids)
@@ -64,22 +64,15 @@ print(f"   Vitesse: {speed_trans:.2f} runs/sec")
 print("-" * 50)
 
 # 2. INNv5 (Le Challenger Sparse)
-# Note: This requires MonolithicINNv5 class to be available in the context
-# We will import it from the notebook/script if this is run as a script
-# For standalone execution, we need to define it or assume it's pasted
 try:
-    # Assuming MonolithicINNv5 is defined in the notebook context where this is run
-    # If running as standalone script, you need to import it.
-    # For now, we'll assume this snippet is pasted AFTER the model definition.
-    
-    # On simule un grand réseau (512 neurones) mais avec peu d'actifs (32)
-    inn_model = MonolithicINNv5(VOCAB_SIZE, d_model=D_MODEL, num_layers=6, num_neurons=512, top_k=32).to(device)
+    # On simule un grand réseau (128 neurones) mais avec peu d'actifs (32)
+    inn_model = MonolithicINNv5(VOCAB_SIZE, d_model=D_MODEL, num_layers=6, num_neurons=128, top_k=32).to(device)
     params_inn = count_parameters(inn_model)
     print(f"🧠 INNv5 (Massive Sparse) instantiated.")
     speed_inn = benchmark_inference(inn_model, input_ids)
     
     print(f"   Params Totaux: {params_inn/1e6:.2f}M")
-    print(f"   Neurones: 512 | Actifs: 32 (Sparsity: {1 - 32/512:.1%})")
+    print(f"   Neurones: 128 | Actifs: 32 (Sparsity: {1 - 32/128:.1%})")
     print(f"   Vitesse: {speed_inn:.2f} runs/sec")
     
     print("=" * 50)
@@ -93,4 +86,3 @@ try:
 except NameError:
     print("⚠️ Erreur: La classe MonolithicINNv5 n'est pas définie.")
     print("Veuillez exécuter la cellule contenant la définition du modèle INNv5 avant ce benchmark.")
-
