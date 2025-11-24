@@ -38,7 +38,8 @@ class CharCorpus:
         with open(path, 'r') as f:
             text = f.read()
         
-        # Split 90/5/5
+        # Split 90/5/5 -> REDUCED TO 5M TOTAL FOR SPEED
+        text = text[:5000000] # Use only first 5M chars
         n = len(text)
         train_end = int(n * 0.9)
         val_end = int(n * 0.95)
