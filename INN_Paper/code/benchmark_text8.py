@@ -86,12 +86,17 @@ def ssm_jit(x, dt, A, B, C, D):
     # x: (B, L, D_in)
     # dt: (B, L, D_in)
     # A: (D_in, D_state)
-    # B: (B, L, D_in, D_state)
-    # C: (B, L, D_in, D_state)
+    # B: (B, L, D_state)  <-- Note: 3 dims
+    # C: (B, L, D_state)  <-- Note: 3 dims
     # D: (D_in)
     
+    # Discretization
+    # dA: (B, L, D_in, D_state)
     dA = torch.exp(torch.einsum('bld,ds->blds', dt, A))
-    dB = torch.einsum('bld,bls->blds', dt, B)
+    
+    # dB: (B, L, D_in, D_state) via broadcasting
+    # dt: (B, L, D_in, 1) * B: (B, L, 1, D_state)
+    dB = dt.unsqueeze(-1) * B.unsqueeze(2)
     
     # Sequential scan (JIT compiled loop is fast)
     h = torch.zeros(x.size(0), x.size(2), A.size(1), device=x.device, dtype=x.dtype)
@@ -100,9 +105,16 @@ def ssm_jit(x, dt, A, B, C, D):
     # Iterate over time L
     for t in range(x.size(1)):
         # h_t = dA_t * h_{t-1} + dB_t * x_t
+        # x[t]: (B, D_in) -> (B, D_in, 1)
+        # dB[t]: (B, D_in, D_state)
+        # Result: (B, D_in, D_state)
         h = dA[:, t, :, :] * h + dB[:, t, :, :] * x[:, t, :].unsqueeze(-1)
+        
         # y_t = C_t * h_t
-        y_t = torch.einsum('bds,bs->bd', h, C[:, t, :, :])
+        # C[t]: (B, D_state) -> (B, 1, D_state)
+        # h: (B, D_in, D_state)
+        # We want (B, D_in). Sum over state dim.
+        y_t = (h * C[:, t, :].unsqueeze(1)).sum(dim=-1)
         ys.append(y_t)
         
     y = torch.stack(ys, dim=1)
@@ -149,17 +161,7 @@ class MultiMambaBlockJIT(nn.Module):
         dt = F.softplus(self.dt_proj(dt))
         A = -torch.exp(self.A_log.float())
         
-        # Reshape B and C for JIT
-        # (B*N, L, D_state) -> (B*N, L, D_inner, D_state) via broadcasting or repeat?
-        # Actually B and C in Mamba are usually (Batch, Length, D_state) and broadcasted across D_inner
-        # But our JIT expects (B, L, D_in, D_state). Let's adjust JIT or inputs.
-        # Standard Mamba: B, C are (B, L, N) where N=d_state. They modulate ALL D_inner channels.
-        
-        # Expand B_ssm, C_ssm to match D_inner
-        # B_ssm: (Batch, L, d_state) -> (Batch, L, d_inner, d_state)
-        B_ssm = B_ssm.unsqueeze(2).expand(-1, -1, self.d_inner, -1)
-        C_ssm = C_ssm.unsqueeze(2).expand(-1, -1, self.d_inner, -1)
-        
+        # Call JIT with correct shapes (B and C are 3D: Batch, Length, D_state)
         y = ssm_jit(x_flat, dt, A, B_ssm, C_ssm, self.D)
         
         y = y.reshape(B, N, L, self.d_inner)
