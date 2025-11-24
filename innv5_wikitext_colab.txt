@@ -33,10 +33,11 @@ class Dictionary:
 class Corpus:
     def __init__(self, path):
         self.dictionary = Dictionary()
-        # Standard WikiText-2 Tokenization
+        print(f"Loading corpus from {path}...")
         self.train = self.tokenize(os.path.join(path, 'train.txt'))
         self.valid = self.tokenize(os.path.join(path, 'valid.txt'))
         self.test = self.tokenize(os.path.join(path, 'test.txt'))
+        print(f"Corpus loaded. Train tokens: {self.train.size(0):,}")
 
     def tokenize(self, path):
         """Tokenizes a text file."""
@@ -83,11 +84,14 @@ def download_wikitext():
     os.makedirs("data/wikitext-2", exist_ok=True)
     for filename, url in urls.items():
         path = f"data/wikitext-2/{filename}"
-        if not os.path.exists(path):
+        # Check if file exists AND is not empty
+        if not os.path.exists(path) or os.path.getsize(path) < 100:
             print(f"Downloading {filename}...")
             r = requests.get(url)
             with open(path, 'wb') as f:
                 f.write(r.content)
+        else:
+            print(f"File {filename} already exists ({os.path.getsize(path)} bytes).")
 
 download_wikitext()
 corpus = Corpus('data/wikitext-2')
@@ -241,8 +245,10 @@ CONFIG = {
 batch_size = CONFIG['batch_size']
 accum_steps = CONFIG['accum_steps']
 
+print(f"Batchifying data... (Batch size: {batch_size})")
 train_data = batchify(corpus.train, batch_size)
 val_data = batchify(corpus.valid, batch_size)
+print(f"Train data shape: {train_data.shape}")
 
 model = MonolithicINNv5(
     vocab_size, 
@@ -271,6 +277,7 @@ def train():
     ntokens = len(corpus.dictionary)
     
     num_batches = train_data.size(1) // CONFIG['seq_len']
+    print(f"Starting epoch {epoch}... Num batches: {num_batches}")
     
     for batch, i in enumerate(range(0, train_data.size(1) - 1, CONFIG['seq_len'])):
         data, targets = get_batch(train_data, i, CONFIG['seq_len'])
