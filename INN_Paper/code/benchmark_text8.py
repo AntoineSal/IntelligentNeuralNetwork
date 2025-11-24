@@ -91,6 +91,9 @@ def ssm_jit(x, dt, A, B, C, D):
     # D: (D_in)
     
     # Discretization
+    # Clamp dt for stability (crucial for long sequences/char-level)
+    dt = torch.clamp(dt, max=4.0) 
+    
     # dA: (B, L, D_in, D_state)
     dA = torch.exp(torch.einsum('bld,ds->blds', dt, A))
     
