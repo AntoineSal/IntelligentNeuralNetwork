@@ -159,8 +159,12 @@ class MonolithicINNv5(nn.Module):
         x = x.permute(1, 0, 2) # (L, B, D)
         x = self.pos_encoder(x)
         
-        # Initial states: (B, Layers, Neurons, D, d_state)
-        states = torch.zeros(B, self.num_layers, self.num_neurons, self.d_model, self.d_state, device=x.device)
+        # Initial states list (one per layer) to avoid in-place modification error
+        # Each element: (B, N_neurons, D, d_state)
+        current_layer_states = [
+            torch.zeros(B, self.num_neurons, self.d_model, self.d_state, device=x.device)
+            for _ in range(self.num_layers)
+        ]
         
         outputs = []
         
@@ -173,6 +177,7 @@ class MonolithicINNv5(nn.Module):
         
         for t in range(L):
             current_input = x[t] # (B, D)
+            new_layer_states = [] # To store updated states for next step
             
             for l in range(self.num_layers):
                 # Routing
@@ -194,7 +199,7 @@ class MonolithicINNv5(nn.Module):
                 
                 # State update for ALL neurons (vectorized)
                 # state: (B, N, D, d_state)
-                curr_state = states[:, l] # (B, N, D, d_state)
+                curr_state = current_layer_states[l] # Use state from previous step (or init)
                 inp_expanded = current_input.unsqueeze(1).unsqueeze(-1) # (B, 1, D, 1)
                 
                 # Update
@@ -210,8 +215,8 @@ class MonolithicINNv5(nn.Module):
                 # Apply Mask (Sparsity)
                 y_neurons = y_neurons * mask.squeeze(-1) # (B, N, D)
                 
-                # Save state
-                states[:, l] = next_state
+                # Store state for next step (NOT in-place)
+                new_layer_states.append(next_state)
                 
                 # Aggregate outputs (Sum active neurons)
                 layer_out = y_neurons.sum(dim=1) # (B, D)
@@ -219,6 +224,8 @@ class MonolithicINNv5(nn.Module):
                 # Residual + Norm
                 current_input = self.norm_final(current_input + self.dropout(layer_out))
             
+            # Update states list for next time step
+            current_layer_states = new_layer_states
             outputs.append(current_input)
             
         out = torch.stack(outputs, dim=0).permute(1, 0, 2) # (B, L, D)
