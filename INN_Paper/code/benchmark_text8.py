@@ -22,7 +22,7 @@ CONFIG = {
     'batch_size': 8,       # SAFE BATCH SIZE
     'seq_len': 128,        # SAFE SEQ LEN
     'epochs': 1,           
-    'subset_size': 1000000 
+    'subset_size': 5000000 
 }
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
