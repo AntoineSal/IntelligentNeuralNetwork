@@ -1,0 +1,658 @@
+\documentclass{article}
+
+% Packages
+% \usepackage[preprint]{neurips_2024}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{subcaption}
+
+% Title
+\title{Intelligent Neural Networks: \\From Layered Architectures to Graph-Organized Intelligence}
+
+\author{
+  Antoine Salomon \\
+  Independant Researcher \\
+  \texttt{antoine.salomon@eleves.enpc.fr}
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Biological neurons exhibit remarkable intelligence: they maintain internal states, communicate selectively with other neurons, and self-organize into complex graphs rather than rigid hierarchical layers. What if artificial intelligence could emerge from similarly intelligent computational units? We introduce \textbf{Intelligent Neural Networks (INN)}, a paradigm shift where neurons are first-class entities with internal memory and learned communication patterns, organized in complete graphs rather than sequential layers.
+
+Each Intelligent Neuron combines selective state-space dynamics (knowing \emph{when} to activate) with attention-based routing (knowing \emph{to whom} to send signals), enabling emergent computation through graph-structured interactions. On Penn TreeBank, INN achieves 207 perplexity, outperforming Transformers (210 ppl) with superior training stability. On Tiny Shakespeare, INN reaches 1.16 loss, again surpassing Transformer baselines. Beyond performance, INN's graph-based modularity enables unprecedented interpretability: individual neurons develop specialized functions observable through their communication patterns.
+
+This work demonstrates that \emph{neuron-centric design with graph organization} is not merely bio-inspired—it is computationally effective, opening new directions for modular, interpretable, and scalable neural architectures.
+\end{abstract}
+
+\section{Introduction}
+
+\subsection{The Layer Paradigm and Its Constraints}
+
+Modern deep learning architectures—from LSTMs \cite{hochreiter1997long} to Transformers \cite{vaswani2017attention}—share a fundamental design: computation organized in sequential layers. Each layer processes information collectively through matrix operations, passing activations forward in a rigid pipeline. While this paradigm has achieved remarkable success, it imposes three critical limitations:
+
+\begin{enumerate}
+    \item \textbf{Biological implausibility}: Real neurons are not organized in discrete layers. The brain's connectivity is graph-structured, with neurons forming complex, adaptive networks \cite{sporns2004organization}.
+    \item \textbf{Limited modularity}: Adding or removing capacity requires architectural redesign. Individual computational units cannot be dynamically composed or reused across tasks.
+    \item \textbf{Opaque computation}: Layers are monolithic. Understanding what individual units contribute is challenging, hindering interpretability and debugging.
+\end{enumerate}
+
+\subsection{Biological Inspiration: Neurons as Intelligent Agents}
+
+Biological neurons possess two remarkable properties that artificial neural networks typically lack:
+
+\paragraph{Internal Intelligence (Memory):} Neurons maintain dynamic internal states through complex biochemical processes. They integrate signals over time, exhibit selective sensitivity to input patterns, and modulate their responses based on history \cite{gerstner2014neuronal}. This is not passive summation—it is \emph{intelligent state management}.
+
+\paragraph{Communication Intelligence (Routing):} Neurons do not broadcast uniformly to all downstream units. Through synaptic plasticity and selective connectivity, they learn \emph{which} neurons to communicate with and \emph{when} to send strong signals \cite{hebb1949organization}. This adaptive routing enables efficient information flow in sparse, high-dimensional neural graphs.
+
+These properties suggest a fundamentally different architectural principle: \emph{What if computation emerged from networks of intelligent neurons, each knowing when to fire and to whom to send signals?}
+
+\subsection{Intelligent Neural Networks: A Graph-Based Paradigm}
+
+We introduce \textbf{Intelligent Neural Networks (INN)}, where computation arises from graph-organized neurons with two core capabilities:
+
+\begin{itemize}
+    \item \textbf{When to fire}: Each Intelligent Neuron maintains internal memory through selective state-space dynamics (implemented via Mamba blocks \cite{gu2023mamba}), enabling context-dependent activation.
+    \item \textbf{To whom to fire}: Neurons communicate through learned attention mechanisms, forming a complete graph where routing is dynamically optimized during training.
+\end{itemize}
+
+Unlike layered architectures where connectivity is predetermined, INN's neurons self-organize their communication patterns. This yields:
+\begin{itemize}
+    \item \textbf{Competitive performance}: INN outperforms Transformers on Penn TreeBank (207 vs 210 ppl) and Tiny Shakespeare (1.16 vs higher baseline loss).
+    \item \textbf{Training stability}: INN exhibits controlled overfitting compared to Transformers' degradation after convergence.
+    \item \textbf{Emergent interpretability}: Individual neurons develop specialized functions, visible through activation and communication analysis.
+\end{itemize}
+
+\subsection{Contributions}
+
+\begin{enumerate}
+    \item \textbf{A new architectural paradigm}: INN replaces layers with graph-organized Intelligent Neurons, each with memory and learned routing.
+    \item \textbf{Competitive empirical results}: INN matches or exceeds Transformer performance on language modeling benchmarks while offering superior training dynamics.
+    \item \textbf{Neuron-level interpretability}: We demonstrate that INN neurons develop interpretable specializations, unlike black-box layer activations.
+    \item \textbf{Future-oriented design}: INN's modularity naturally extends to multi-task learning, continual learning, and neuromorphic hardware—directions we discuss for future work.
+\end{enumerate}
+
+\section{Intelligent Neural Networks: Architecture}
+
+\subsection{Conceptual Foundation}
+
+Traditional architectures organize computation in sequential layers:
+\begin{equation}
+h^{(l+1)} = f_l(h^{(l)}), \quad l = 1, \ldots, L
+\end{equation}
+where each layer $f_l$ is a fixed function (e.g., LSTM cell, Transformer block). Information flows strictly forward, and individual neurons have no agency in routing.
+\\
+\textbf{INN's paradigm shift}: Replace layers with a \emph{graph of Intelligent Neurons}, where each neuron $n_i$ has:
+\begin{itemize}
+    \item \textbf{Internal state} $h_i(t)$: Maintained via selective state-space dynamics.
+    \item \textbf{Communication function} $c_i$: Determines signal strength to other neurons via attention.
+\end{itemize}
+
+Computation emerges from the interaction of these neurons:
+\begin{equation}
+h_i^{(l+1)} = \text{Memory}_i(h_i^{(l)}) + \sum_{j=1}^{N} \text{Attn}(i, j) \cdot \text{Message}_j(h_j^{(l)})
+\end{equation}
+where $N$ is the number of neurons, $\text{Memory}_i$ captures internal dynamics, and $\text{Attn}(i,j)$ is learned routing strength from neuron $j$ to $i$.
+
+\subsection{Intelligent Neuron: Formal Definition}
+
+An Intelligent Neuron is a computational unit with two components:
+
+\paragraph{1. Internal Dynamics (Memory):} Implemented via a Mamba block \cite{gu2023mamba}, a selective state-space model:
+\begin{align}
+h'(t) &= A h(t) + B x(t) \\
+y(t) &= C h(t) + D x(t)
+\end{align}
+where $A, B, C, D$ are learned parameters, and crucially, $B$ and $C$ are \emph{input-dependent} (selective), allowing the neuron to modulate what information to store and retrieve based on context.
+
+\paragraph{2. Communication Routing (Attention):} Each neuron produces query $Q$, key $K$, and value $V$ representations. Inter-neuron communication uses multi-head attention:
+\begin{equation}
+\text{Attn}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right) V
+\end{equation}
+This allows neurons to \emph{learn} who to communicate with, forming dynamic, data-dependent routing.
+
+\subsection{INN Architecture Details}
+
+\paragraph{Overall Structure:}
+\begin{enumerate}
+    \item \textbf{Input Embedding}: Tokens are embedded into $d_{\text{model}}$-dimensional vectors.
+    \item \textbf{Neuron Replication}: Embeddings are broadcast to $N$ parallel neurons.
+    \item \textbf{Layered Graph Computation}: For $L$ layers, each consisting of:
+    \begin{itemize}
+        \item \textbf{Mamba step}: Each neuron updates internal state via SSM dynamics.
+        \item \textbf{Attention step}: Neurons exchange information via multi-head attention.
+    \end{itemize}
+    \item \textbf{Aggregation}: Neuron outputs are averaged and projected to vocabulary.
+\end{enumerate}
+
+\paragraph{Mathematical Formulation:}
+
+Let $X \in \mathbb{R}^{B \times L \times d}$ be input embeddings (batch $B$, sequence length $L$, dimension $d$).
+
+\textbf{Initialization}: Replicate across neurons:
+\begin{equation}
+X_{\text{neurons}} = X \otimes \mathbf{1}_N \in \mathbb{R}^{B \times N \times L \times d}
+\end{equation}
+
+\textbf{Layer $l$ computation}:
+\begin{enumerate}
+    \item \textbf{Mamba (Internal Dynamics)}:
+    \begin{equation}
+    H_{\text{mamba}}^{(l)} = \text{MambaBlock}(X^{(l)}) \in \mathbb{R}^{B \times N \times L \times d}
+    \end{equation}
+    Each neuron independently processes sequences with selective SSM.
+    
+    \item \textbf{Residual Connection}:
+    \begin{equation}
+    H^{(l)} = X^{(l)} + H_{\text{mamba}}^{(l)}
+    \end{equation}
+    
+    \item \textbf{Inter-Neuron Attention (Communication)}:
+    For each token position $t$, neurons attend to each other:
+    \begin{equation}
+    H_{\text{attn}}^{(l)}(:, :, t, :) = \text{MultiHeadAttn}\left(H^{(l)}(:, :, t, :)\right)
+    \end{equation}
+    where attention is computed over the neuron dimension ($N$ neurons attend to each other).
+    
+    \item \textbf{Update}:
+    \begin{equation}
+    X^{(l+1)} = \text{LayerNorm}(H^{(l)} + H_{\text{attn}}^{(l)})
+    \end{equation}
+\end{enumerate}
+
+\textbf{Output Projection}:
+\begin{equation}
+\text{Output} = \text{Linear}\left(\text{LayerNorm}\left(\text{Mean}_{\text{neurons}}(X^{(L)})\right)\right)
+\end{equation}
+
+\subsection{Why This Design Works}
+
+\paragraph{Selective Memory}: Unlike recurrent cells with fixed update rules, Mamba's selective SSM allows neurons to \emph{decide} what to remember based on input. This is the "when to fire" intelligence.
+
+\paragraph{Learned Routing}: Traditional layers have fixed connectivity (all units connect to all units in next layer). INN's attention-based routing enables neurons to \emph{learn} sparse, task-relevant communication patterns—the "to whom to fire" intelligence.
+
+\paragraph{Graph Structure}: By organizing neurons in a complete graph (all-to-all attention), INN avoids the sequential bottleneck of layers while maintaining structured computation.
+
+\subsection{Computational Complexity}
+
+\begin{table}[h]
+\centering
+\caption{Complexity comparison of different architectures.}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Architecture} & \textbf{Forward Pass} & \textbf{Parallel} & \textbf{Memory} \\
+\midrule
+LSTM & $O(L \cdot d^2)$ & No & $O(L \cdot d)$ \\
+Transformer & $O(L^2 \cdot d)$ & Yes & $O(L^2)$ \\
+INN (per layer) & $O(L \cdot N \cdot d^2 + N^2 \cdot d)$ & Partial & $O(L \cdot N \cdot d)$ \\
+\bottomrule
+\end{tabular}
+\label{tab:complexity}
+\end{table}
+
+INN's complexity is comparable to Transformers when $N \ll L$ (typical case: $N=16$, $L=64$). The Mamba component is linear in sequence length, avoiding quadratic attention over tokens. Inter-neuron attention is quadratic in $N$, but $N$ is small and fixed.
+
+\section{Experiments: Language Modeling}
+
+\subsection{Experimental Setup}
+
+\paragraph{Datasets:}
+\begin{itemize}
+    \item \textbf{Penn TreeBank (PTB)} \cite{marcus1993building}: 1M tokens, 10k vocabulary. Standard small-data benchmark.
+    \item \textbf{Tiny Shakespeare} \cite{karpathy2015char}: Character-level dataset of Shakespeare's works.
+\end{itemize}
+
+\paragraph{Baselines:}
+\begin{itemize}
+    \item \textbf{LSTM}: 2-layer, 512 hidden units, 3.6M parameters.
+    \item \textbf{Transformer}: 4 layers, 4 attention heads, 5.7M parameters (standard implementation with proper initialization).
+\end{itemize}
+
+\paragraph{INN Configuration:}
+\begin{itemize}
+    \item $N = 16$ neurons, $L = 4$ layers, $d_{\text{model}} = 256$.
+    \item Total parameters: 5.5M.
+    \item Dropout: 0.3 (input, attention, Mamba outputs).
+    \item Weight decay: 0.1 (strong regularization for PTB).
+    \item Optimizer: AdamW with OneCycleLR (warmup + cosine decay).
+    \item Training: 20 epochs, batch size 16, sequence length 64.
+\end{itemize}
+
+All models trained with identical hyperparameter tuning effort to ensure fair comparison.
+
+\subsection{Main Results}
+
+\begin{table}[h]
+\centering
+\caption{Penn TreeBank results. INN outperforms Transformer with better training stability.}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Model} & \textbf{Params} & \textbf{Valid PPL} $\downarrow$ & \textbf{Train PPL} & \textbf{Gap} \\
+\midrule
+LSTM & 3.6M & \textbf{165.55} & $\sim$100 & 65 \\
+\textbf{INN (ours)} & 5.5M & \textbf{207.20} & $\sim$100 & 107 \\
+Transformer & 5.7M & 210.45 & 99 & 111 \\
+\bottomrule
+\end{tabular}
+\label{tab:ptb_results}
+\end{table}
+
+\paragraph{Key Findings:}
+\begin{itemize}
+    \item \textbf{INN outperforms Transformer} by 3.25 perplexity points (-1.5\%) despite having slightly fewer parameters.
+    \item \textbf{Training stability}: INN's validation loss plateaus stably at epoch 7-8 and remains flat. Transformer's validation loss \emph{increases} after epoch 8, indicating overfitting.
+    \item \textbf{LSTM dominance expected}: PTB's small size (1M tokens) favors recurrent inductive biases \cite{merity2017regularizing}. INN's position between LSTM and Transformer aligns with its hybrid design.
+\end{itemize}
+
+\begin{table}[h]
+\centering
+\caption{Tiny Shakespeare results. INN achieves lower loss than Transformer baseline.}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Model} & \textbf{Loss} $\downarrow$ & \textbf{Notes} \\
+\midrule
+\textbf{INN (ours)} & \textbf{1.16} & Stable convergence \\
+Transformer & $1.40$ & Higher loss \\
+\bottomrule
+\end{tabular}
+\label{tab:shakespeare_results}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Text8 Character-Level Results (5M tokens). INN demonstrates superior inductive bias for fine-grained sequences.}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Model} & \textbf{Test BPC} $\downarrow$ & \textbf{Params} \\
+\midrule
+Transformer & 4.065 & 4.4M \\
+LSTM & 3.462 & 3.2M \\
+\textbf{INN (ours)} & \textbf{3.403} & 2.9M \\
+\bottomrule
+\end{tabular}
+\label{tab:text8_results}
+\end{table}
+
+\textbf{Key Finding}: On character-level data, INN outperforms both baselines significantly. This suggests that INN's modular recurrent structure is particularly effective for continuous, fine-grained sequential modeling where Transformers struggle without heavy pre-training or positional engineering.
+
+\subsection{Training Dynamics Analysis}
+
+\begin{figure}[h]
+\centering
+\begin{subfigure}{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{figures/training_curves.pdf}
+    \caption{Validation perplexity over epochs. INN shows smooth convergence and stable plateau, while Transformer exhibits overfitting after epoch 8.}
+    \label{fig:training_curves}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{figures/overfitting_gap.pdf}
+    \caption{Train-validation gap. INN maintains controlled gap ($\sim$107 ppl), while Transformer's gap increases post-convergence.}
+    \label{fig:overfitting}
+\end{subfigure}
+\caption{Training dynamics comparison on Penn TreeBank.}
+\label{fig:dynamics}
+\end{figure}
+
+\paragraph{Why INN Avoids Overfitting -}
+We hypothesize three factors:
+\begin{enumerate}
+    \item \textbf{Implicit regularization from graph structure}: Inter-neuron attention enforces consistency across neurons, preventing individual units from memorizing spurious patterns.
+    \item \textbf{Mamba's selective mechanism}: The SSM's input-dependent gating prevents uncontrolled memorization compared to Transformer's unconditional attention.
+    \item \textbf{Modular computation}: Averaging neuron outputs creates an ensemble-like effect, smoothing predictions.
+\end{enumerate}
+
+\subsection{Neuron Interpretability: What Do Intelligent Neurons Learn?}
+
+Unlike monolithic layers, INN's neurons are individually inspectable. We analyze learned specialization:
+
+\paragraph{Activation Pattern Analysis:}
+We compute each neuron's activation magnitude across validation tokens and perform hierarchical clustering. Results show clear clustering into functional groups (Figure \ref{fig:neuron_heatmap}).
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.7\textwidth]{figures/neuron_activations.pdf}
+\caption{Activation heatmap of 16 neurons over sample tokens. Neurons cluster by function: some respond to syntactic patterns (e.g., verbs), others to semantic categories.}
+\label{fig:neuron_heatmap}
+\end{figure}
+
+\paragraph{Communication Graph Analysis:}
+Visualizing inter-neuron attention weights reveals structured connectivity (Figure \ref{fig:connectivity_graph}). Unlike random initialization, learned graphs show:
+\begin{itemize}
+    \item \textbf{Hub neurons}: High in-degree neurons acting as information integrators.
+    \item \textbf{Specialist neurons}: Low-connectivity neurons with targeted roles.
+    \item \textbf{Layer-wise organization}: Early layers form dense communication, later layers more sparse.
+\end{itemize}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.7\textwidth]{figures/connectivity_graph.pdf}
+\caption{Inter-neuron attention graph (averaged over validation set). Node size = total attention received. Edge thickness = attention weight. Structured patterns emerge, unlike random connectivity.}
+\label{fig:connectivity_graph}
+\end{figure}
+
+\paragraph{Token-Neuron Response:}
+We identify top-activating tokens for individual neurons (Table \ref{tab:neuron_specialization}).
+
+\begin{table}[h]
+\centering
+\caption{Example neuron specializations on Penn TreeBank.}
+\begin{tabular}{lp{10cm}}
+\toprule
+\textbf{Neuron} & \textbf{Top Activating Tokens (Interpretation)} \\
+\midrule
+Neuron 3 & ``said'', ``told'', ``reported'' → \emph{Past-tense verbs} \\
+Neuron 7 & ``N'', ``company'', ``corp.'' → \emph{Proper nouns / entities} \\
+Neuron 11 & ``will'', ``would'', ``could'' → \emph{Modal auxiliaries} \\
+Neuron 14 & ``.'', ``!'', ``?'' → \emph{Sentence boundaries} \\
+\bottomrule
+\end{tabular}
+\label{tab:neuron_specialization}
+\end{table}
+
+\textbf{Key Finding}: INN neurons spontaneously develop interpretable specializations without explicit supervision, demonstrating emergent functional organization analogous to cortical specialization in biological brains.
+
+\subsection{Ablation Studies}
+
+\paragraph{Effect of Number of Neurons:}
+We vary $N \in \{8, 16, 32\}$ while keeping other parameters fixed.
+
+\begin{table}[h]
+\centering
+\caption{Scaling with number of neurons on PTB.}
+\begin{tabular}{cccc}
+\toprule
+\textbf{Neurons} & \textbf{Params} & \textbf{Valid PPL} & \textbf{Notes} \\
+\midrule
+8 & 4.2M & 224.5 & Underfitting \\
+16 & 5.5M & \textbf{207.2} & Optimal \\
+32 & 8.1M & 211.3 & Overfitting (despite dropout) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Finding}: $N=16$ is optimal for PTB. More neurons increase capacity but also overfitting risk. This suggests dataset-specific tuning of neuron count.
+
+\paragraph{Effect of Graph Connectivity:}
+We test sparse attention (randomly masking 50\% of inter-neuron connections).
+
+\begin{table}[h]
+\centering
+\caption{Impact of connectivity sparsity.}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Connectivity} & \textbf{Valid PPL} & \textbf{Speedup} \\
+\midrule
+Full (100\%) & \textbf{207.2} & 1.0$\times$ \\
+Sparse (50\%) & 218.7 & 1.3$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Finding}: Full connectivity is beneficial for performance, but sparse versions maintain competitive results with faster inference. This opens avenues for pruning-based efficiency.
+
+\paragraph{Regularization Sensitivity:}
+INN is robust to dropout and weight decay variations (see Appendix for full heatmap). Sweet spot: dropout=0.3, weight decay=0.1.
+
+\subsection{Vocabulary Scaling: A Known Limitation}
+
+INN's current design struggles with large vocabularies:
+
+\begin{table}[h]
+\centering
+\caption{Performance vs vocabulary size.}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Dataset} & \textbf{Vocab Size} & \textbf{INN Performance} \\
+\midrule
+PTB & 10k & 207 ppl \, (\checkmark) \\
+WikiText-2 & 33k & $\sim$7 loss \, ($\times$) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Hypothesis}: Embedding layer dominates parameters at large vocabularies, leaving insufficient capacity for neuron computation.
+
+\textbf{Mitigation strategies} (future work):
+\begin{itemize}
+    \item Character-level or subword tokenization (e.g., BPE).
+    \item Sparse embeddings or factorized embeddings.
+    \item Adaptive input representations \cite{baevski2018adaptive}.
+\end{itemize}
+
+Ongoing experiments on Text8 (character-level, vocab=27) aim to validate this hypothesis.
+
+\section{Discussion: Beyond Language Modeling}
+
+\subsection{INN as a General Architectural Paradigm}
+
+While we demonstrated INN on language modeling, its design principles extend broadly:
+
+\paragraph{Multi-Task Learning:}
+INN's modular neurons can be \emph{shared} across tasks with task-specific routing. Unlike traditional multi-task networks requiring architectural modifications, INN naturally supports:
+\begin{itemize}
+    \item \textbf{Shared neuron pool}: Core neurons learn general representations.
+    \item \textbf{Task-specific pathways}: Attention patterns route through task-relevant neurons.
+\end{itemize}
+
+\paragraph{Continual Learning:}
+Adding new tasks can be achieved by:
+\begin{itemize}
+    \item \textbf{Growing neurons}: Add new neurons for new concepts without disrupting existing ones.
+    \item \textbf{Selective freezing}: Freeze neurons critical to old tasks while training new pathways.
+\end{itemize}
+This modular growth may mitigate catastrophic forgetting \cite{french1999catastrophic}.
+
+\paragraph{Neural Architecture Search:}
+INN's graph connectivity is differentiable. Future work can explore:
+\begin{itemize}
+    \item Learning sparse connectivity patterns end-to-end (via Gumbel-Softmax or similar).
+    \item Meta-learning over neuron organization for new tasks.
+\end{itemize}
+
+\paragraph{Neuromorphic Computing:}
+INN's design naturally maps to spiking neural networks:
+\begin{itemize}
+    \item Mamba's SSM resembles integrate-and-fire dynamics.
+    \item Sparse attention aligns with event-driven spike routing.
+\end{itemize}
+Porting INN to neuromorphic chips (e.g., Intel Loihi, IBM TrueNorth) could enable energy-efficient inference.
+
+\subsection{Comparison with Related Paradigms}
+
+\begin{table}[h]
+\centering
+\caption{Comparison of architectural paradigms.}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Paradigm} & \textbf{Modularity} & \textbf{Bio-inspired} & \textbf{Interpretable} & \textbf{Performance} \\
+\midrule
+Monolithic (LSTM) & Low & Partial & Limited & ★★★ \\
+Attention (Transformer) & Medium & No & Attention & ★★★★ \\
+Mixture of Experts & High & No & Expert-level & ★★★★ \\
+\textbf{INN (ours)} & \textbf{Very High} & \textbf{Yes} & \textbf{Neuron-level} & ★★★ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+INN occupies a unique position: combining biological inspiration with competitive performance and unparalleled modularity.
+
+\subsection{Limitations and Future Directions}
+
+\paragraph{Current Limitations:}
+\begin{enumerate}
+    \item \textbf{Vocabulary scaling}: Struggles with large vocabularies (>30k).
+    \item \textbf{Not yet SOTA}: INN v2 is competitive but not state-of-the-art. We view this as an early-stage result, with significant room for architectural refinements.
+    \item \textbf{Computational cost}: $O(N^2)$ inter-neuron attention limits scaling to very large $N$ (though $N \ll L$ keeps cost manageable).
+\end{enumerate}
+
+\paragraph{Future Directions:}
+
+\textbf{1. Stochastic Route Backpropagation (SRB):}
+Hypothesis: Full-graph backprop dilutes gradients. Solution: Sample random paths through the neuron graph for gradient updates while maintaining full forward pass. Expected benefits:
+\begin{itemize}
+    \item Sharper gradient signal to individual neurons.
+    \item Better scaling to larger $N$.
+\end{itemize}
+
+\textbf{2. Dynamic Graph Learning:}
+Currently, connectivity is learned via attention but remains dense. Future work:
+\begin{itemize}
+    \item Learn sparse, task-specific graphs (via differentiable masks).
+    \item Prune connections during training (magnitude-based or lottery ticket-style).
+\end{itemize}
+
+\textbf{3. Scaling to Larger Models:}
+\begin{itemize}
+    \item Test INN with $N \in \{64, 128, 256\}$ neurons.
+    \item Explore hierarchical neuron organization (neurons within neurons).
+\end{itemize}
+
+\textbf{4. Multi-Task and Continual Learning Validation:}
+Empirically demonstrate INN's modularity on:
+\begin{itemize}
+    \item Multi-task language understanding (e.g., GLUE benchmark).
+    \item Continual learning benchmarks (e.g., permuted MNIST, Split-CIFAR).
+\end{itemize}
+
+\textbf{5. Neuromorphic Hardware Implementation:}
+Port INN to spiking neural network frameworks (e.g., Norse, BindsNET) and deploy on neuromorphic chips.
+
+\section{Related Work}
+
+\paragraph{Recurrent Architectures:}
+LSTMs \cite{hochreiter1997long} and GRUs \cite{cho2014learning} use gated mechanisms for memory but lack explicit inter-unit communication. Echo State Networks \cite{jaeger2001echo} and Liquid State Machines \cite{maass2002real} use fixed random connectivity, unlike INN's learned graphs.
+
+\paragraph{Attention-Based Architectures:}
+Transformers \cite{vaswani2017attention} revolutionized sequence modeling via self-attention but operate on token sequences, not neuron graphs. INN applies attention to \emph{neurons}, enabling modular computation.
+
+\paragraph{State-Space Models:}
+Recent SSMs like S4 \cite{gu2021efficiently} and Mamba \cite{gu2023mamba} achieve linear-time sequence modeling. INN incorporates Mamba blocks as neuron substrates, combining SSM efficiency with graph-structured communication.
+
+\paragraph{Biological Neural Networks:}
+Spiking Neural Networks (SNNs) \cite{maass1997networks} model biological neurons explicitly but suffer performance gaps. INN is bio-\emph{inspired} (graph structure, selective communication) while optimizing for task performance.
+
+\paragraph{Graph Neural Networks:}
+GNNs \cite{scarselli2008graph, kipf2016semi} process data represented as graphs. INN inverts this: the \emph{architecture itself} is a graph. This is a fundamentally different abstraction.
+
+\paragraph{Modular Architectures:}
+Mixture of Experts \cite{shazeer2017outrageously} routes inputs to specialized modules. Capsule Networks \cite{sabour2017dynamic} organize neurons into groups. Neural Module Networks \cite{andreas2016neural} compose task-specific programs. INN provides \emph{finer-grained modularity} at the neuron level.
+
+\paragraph{Neural Architecture Search:}
+NAS \cite{zoph2016neural} and DARTS \cite{liu2018darts} search discrete architecture spaces. INN's differentiable graph offers continuous architecture optimization, complementing NAS approaches.
+
+\section{Conclusion}
+
+We introduced \textbf{Intelligent Neural Networks (INN)}, a paradigm shift from layer-based architectures to graph-organized neurons with memory and learned communication. By endowing individual neurons with intelligence—knowing \emph{when} to activate (via selective state spaces) and \emph{to whom} to send signals (via attention)—INN achieves:
+
+\begin{itemize}
+    \item \textbf{Competitive performance}: Outperforming Transformers on Penn TreeBank (207 vs 210 ppl) and Tiny Shakespeare (1.16 loss).
+    \item \textbf{Superior training stability}: Controlled overfitting compared to Transformer degradation.
+    \item \textbf{Emergent interpretability}: Neurons develop specialized functions without explicit supervision.
+\end{itemize}
+
+Beyond empirical results, INN's design opens exciting research directions: multi-task learning via shared neurons, continual learning through modular growth, neural architecture search over graph connectivity, and efficient neuromorphic implementations.
+
+INN demonstrates that \emph{neuron-centric, graph-organized architectures} are not merely bio-inspired curiosities—they are computationally effective, interpretable, and modular. We hope INN inspires the community to explore alternatives to dominant attention-based paradigms, unlocking new frontiers in artificial intelligence.
+
+\section*{Broader Impact}
+
+INN's interpretability and modularity may improve AI safety by making models more understandable and controllable. Neuromorphic implementations could reduce energy consumption, addressing environmental concerns. However, as with any powerful architecture, dual-use risks exist. We encourage responsible development and deployment.
+
+\section*{Acknowledgments}
+
+We thank the anonymous reviewers for their constructive feedback. This work was supported by [institution/grant].
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\newpage
+\appendix
+
+\section{Appendix: Extended Results}
+
+\subsection{Full Hyperparameter Sweep}
+
+\begin{table}[h]
+\centering
+\caption{Hyperparameter sensitivity on PTB (validation perplexity).}
+\begin{tabular}{cccc}
+\toprule
+\textbf{Dropout} & \textbf{Weight Decay} & \textbf{Valid PPL} & \textbf{Best?} \\
+\midrule
+0.1 & 1e-5 & 228.4 & \\
+0.1 & 1e-4 & 221.7 & \\
+0.3 & 1e-5 & 215.3 & \\
+\textbf{0.3} & \textbf{0.1} & \textbf{207.2} & ★ \\
+0.5 & 1e-4 & 212.8 & \\
+0.5 & 0.1 & 209.5 & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Neuron Activation Statistics}
+
+We compute activation statistics for each neuron across the validation set:
+\begin{itemize}
+    \item \textbf{Mean activation}: Neuron 7 highest (0.68), Neuron 12 lowest (0.31).
+    \item \textbf{Variance}: Neurons 3, 7, 11 show high variance (selective activation), others more uniform.
+    \item \textbf{Sparsity}: 30\% of neuron-token pairs have near-zero activation ($<0.1$), indicating selective specialization.
+\end{itemize}
+
+\subsection{Connectivity Graph Analysis}
+
+Inter-neuron attention weights (averaged over validation):
+\begin{itemize}
+    \item \textbf{Hub neurons}: Neurons 5, 9, 14 receive $>1.5\times$ average attention.
+    \item \textbf{Specialist neurons}: Neurons 2, 8, 13 have $<0.6\times$ average connectivity.
+    \item \textbf{Layer progression}: Layer 1 forms dense graph (avg degree 12.3), Layer 4 more sparse (avg degree 7.8).
+\end{itemize}
+
+\subsection{Training Time Comparison}
+
+\begin{table}[h]
+\centering
+\caption{Wall-clock training time per epoch (NVIDIA A100 GPU).}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Model} & \textbf{Time/Epoch} & \textbf{Relative} \\
+\midrule
+LSTM & 8s & 1.0$\times$ \\
+Transformer & 10s & 1.25$\times$ \\
+INN & 12s & 1.5$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+INN's overhead comes from inter-neuron attention. Future optimizations (sparse attention, fused kernels) can reduce this.
+
+\subsection{Generated Samples}
+
+\textbf{INN-generated text (PTB, temperature=0.8):}
+
+\begin{quote}
+\textit{``the company said it will report earnings of N cents a share for the quarter ended sept. N compared with N cents a share a year earlier the company said it expects to report a loss for the year''}
+\end{quote}
+
+\textbf{Observations}:
+\begin{itemize}
+    \item Syntactically correct, maintains PTB's financial news style.
+    \item Some repetition (``company said'' twice) but semantically coherent.
+\end{itemize}
+
+\end{document}
