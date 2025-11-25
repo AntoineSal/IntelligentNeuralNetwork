@@ -18,9 +18,9 @@ CONFIG = {
     'n_head': 4,
     'd_hid': 1024,     
     'dropout': 0.1,
-    'lr': 1e-3,
-    'batch_size': 8,       # SAFE BATCH SIZE
-    'seq_len': 128,        # SAFE SEQ LEN
+    'lr': 3e-4,            # LOWER LR for stability
+    'batch_size': 8,       
+    'seq_len': 128,        
     'epochs': 1,           
     'subset_size': 5000000 
 }
@@ -84,7 +84,7 @@ def get_batch(source, i, seq_len):
 # === JIT OPTIMIZED SSM ===
 @torch.jit.script
 def ssm_jit(x, dt, A, B, C, D):
-    dt = torch.clamp(dt, max=4.0) # Clamp for stability
+    dt = torch.clamp(dt, max=2.5) # Aggressive clamp for stability on long training
     dA = torch.exp(torch.einsum('bld,ds->blds', dt, A))
     dB = dt.unsqueeze(-1) * B.unsqueeze(2)
     
@@ -209,7 +209,7 @@ def train(model, name, corpus):
             
             opt.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5) # Stricter clipping
             opt.step()
             
             if sched.last_epoch < total_steps:

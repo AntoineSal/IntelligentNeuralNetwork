@@ -556,6 +556,10 @@ Mixture of Experts \cite{shazeer2017outrageously} routes inputs to specialized m
 \paragraph{Neural Architecture Search:}
 NAS \cite{zoph2016neural} and DARTS \cite{liu2018darts} search discrete architecture spaces. INN's differentiable graph offers continuous architecture optimization, complementing NAS approaches.
 
+\subsection{A Note on Resource Constraints and Future Scaling}
+
+This research was conducted by an independent researcher using a single NVIDIA A100 GPU. The competitive results obtained under these constraints highlight INN's parameter efficiency compared to baselines that typically require massive compute for optimization. We believe INN's modularity makes it an ideal candidate for large-scale distributed training, and we welcome collaborations to explore its capabilities at the scale of modern Foundation Models.
+
 \section{Conclusion}
 
 We introduced \textbf{Intelligent Neural Networks (INN)}, a paradigm shift from layer-based architectures to graph-organized neurons with memory and learned communication. By endowing individual neurons with intelligence—knowing \emph{when} to activate (via selective state spaces) and \emph{to whom} to send signals (via attention)—INN achieves:
