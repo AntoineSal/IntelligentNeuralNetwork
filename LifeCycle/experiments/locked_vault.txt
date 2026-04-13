@@ -1,0 +1,176 @@
+# @title 🧬 INN V10.1: The Locked Vault (Fixed)
+# @markdown Correction du bug d'initialisation.
+# @markdown Rappel : Mémoire Figée (Identité) + Cerveau Plastique.
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import math
+import random
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"🚀 INN V10.1 (LOCKED VAULT) on {DEVICE}")
+
+D_MODEL = 128
+D_STATE = 256
+VOCAB_SIZE = 100
+LR = 2e-3
+
+# --- 1. LE COFFRE-FORT (Locked Memory) ---
+class LockedMemoryNeuron(nn.Module):
+    def __init__(self, d_model, d_state):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        
+        self.gru = nn.GRU(d_model, d_state, batch_first=True)
+        self.out_proj = nn.Linear(d_state, d_model)
+        
+        # Initialisation Identité + Bias Hack
+        with torch.no_grad():
+            self.gru.weight_hh_l0.zero_()
+            i_start = 2 * d_state
+            i_end = 3 * d_state
+            self.gru.weight_hh_l0[i_start:i_end].copy_(torch.eye(d_state))
+            
+            self.gru.bias_hh_l0.zero_()
+            # Update Gate Bias (+5.0) -> Force Memory
+            self.gru.bias_hh_l0[d_state:2*d_state].fill_(5.0) 
+            
+            self.gru.bias_ih_l0.zero_()
+            
+        # FREEZE RECURRENCE
+        self.gru.weight_hh_l0.requires_grad = False
+        self.gru.bias_hh_l0.requires_grad = False
+        
+    def forward(self, x, h):
+        if h is None: h = torch.zeros(1, x.size(0), self.d_state, device=x.device)
+        o, h_new = self.gru(x, h)
+        return self.out_proj(o), h_new
+
+# --- 2. LE CALCULATEUR (Trainable) ---
+class ComputeNeuron(nn.Module):
+    def __init__(self, d_model, d_state):
+        super().__init__()
+        self.gru = nn.GRU(d_model, d_state, batch_first=True)
+        self.out_proj = nn.Linear(d_state, d_model)
+    def forward(self, x, h):
+        if h is None: h = torch.zeros(1, x.size(0), self.gru.hidden_size, device=x.device)
+        o, h_new = self.gru(x, h)
+        return self.out_proj(o), h_new
+
+# --- 3. ARCHITECTURE ---
+class LockedINN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embedding = nn.Embedding(VOCAB_SIZE, D_MODEL)
+        
+        self.neurons = nn.ModuleList([
+            LockedMemoryNeuron(D_MODEL, D_STATE),
+            LockedMemoryNeuron(D_MODEL, D_STATE),
+            ComputeNeuron(D_MODEL, D_STATE),
+            ComputeNeuron(D_MODEL, D_STATE)
+        ])
+        
+        # Smart Workspace Components
+        self.fusion_net = nn.Sequential(
+            nn.Linear(D_MODEL, D_MODEL),
+            nn.GELU(),
+            nn.Linear(D_MODEL, D_MODEL)
+        )
+        
+        # Attention Components (Manual implementation)
+        self.q = nn.Linear(D_MODEL, D_MODEL)
+        self.k = nn.Linear(D_MODEL, D_MODEL)
+        self.v = nn.Linear(D_MODEL, D_MODEL) # CORRECTION ICI
+        self.w_out = nn.Linear(D_MODEL, D_MODEL)
+        self.norm = nn.LayerNorm(D_MODEL)
+        
+        self.readout = nn.Linear(D_MODEL * 4, VOCAB_SIZE)
+
+    def run_workspace(self, stack):
+        B, S, N, D = stack.shape
+        flat = stack.view(B*S, N, D)
+        
+        # Attention
+        q = self.q(flat)
+        k = self.k(flat)
+        v = self.v(flat)
+        attn = F.softmax(torch.matmul(q, k.transpose(-2,-1)) / math.sqrt(D), dim=-1)
+        mixed = torch.matmul(attn, v)
+        
+        # Fusion (FFN)
+        processed = self.fusion_net(mixed)
+        
+        # Residual + Norm
+        out = self.norm(flat + self.w_out(processed))
+        return out.view(B, S, N, D)
+
+    def forward(self, x, h=None):
+        if h is None: h = [None] * 4
+        x_emb = self.embedding(x)
+        outs, new_h = [], []
+        for i, n in enumerate(self.neurons):
+            o, hh = n(x_emb, h[i])
+            outs.append(o); new_h.append(hh)
+        stack = torch.stack(outs, dim=2)
+        integ = self.run_workspace(stack)
+        return self.readout(integ.view(x.size(0), x.size(1), -1)), new_h
+
+# --- RUN ---
+def run_v10():
+    model = LockedINN().to(DEVICE)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    opt = optim.Adam(trainable_params, lr=LR)
+    
+    def get_batch(bs, seq):
+        x = torch.randint(30, 100, (bs, seq)); y = x.clone(); m = torch.zeros_like(x).float()
+        for b in range(bs):
+            va, vb = random.randint(0,9), random.randint(0,9)
+            x[b, random.randint(0, seq//4)], x[b, random.randint(0, seq//4)+1] = 20, va
+            x[b, random.randint(seq//3, 2*seq//3)], x[b, random.randint(seq//3, 2*seq//3)+1] = 21, vb
+            q = random.randint(3*seq//4, seq-2)
+            x[b, q], x[b, q+1] = 99, 98; y[b, q+1] = va+vb; m[b, q+1] = 1.0
+        return x.to(DEVICE), y.to(DEVICE), m.to(DEVICE)
+
+    print("🧊 TRAINING V10.1 (LOCKED MEMORY)...")
+    
+    for step in range(1001):
+        x, y, mask = get_batch(32, 64)
+        logits, _ = model(x, None)
+        loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), y.view(-1), reduction='none')
+        loss = (loss * mask.view(-1)).sum() / (mask.sum() + 1e-6)
+        opt.zero_grad(); loss.backward(); opt.step()
+        if step % 200 == 0: 
+            print(f"Step {step} | Loss: {loss.item():.4f}")
+            if loss.item() < 0.05: break
+
+    print("\n🌌 ULTIME BENCHMARK 10K (LOCKED)")
+    model.eval()
+    for H in [2000, 5000, 10000]:
+        va, vb, tgt = 4, 3, 7
+        h = None
+        _, h = model(torch.tensor([[20, va]]).to(DEVICE), h)
+        for _ in range(H//200): _, h = model(torch.randint(30,99,(1,100)).to(DEVICE), h)
+        _, h = model(torch.tensor([[21, vb]]).to(DEVICE), h)
+        for _ in range(H//200): _, h = model(torch.randint(30,99,(1,100)).to(DEVICE), h)
+        logits, _ = model(torch.tensor([[99, 98]]).to(DEVICE), h)
+        pred = logits[0,-1].argmax().item()
+        conf = F.softmax(logits[0,-1], dim=0)[pred].item()
+        print(f"H={H} | {'✅' if pred==tgt else '❌ '+str(pred)} | Conf: {conf:.1%}")
+
+if __name__ == "__main__":
+    run_v10()
+
+🚀 INN V10.1 (LOCKED VAULT) on cuda
+🧊 TRAINING V10.1 (LOCKED MEMORY)...
+Step 0 | Loss: 4.8578
+Step 200 | Loss: 0.7967
+Step 400 | Loss: 0.0857
+Step 600 | Loss: 0.0065
+
+🌌 ULTIME BENCHMARK 10K (LOCKED)
+H=2000 | ❌ 12 | Conf: 87.4%
+H=5000 | ✅ | Conf: 83.0%
+H=10000 | ✅ | Conf: 60.0%

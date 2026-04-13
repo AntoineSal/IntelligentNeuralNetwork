@@ -1,0 +1,156 @@
+=== LAUNCHING TRANSFORMER BASELINE ON TEXT8 ===
+Config: {'dataset': 'text8', 'vocab_size': 27, 'seq_len': 256, 'batch_size': 32, 'lr': 0.0003, 'epochs': 1, 'grad_clip': 0.25, 'lstm_hidden': 512, 'lstm_layers': 3, 'trans_d_model': 256, 'trans_n_head': 8, 'trans_n_layers': 6, 'trans_dim_feedforward': 1024}
+Loading text8...
+Vocab found: 27 (Expected 27)
+Encoding data...
+Train: 90,000,000 | Valid: 5,000,000
+/usr/local/lib/python3.12/dist-packages/torch/nn/modules/transformer.py:392: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.self_attn.batch_first was not True(use batch_first for better inference performance)
+  warnings.warn(
+
+Model: TRANSFORMER | Params: 4,745,499
+Comparison target: INNv2 was ~4.2M params
+Starting training for 1 epoch(s)...
+Batch 100 | Loss: 26.6325 | BPC: 38.4226 | Speed: 259810 tok/s
+Batch 200 | Loss: 5.2680 | BPC: 7.6002 | Speed: 286152 tok/s
+Batch 300 | Loss: 4.2045 | BPC: 6.0658 | Speed: 287493 tok/s
+Batch 400 | Loss: 3.6261 | BPC: 5.2314 | Speed: 286986 tok/s
+Batch 500 | Loss: 3.2456 | BPC: 4.6824 | Speed: 287387 tok/s
+Batch 600 | Loss: 3.0182 | BPC: 4.3544 | Speed: 289268 tok/s
+Batch 700 | Loss: 2.8562 | BPC: 4.1207 | Speed: 287775 tok/s
+Batch 800 | Loss: 2.7355 | BPC: 3.9465 | Speed: 286035 tok/s
+Batch 900 | Loss: 2.6668 | BPC: 3.8474 | Speed: 286686 tok/s
+Batch 1000 | Loss: 2.6017 | BPC: 3.7534 | Speed: 289538 tok/s
+Batch 1100 | Loss: 2.5602 | BPC: 3.6936 | Speed: 290388 tok/s
+Batch 1200 | Loss: 2.5371 | BPC: 3.6602 | Speed: 290456 tok/s
+Batch 1300 | Loss: 2.5118 | BPC: 3.6237 | Speed: 287397 tok/s
+Batch 1400 | Loss: 2.4984 | BPC: 3.6044 | Speed: 288568 tok/s
+Batch 1500 | Loss: 2.4816 | BPC: 3.5801 | Speed: 287524 tok/s
+Batch 1600 | Loss: 2.4783 | BPC: 3.5754 | Speed: 287065 tok/s
+Batch 1700 | Loss: 2.4579 | BPC: 3.5460 | Speed: 290410 tok/s
+Batch 1800 | Loss: 2.4495 | BPC: 3.5339 | Speed: 290722 tok/s
+Batch 1900 | Loss: 2.4617 | BPC: 3.5514 | Speed: 290133 tok/s
+Batch 2000 | Loss: 2.4514 | BPC: 3.5367 | Speed: 290233 tok/s
+Batch 2100 | Loss: 2.4467 | BPC: 3.5298 | Speed: 288889 tok/s
+Batch 2200 | Loss: 2.4458 | BPC: 3.5286 | Speed: 287157 tok/s
+Batch 2300 | Loss: 2.4351 | BPC: 3.5131 | Speed: 287134 tok/s
+Batch 2400 | Loss: 2.4370 | BPC: 3.5159 | Speed: 290393 tok/s
+Batch 2500 | Loss: 2.4205 | BPC: 3.4920 | Speed: 290433 tok/s
+Batch 2600 | Loss: 2.4147 | BPC: 3.4837 | Speed: 290599 tok/s
+Batch 2700 | Loss: 2.4109 | BPC: 3.4781 | Speed: 290462 tok/s
+Batch 2800 | Loss: 2.3945 | BPC: 3.4545 | Speed: 287240 tok/s
+Batch 2900 | Loss: 2.3723 | BPC: 3.4225 | Speed: 287192 tok/s
+Batch 3000 | Loss: 2.3402 | BPC: 3.3761 | Speed: 287598 tok/s
+Batch 3100 | Loss: 2.2957 | BPC: 3.3119 | Speed: 290587 tok/s
+Batch 3200 | Loss: 2.2636 | BPC: 3.2656 | Speed: 289588 tok/s
+Batch 3300 | Loss: 2.2206 | BPC: 3.2037 | Speed: 290467 tok/s
+Batch 3400 | Loss: 2.1627 | BPC: 3.1202 | Speed: 290134 tok/s
+Batch 3500 | Loss: 2.1340 | BPC: 3.0787 | Speed: 287017 tok/s
+Batch 3600 | Loss: 2.1057 | BPC: 3.0379 | Speed: 286479 tok/s
+Batch 3700 | Loss: 2.0843 | BPC: 3.0070 | Speed: 287341 tok/s
+Batch 3800 | Loss: 2.0371 | BPC: 2.9389 | Speed: 290787 tok/s
+Batch 3900 | Loss: 2.0265 | BPC: 2.9236 | Speed: 290655 tok/s
+Batch 4000 | Loss: 1.9954 | BPC: 2.8788 | Speed: 290180 tok/s
+Batch 4100 | Loss: 1.9836 | BPC: 2.8617 | Speed: 289622 tok/s
+Batch 4200 | Loss: 1.9368 | BPC: 2.7943 | Speed: 286635 tok/s
+Batch 4300 | Loss: 1.9310 | BPC: 2.7858 | Speed: 286997 tok/s
+Batch 4400 | Loss: 1.9024 | BPC: 2.7446 | Speed: 287910 tok/s
+Batch 4500 | Loss: 1.8873 | BPC: 2.7229 | Speed: 290580 tok/s
+Batch 4600 | Loss: 1.8589 | BPC: 2.6818 | Speed: 290218 tok/s
+Batch 4700 | Loss: 1.8533 | BPC: 2.6737 | Speed: 290650 tok/s
+Batch 4800 | Loss: 1.8313 | BPC: 2.6420 | Speed: 289458 tok/s
+Batch 4900 | Loss: 1.8112 | BPC: 2.6130 | Speed: 287003 tok/s
+Batch 5000 | Loss: 1.7843 | BPC: 2.5742 | Speed: 287191 tok/s
+Batch 5100 | Loss: 1.7755 | BPC: 2.5615 | Speed: 288064 tok/s
+Batch 5200 | Loss: 1.7742 | BPC: 2.5596 | Speed: 290521 tok/s
+Batch 5300 | Loss: 1.7498 | BPC: 2.5244 | Speed: 290506 tok/s
+Batch 5400 | Loss: 1.7346 | BPC: 2.5025 | Speed: 289871 tok/s
+Batch 5500 | Loss: 1.7344 | BPC: 2.5022 | Speed: 289192 tok/s
+Batch 5600 | Loss: 1.7304 | BPC: 2.4964 | Speed: 286423 tok/s
+Batch 5700 | Loss: 1.6782 | BPC: 2.4211 | Speed: 286601 tok/s
+Batch 5800 | Loss: 1.7174 | BPC: 2.4777 | Speed: 288791 tok/s
+Batch 5900 | Loss: 1.6855 | BPC: 2.4317 | Speed: 290071 tok/s
+Batch 6000 | Loss: 1.6681 | BPC: 2.4065 | Speed: 290060 tok/s
+Batch 6100 | Loss: 1.6568 | BPC: 2.3902 | Speed: 290215 tok/s
+Batch 6200 | Loss: 1.6564 | BPC: 2.3896 | Speed: 288944 tok/s
+Batch 6300 | Loss: 1.6736 | BPC: 2.4145 | Speed: 286429 tok/s
+Batch 6400 | Loss: 1.6364 | BPC: 2.3608 | Speed: 286306 tok/s
+Batch 6500 | Loss: 1.6495 | BPC: 2.3797 | Speed: 289212 tok/s
+Batch 6600 | Loss: 1.6387 | BPC: 2.3642 | Speed: 290383 tok/s
+Batch 6700 | Loss: 1.6231 | BPC: 2.3417 | Speed: 289688 tok/s
+Batch 6800 | Loss: 1.6300 | BPC: 2.3516 | Speed: 289795 tok/s
+Batch 6900 | Loss: 1.6317 | BPC: 2.3541 | Speed: 288232 tok/s
+Batch 7000 | Loss: 1.6159 | BPC: 2.3313 | Speed: 286628 tok/s
+Batch 7100 | Loss: 1.6097 | BPC: 2.3223 | Speed: 286271 tok/s
+Batch 7200 | Loss: 1.6132 | BPC: 2.3273 | Speed: 288924 tok/s
+Batch 7300 | Loss: 1.6067 | BPC: 2.3180 | Speed: 290020 tok/s
+Batch 7400 | Loss: 1.5884 | BPC: 2.2916 | Speed: 290504 tok/s
+Batch 7500 | Loss: 1.5921 | BPC: 2.2969 | Speed: 290455 tok/s
+Batch 7600 | Loss: 1.5803 | BPC: 2.2799 | Speed: 288156 tok/s
+Batch 7700 | Loss: 1.5778 | BPC: 2.2763 | Speed: 287337 tok/s
+Batch 7800 | Loss: 1.5778 | BPC: 2.2762 | Speed: 286570 tok/s
+Batch 7900 | Loss: 1.5860 | BPC: 2.2881 | Speed: 289696 tok/s
+Batch 8000 | Loss: 1.5735 | BPC: 2.2701 | Speed: 289735 tok/s
+Batch 8100 | Loss: 1.5806 | BPC: 2.2803 | Speed: 290329 tok/s
+Batch 8200 | Loss: 1.5806 | BPC: 2.2803 | Speed: 290143 tok/s
+Batch 8300 | Loss: 1.5564 | BPC: 2.2454 | Speed: 287512 tok/s
+Batch 8400 | Loss: 1.5666 | BPC: 2.2601 | Speed: 287333 tok/s
+Batch 8500 | Loss: 1.5599 | BPC: 2.2504 | Speed: 287175 tok/s
+Batch 8600 | Loss: 1.5683 | BPC: 2.2626 | Speed: 290463 tok/s
+Batch 8700 | Loss: 1.5571 | BPC: 2.2464 | Speed: 290162 tok/s
+Batch 8800 | Loss: 1.5466 | BPC: 2.2313 | Speed: 290616 tok/s
+Batch 8900 | Loss: 1.5399 | BPC: 2.2217 | Speed: 290144 tok/s
+Batch 9000 | Loss: 1.5600 | BPC: 2.2506 | Speed: 286780 tok/s
+Batch 9100 | Loss: 1.5532 | BPC: 2.2408 | Speed: 286812 tok/s
+Batch 9200 | Loss: 1.5640 | BPC: 2.2564 | Speed: 287885 tok/s
+Batch 9300 | Loss: 1.5547 | BPC: 2.2430 | Speed: 290424 tok/s
+Batch 9400 | Loss: 1.5632 | BPC: 2.2553 | Speed: 290142 tok/s
+Batch 9500 | Loss: 1.5623 | BPC: 2.2540 | Speed: 290168 tok/s
+Batch 9600 | Loss: 1.5490 | BPC: 2.2348 | Speed: 289676 tok/s
+Batch 9700 | Loss: 1.5518 | BPC: 2.2388 | Speed: 287084 tok/s
+Batch 9800 | Loss: 1.5379 | BPC: 2.2188 | Speed: 286723 tok/s
+Batch 9900 | Loss: 1.5261 | BPC: 2.2017 | Speed: 288449 tok/s
+Batch 10000 | Loss: 1.5367 | BPC: 2.2170 | Speed: 290412 tok/s
+Batch 10100 | Loss: 1.5315 | BPC: 2.2095 | Speed: 290316 tok/s
+Batch 10200 | Loss: 1.5415 | BPC: 2.2239 | Speed: 290277 tok/s
+Batch 10300 | Loss: 1.5400 | BPC: 2.2217 | Speed: 289033 tok/s
+Batch 10400 | Loss: 1.5497 | BPC: 2.2357 | Speed: 286652 tok/s
+Batch 10500 | Loss: 1.5359 | BPC: 2.2159 | Speed: 287282 tok/s
+Batch 10600 | Loss: 1.5339 | BPC: 2.2130 | Speed: 289210 tok/s
+Batch 10700 | Loss: 1.5400 | BPC: 2.2218 | Speed: 290176 tok/s
+Batch 10800 | Loss: 1.5186 | BPC: 2.1909 | Speed: 290746 tok/s
+Batch 10900 | Loss: 1.5452 | BPC: 2.2293 | Speed: 290113 tok/s
+
+=== FINAL VALIDATION ===
+🏆 TRANSFORMER Final Test BPC: 2.0552
+
+=== LAUNCHING LSTM ULTIMATE FAIR (OneCycleLR) ===
+Downloading text8...
+Text Loaded. Length: 100,000,000
+Params: 4,266,387
+Starting training for 10986 steps...
+Step 500/10986 | BPC: 3.4745 | LR: 4.53e-04 | Speed: 352687 tok/s
+Step 1000/10986 | BPC: 2.2869 | LR: 9.81e-04 | Speed: 361514 tok/s
+Step 1500/10986 | BPC: 1.9755 | LR: 9.96e-04 | Speed: 351691 tok/s
+Step 2000/10986 | BPC: 1.8633 | LR: 9.80e-04 | Speed: 366194 tok/s
+Step 2500/10986 | BPC: 1.8394 | LR: 9.51e-04 | Speed: 345772 tok/s
+Step 3000/10986 | BPC: 1.8040 | LR: 9.11e-04 | Speed: 358792 tok/s
+Step 3500/10986 | BPC: 1.7723 | LR: 8.61e-04 | Speed: 342349 tok/s
+Step 4000/10986 | BPC: 1.7568 | LR: 8.02e-04 | Speed: 366355 tok/s
+Step 4500/10986 | BPC: 1.7323 | LR: 7.35e-04 | Speed: 351021 tok/s
+Step 5000/10986 | BPC: 1.7199 | LR: 6.62e-04 | Speed: 357057 tok/s
+Step 5500/10986 | BPC: 1.7070 | LR: 5.86e-04 | Speed: 341504 tok/s
+Step 6000/10986 | BPC: 1.6867 | LR: 5.07e-04 | Speed: 342472 tok/s
+Step 6500/10986 | BPC: 1.6784 | LR: 4.27e-04 | Speed: 338254 tok/s
+Step 7000/10986 | BPC: 1.6841 | LR: 3.50e-04 | Speed: 333414 tok/s
+Step 7500/10986 | BPC: 1.6755 | LR: 2.76e-04 | Speed: 339697 tok/s
+Step 8000/10986 | BPC: 1.6640 | LR: 2.09e-04 | Speed: 336118 tok/s
+Step 8500/10986 | BPC: 1.6661 | LR: 1.48e-04 | Speed: 343670 tok/s
+Step 9000/10986 | BPC: 1.6682 | LR: 9.62e-05 | Speed: 337444 tok/s
+Step 9500/10986 | BPC: 1.6820 | LR: 5.46e-05 | Speed: 338790 tok/s
+Step 10000/10986 | BPC: 1.6637 | LR: 2.43e-05 | Speed: 329668 tok/s
+Step 10500/10986 | BPC: 1.6666 | LR: 5.93e-06 | Speed: 339454 tok/s
+
+Validating...
+
+🏆 ULTIMATE LSTM (OneCycle) BPC: 1.6820
+   Target to beat (INN): 1.7050

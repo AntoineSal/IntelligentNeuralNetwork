@@ -1,0 +1,1484 @@
+"""
+INN Multi-Codebook "Hi-Fi": The Hybrid Architecture
+===================================================
+Architecture Finale pour la génération Audio Haute-Fidélité.
+
+Concept "Hybrid INN" :
+1. Parallel Experts : N neurones LSTM indépendants traitent la séquence (Vitesse max).
+2. Interleaved Input : Les 4 codebooks sont décalés temporellement pour respecter la causalité.
+3. Dynamic Mixing : Une Attention finale sélectionne quel neurone écouter pour chaque codebook.
+
+Objectif :
+- Générer de l'audio "propre" (4 codebooks).
+- Battre les baselines en vitesse et en qualité.
+"""
+
+import os
+import shutil
+import time
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import torchaudio
+import soundfile as sf
+import glob
+import pandas as pd
+from torch.utils.data import DataLoader, Dataset
+from transformers import EncodecModel, AutoProcessor
+
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+CONFIG = {
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "sample_rate": 24000,
+    "vocab_size": 1024,
+    "n_codebooks": 4,     # Hi-Fi Audio (Bandwidth 6kbps)
+    "seq_len": 450,       # ~6 sec of audio (450 * 4 codebooks = 1800 tokens logic)
+    "batch_size": 64,     # A100 Optimized
+    "epochs": 10,
+    "lr": 1e-3,           # Validé par le benchmark Codebook 0
+    "log_dir": "./multicodebook_logs"
+}
+
+if not os.path.exists(CONFIG["log_dir"]):
+    os.makedirs(CONFIG["log_dir"])
+
+# ==============================================================================
+# 1. INN HYBRID ARCHITECTURE (Multi-Codebook)
+# ==============================================================================
+class INN_Neuron(nn.Module):
+    def __init__(self, d_model, d_rnn):
+        super().__init__()
+        # Le neurone "voit" une somme d'embeddings (C1+C2+C3+C4)
+        self.lstm = nn.LSTM(d_model, d_rnn, batch_first=True)
+        self.out_proj = nn.Linear(d_rnn, d_model)
+        self.ln_out = nn.LayerNorm(d_model) # Stabilization pour l'Attention Mixer
+
+    def forward(self, x):
+        # x: (batch, seq, d_model)
+        lstm_out, _ = self.lstm(x)
+        proj = self.out_proj(lstm_out)
+        return self.ln_out(proj)
+
+class INN_MultiCodebook(nn.Module):
+    def __init__(self, vocab_size, d_model, n_neurons, d_rnn, n_heads, n_codebooks=4):
+        super().__init__()
+        self.n_codebooks = n_codebooks
+        self.d_model = d_model
+        self.n_neurons = n_neurons
+
+        # Embeddings pour chaque codebook
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(vocab_size + 1, d_model, padding_idx=vocab_size)
+            for _ in range(n_codebooks)
+        ])
+
+        # Normalisation de l'entrée fusionnée (Crucial car Somme de 4 embeddings)
+        self.input_norm = nn.LayerNorm(d_model)
+
+        # Parallel Experts (Le Cerveau)
+        self.neurons = nn.ModuleList([INN_Neuron(d_model, d_rnn) for _ in range(n_neurons)])
+
+        # Global Mixer (Le Juge)
+        self.mixer_attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.norm_mix = nn.LayerNorm(d_model)
+
+        # Têtes de sortie (une par codebook)
+        self.heads = nn.ModuleList([
+            nn.Linear(d_model, vocab_size) for _ in range(n_codebooks)
+        ])
+
+    def forward(self, x):
+        # x: (Batch, N_Codebooks, Seq_Len)
+        B, K, T = x.size()
+
+        # 1. Interleaving Logic (Delay Pattern)
+        # On décale les entrées pour que C_k(t) dépende de C_{k-1}(t) et C_k(t-1)
+        # Stratégie simplifiée "Summed Embeddings" avec Masking Causal implicite via LSTM
+
+        # Somme des embeddings des K codebooks (Input Fusion)
+        x_fused = torch.zeros(B, T, self.d_model, device=x.device)
+        for k in range(self.n_codebooks):
+            x_fused += self.embeddings[k](x[:, k, :])
+
+        # Normalisation Post-Fusion (Stabilization)
+        x_fused = self.input_norm(x_fused)
+
+        # 2. Parallel Processing
+        neuron_outputs = [n(x_fused) for n in self.neurons]
+        stack = torch.stack(neuron_outputs, dim=2) # (B, T, N, D)
+
+        # 3. Dynamic Mixing
+        stack_flat = stack.reshape(-1, self.n_neurons, self.d_model)
+        query_flat = x_fused.reshape(-1, 1, self.d_model)
+
+        attn_out, _ = self.mixer_attn(query_flat, stack_flat, stack_flat)
+        mixed = self.norm_mix(attn_out.squeeze(1) + query_flat.squeeze(1)) # (B*T, D)
+        mixed = mixed.view(B, T, self.d_model)
+
+        # 4. Parallel Prediction (Multi-Head)
+        # Chaque tête prédit le prochain token pour son codebook
+        logits_list = []
+        for k in range(self.n_codebooks):
+            logits_list.append(self.heads[k](mixed))
+
+        return torch.stack(logits_list, dim=1) # (B, K, T, Vocab)
+
+# ==============================================================================
+# 2. BASELINES (Pour Référence)
+# ==============================================================================
+class Transformer_Baseline(nn.Module):
+    def __init__(self, vocab_size, d_model, n_head, n_layers, n_codebooks=4):
+        super().__init__()
+        self.n_codebooks = n_codebooks
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(vocab_size + 1, d_model, padding_idx=vocab_size)
+            for _ in range(n_codebooks)
+        ])
+        encoder_layer = nn.TransformerEncoderLayer(d_model, n_head, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, n_layers)
+        self.heads = nn.ModuleList([nn.Linear(d_model, vocab_size) for _ in range(n_codebooks)])
+
+    def forward(self, x):
+        B, K, T = x.size()
+        x_fused = torch.zeros(B, T, 512, device=x.device) # d_model hardcoded for baseline match
+        for k in range(self.n_codebooks):
+            x_fused += self.embeddings[k](x[:, k, :])
+
+        mask = torch.triu(torch.ones(T, T) * float('-inf'), diagonal=1).to(x.device)
+        feat = self.transformer(x_fused, mask=mask, is_causal=True)
+
+        return torch.stack([h(feat) for h in self.heads], dim=1)
+
+# ==============================================================================
+# DATASET
+# ==============================================================================
+class LibriSpeechMultiCodebook(Dataset):
+    def __init__(self, root, url="train-clean-100"):
+        self.files = sorted(glob.glob(os.path.join(root, "LibriSpeech", url, "**", "*.flac"), recursive=True))
+
+        # Robust Download Logic (Force Cleanup if Empty/Corrupted)
+        if len(self.files) == 0:
+            print(f"Dataset not found or corrupted in {root}. Initiating cleanup and download...")
+
+            # 1. Clean up potential corrupted partial files
+            if os.path.exists(root):
+                try:
+                    shutil.rmtree(root)
+                    print("🧹 Cleaned up existing directory to remove partial files.")
+                except Exception as e:
+                    print(f"⚠️ Warning: Could not clean directory: {e}")
+
+            os.makedirs(root, exist_ok=True)
+
+            # 2. Download Fresh
+            try:
+                print("📥 Downloading LibriSpeech... (This takes a few minutes)")
+                torchaudio.datasets.LIBRISPEECH(root=root, url=url, download=True)
+                self.files = sorted(glob.glob(os.path.join(root, "LibriSpeech", url, "**", "*.flac"), recursive=True))
+            except Exception as e:
+                print(f"❌ Download failed: {e}")
+                raise e
+
+        print(f"📚 Dataset: {len(self.files)} files (Multi-Codebook Mode)")
+        self.resampler = torchaudio.transforms.Resample(orig_freq=16000, new_freq=CONFIG["sample_rate"])
+
+    def __len__(self): return len(self.files)
+
+    def __getitem__(self, idx):
+        try:
+            wav, _ = sf.read(self.files[idx])
+            waveform = torch.from_numpy(wav).float()
+            if waveform.ndim == 1: waveform = waveform.unsqueeze(0)
+            else: waveform = waveform.t()
+            return self.resampler(waveform)
+        except: return torch.zeros(1, CONFIG["sample_rate"])
+
+class AudioTokenizer:
+    def __init__(self, device):
+        self.device = device
+        self.model = EncodecModel.from_pretrained("facebook/encodec_24khz").to(device)
+        self.processor = AutoProcessor.from_pretrained("facebook/encodec_24khz")
+        self.model.eval()
+
+    @torch.no_grad()
+    def encode(self, waveform):
+        raw_audio = [w.squeeze(0).cpu().numpy() for w in waveform]
+        inputs = self.processor(raw_audio=raw_audio, sampling_rate=CONFIG["sample_rate"], return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        # Force bandwidth to match n_codebooks
+        # 4 codebooks => 3.0 kbps
+        # 8 codebooks => 6.0 kbps
+        target_bandwidth = CONFIG["n_codebooks"] * 0.75
+
+        outputs = self.model.encode(**inputs, bandwidth=target_bandwidth)
+        # (1, 1, n_codebooks, seq_len) -> (n_codebooks, seq_len)
+        codes = outputs.audio_codes[0].squeeze(0).squeeze(0)
+        return codes
+
+# ==============================================================================
+# TRAINING LOOP
+# ==============================================================================
+def train():
+    print("🚀 LAUNCHING HYBRID INN MULTI-CODEBOOK RUN")
+    torch.set_float32_matmul_precision('high')
+
+    tokenizer = AudioTokenizer(CONFIG["device"])
+    ds = LibriSpeechMultiCodebook(root="./librispeech_data")
+
+    def collate_fn(batch):
+        max_len = min(max([w.size(-1) for w in batch]), 24000*10)
+        padded = torch.zeros(len(batch), 1, max_len)
+        for i, w in enumerate(batch):
+            sl = min(w.size(-1), max_len)
+            padded[i, :, :sl] = w[:, :sl]
+        return padded
+
+    dl = DataLoader(ds, batch_size=CONFIG["batch_size"], shuffle=True, collate_fn=collate_fn, num_workers=4)
+
+    # INN Model (Scaled Up for Hi-Fi)
+    model = INN_MultiCodebook(
+        vocab_size=CONFIG["vocab_size"],
+        d_model=512,      # Plus large pour gérer la complexité
+        n_neurons=24,     # Plus d'experts
+        d_rnn=256,
+        n_heads=8,
+        n_codebooks=4
+    ).to(CONFIG["device"])
+
+    print(f"📊 Parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+
+    optimizer = optim.AdamW(model.parameters(), lr=CONFIG["lr"])
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG["epochs"] * len(dl))
+    criterion = nn.CrossEntropyLoss()
+
+    model.train()
+    step = 0
+    start_time = time.time()
+
+    for epoch in range(CONFIG["epochs"]):
+        print(f"🏁 Epoch {epoch+1}/{CONFIG['epochs']}")
+        for batch_waves in dl:
+            batch_waves = batch_waves.to(CONFIG["device"])
+
+            with torch.no_grad():
+                # (Batch, 4, Seq)
+                codes = torch.stack([tokenizer.encode(w.unsqueeze(0)) for w in batch_waves])
+                codes = codes.to(CONFIG["device"])
+
+            if codes.size(-1) > CONFIG["seq_len"]:
+                codes = codes[:, :, :CONFIG["seq_len"]]
+
+            inputs = codes[:, :, :-1]
+            targets = codes[:, :, 1:]
+
+            if inputs.size(-1) < 10: continue
+
+            optimizer.zero_grad()
+            logits = model(inputs) # (B, 4, T, Vocab)
+
+            # Loss sum over all codebooks
+            loss = 0
+            for k in range(CONFIG["n_codebooks"]):
+                loss += criterion(logits[:, k, :, :].reshape(-1, CONFIG["vocab_size"]), targets[:, k, :].reshape(-1))
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+
+            step += 1
+            if step % 10 == 0:
+                elapsed = time.time() - start_time
+                avg_loss = loss.item() / 4 # Average per codebook
+                ppl = math.exp(avg_loss)
+                print(f"Step {step} | Total Loss: {loss.item():.4f} | Avg Ppl: {ppl:.2f} | Time: {elapsed:.0f}s")
+
+            if step % 1000 == 0:
+                torch.save(model.state_dict(), f"{CONFIG['log_dir']}/inn_multicodebook_{step}.pt")
+                print("💾 Checkpoint saved.")
+
+if __name__ == "__main__":
+    train()
+
+🚀 LAUNCHING HYBRID INN MULTI-CODEBOOK RUN
+📚 Dataset: 28539 files (Multi-Codebook Mode)
+📊 Parameters: 27,359,232
+🏁 Epoch 1/10
+Step 10 | Total Loss: 22.2209 | Avg Ppl: 258.59 | Time: 27s
+Step 20 | Total Loss: 20.4391 | Avg Ppl: 165.63 | Time: 53s
+Step 30 | Total Loss: 19.8134 | Avg Ppl: 141.65 | Time: 78s
+Step 40 | Total Loss: 19.3969 | Avg Ppl: 127.64 | Time: 104s
+Step 50 | Total Loss: 19.4940 | Avg Ppl: 130.78 | Time: 130s
+Step 60 | Total Loss: 18.9713 | Avg Ppl: 114.76 | Time: 156s
+Step 70 | Total Loss: 19.2016 | Avg Ppl: 121.56 | Time: 181s
+Step 80 | Total Loss: 19.0155 | Avg Ppl: 116.03 | Time: 207s
+Step 90 | Total Loss: 18.3591 | Avg Ppl: 98.47 | Time: 233s
+Step 100 | Total Loss: 17.4684 | Avg Ppl: 78.82 | Time: 258s
+Step 110 | Total Loss: 18.1378 | Avg Ppl: 93.17 | Time: 284s
+Step 120 | Total Loss: 17.8433 | Avg Ppl: 86.56 | Time: 310s
+Step 130 | Total Loss: 18.0562 | Avg Ppl: 91.29 | Time: 336s
+Step 140 | Total Loss: 18.2331 | Avg Ppl: 95.42 | Time: 361s
+Step 150 | Total Loss: 17.7008 | Avg Ppl: 83.53 | Time: 387s
+Step 160 | Total Loss: 17.3340 | Avg Ppl: 76.21 | Time: 413s
+Step 170 | Total Loss: 17.3864 | Avg Ppl: 77.22 | Time: 439s
+Step 180 | Total Loss: 17.7460 | Avg Ppl: 84.48 | Time: 465s
+Step 190 | Total Loss: 17.8247 | Avg Ppl: 86.16 | Time: 490s
+Step 200 | Total Loss: 17.1927 | Avg Ppl: 73.57 | Time: 516s
+Step 210 | Total Loss: 17.1162 | Avg Ppl: 72.17 | Time: 542s
+Step 220 | Total Loss: 17.5465 | Avg Ppl: 80.37 | Time: 567s
+Step 230 | Total Loss: 17.4642 | Avg Ppl: 78.73 | Time: 593s
+Step 240 | Total Loss: 17.1306 | Avg Ppl: 72.43 | Time: 619s
+Step 250 | Total Loss: 16.6793 | Avg Ppl: 64.70 | Time: 644s
+Step 260 | Total Loss: 17.1167 | Avg Ppl: 72.18 | Time: 670s
+Step 270 | Total Loss: 17.1788 | Avg Ppl: 73.31 | Time: 696s
+Step 280 | Total Loss: 17.1385 | Avg Ppl: 72.57 | Time: 721s
+Step 290 | Total Loss: 17.6884 | Avg Ppl: 83.27 | Time: 747s
+Step 300 | Total Loss: 16.9846 | Avg Ppl: 69.84 | Time: 773s
+Step 310 | Total Loss: 16.9891 | Avg Ppl: 69.91 | Time: 798s
+Step 320 | Total Loss: 17.0984 | Avg Ppl: 71.85 | Time: 824s
+Step 330 | Total Loss: 17.1253 | Avg Ppl: 72.34 | Time: 850s
+Step 340 | Total Loss: 16.6448 | Avg Ppl: 64.15 | Time: 875s
+Step 350 | Total Loss: 17.0426 | Avg Ppl: 70.86 | Time: 901s
+Step 360 | Total Loss: 16.9608 | Avg Ppl: 69.42 | Time: 927s
+Step 370 | Total Loss: 16.9268 | Avg Ppl: 68.83 | Time: 952s
+Step 380 | Total Loss: 16.7382 | Avg Ppl: 65.66 | Time: 978s
+Step 390 | Total Loss: 16.9454 | Avg Ppl: 69.16 | Time: 1004s
+Step 400 | Total Loss: 16.8337 | Avg Ppl: 67.25 | Time: 1029s
+Step 410 | Total Loss: 16.4990 | Avg Ppl: 61.85 | Time: 1055s
+Step 420 | Total Loss: 17.0079 | Avg Ppl: 70.24 | Time: 1081s
+Step 430 | Total Loss: 16.1819 | Avg Ppl: 57.14 | Time: 1106s
+Step 440 | Total Loss: 16.3073 | Avg Ppl: 58.96 | Time: 1132s
+🏁 Epoch 2/10
+Step 450 | Total Loss: 16.7309 | Avg Ppl: 65.54 | Time: 1158s
+Step 460 | Total Loss: 16.6787 | Avg Ppl: 64.69 | Time: 1184s
+Step 470 | Total Loss: 16.6268 | Avg Ppl: 63.86 | Time: 1210s
+Step 480 | Total Loss: 16.5453 | Avg Ppl: 62.57 | Time: 1236s
+Step 490 | Total Loss: 16.3645 | Avg Ppl: 59.81 | Time: 1261s
+Step 500 | Total Loss: 16.8429 | Avg Ppl: 67.41 | Time: 1287s
+Step 510 | Total Loss: 16.3132 | Avg Ppl: 59.05 | Time: 1313s
+Step 520 | Total Loss: 16.4518 | Avg Ppl: 61.13 | Time: 1339s
+Step 530 | Total Loss: 16.7176 | Avg Ppl: 65.33 | Time: 1364s
+Step 540 | Total Loss: 15.9042 | Avg Ppl: 53.31 | Time: 1390s
+Step 550 | Total Loss: 16.3648 | Avg Ppl: 59.81 | Time: 1416s
+Step 560 | Total Loss: 16.2079 | Avg Ppl: 57.51 | Time: 1442s
+Step 570 | Total Loss: 16.2730 | Avg Ppl: 58.45 | Time: 1468s
+Step 580 | Total Loss: 16.6625 | Avg Ppl: 64.43 | Time: 1494s
+Step 590 | Total Loss: 16.7201 | Avg Ppl: 65.37 | Time: 1519s
+Step 600 | Total Loss: 16.3391 | Avg Ppl: 59.43 | Time: 1545s
+Step 610 | Total Loss: 16.3689 | Avg Ppl: 59.87 | Time: 1571s
+Step 620 | Total Loss: 16.5594 | Avg Ppl: 62.79 | Time: 1597s
+Step 630 | Total Loss: 16.9185 | Avg Ppl: 68.69 | Time: 1622s
+Step 640 | Total Loss: 16.6418 | Avg Ppl: 64.10 | Time: 1648s
+Step 650 | Total Loss: 16.4453 | Avg Ppl: 61.03 | Time: 1674s
+Step 660 | Total Loss: 16.3824 | Avg Ppl: 60.07 | Time: 1700s
+Step 670 | Total Loss: 15.5239 | Avg Ppl: 48.47 | Time: 1725s
+Step 680 | Total Loss: 15.9613 | Avg Ppl: 54.07 | Time: 1751s
+Step 690 | Total Loss: 16.0530 | Avg Ppl: 55.33 | Time: 1777s
+Step 700 | Total Loss: 16.0375 | Avg Ppl: 55.11 | Time: 1803s
+Step 710 | Total Loss: 16.3571 | Avg Ppl: 59.70 | Time: 1829s
+Step 720 | Total Loss: 16.7783 | Avg Ppl: 66.33 | Time: 1854s
+Step 730 | Total Loss: 16.1685 | Avg Ppl: 56.95 | Time: 1880s
+Step 740 | Total Loss: 16.4499 | Avg Ppl: 61.10 | Time: 1906s
+Step 750 | Total Loss: 15.8462 | Avg Ppl: 52.54 | Time: 1932s
+Step 760 | Total Loss: 15.9704 | Avg Ppl: 54.20 | Time: 1957s
+Step 770 | Total Loss: 16.2399 | Avg Ppl: 57.97 | Time: 1983s
+Step 780 | Total Loss: 16.3649 | Avg Ppl: 59.81 | Time: 2009s
+Step 790 | Total Loss: 16.5159 | Avg Ppl: 62.11 | Time: 2035s
+Step 800 | Total Loss: 16.2982 | Avg Ppl: 58.82 | Time: 2060s
+Step 810 | Total Loss: 16.0338 | Avg Ppl: 55.06 | Time: 2086s
+Step 820 | Total Loss: 16.5390 | Avg Ppl: 62.47 | Time: 2112s
+Step 830 | Total Loss: 16.5312 | Avg Ppl: 62.35 | Time: 2138s
+Step 840 | Total Loss: 16.2206 | Avg Ppl: 57.69 | Time: 2163s
+Step 850 | Total Loss: 15.6831 | Avg Ppl: 50.44 | Time: 2189s
+Step 860 | Total Loss: 15.8774 | Avg Ppl: 52.95 | Time: 2215s
+Step 870 | Total Loss: 16.4637 | Avg Ppl: 61.31 | Time: 2240s
+Step 880 | Total Loss: 16.3772 | Avg Ppl: 60.00 | Time: 2266s
+Step 890 | Total Loss: 15.7846 | Avg Ppl: 51.74 | Time: 2292s
+🏁 Epoch 3/10
+Step 900 | Total Loss: 15.9405 | Avg Ppl: 53.79 | Time: 2318s
+Step 910 | Total Loss: 15.6703 | Avg Ppl: 50.28 | Time: 2344s
+Step 920 | Total Loss: 15.9271 | Avg Ppl: 53.61 | Time: 2370s
+Step 930 | Total Loss: 15.6998 | Avg Ppl: 50.65 | Time: 2395s
+Step 940 | Total Loss: 15.3860 | Avg Ppl: 46.83 | Time: 2421s
+Step 950 | Total Loss: 15.7815 | Avg Ppl: 51.70 | Time: 2447s
+Step 960 | Total Loss: 15.1798 | Avg Ppl: 44.48 | Time: 2473s
+Step 970 | Total Loss: 15.7496 | Avg Ppl: 51.29 | Time: 2498s
+Step 980 | Total Loss: 15.9683 | Avg Ppl: 54.17 | Time: 2524s
+Step 990 | Total Loss: 15.7441 | Avg Ppl: 51.21 | Time: 2550s
+Step 1000 | Total Loss: 16.3510 | Avg Ppl: 59.61 | Time: 2576s
+💾 Checkpoint saved.
+Step 1010 | Total Loss: 15.8315 | Avg Ppl: 52.35 | Time: 2602s
+Step 1020 | Total Loss: 16.1782 | Avg Ppl: 57.09 | Time: 2627s
+Step 1030 | Total Loss: 16.0735 | Avg Ppl: 55.61 | Time: 2653s
+Step 1040 | Total Loss: 16.0122 | Avg Ppl: 54.77 | Time: 2679s
+Step 1050 | Total Loss: 15.2652 | Avg Ppl: 45.44 | Time: 2705s
+Step 1060 | Total Loss: 15.6011 | Avg Ppl: 49.42 | Time: 2731s
+Step 1070 | Total Loss: 16.0637 | Avg Ppl: 55.47 | Time: 2757s
+Step 1080 | Total Loss: 15.9203 | Avg Ppl: 53.52 | Time: 2782s
+Step 1090 | Total Loss: 15.6469 | Avg Ppl: 49.99 | Time: 2808s
+Step 1100 | Total Loss: 16.3509 | Avg Ppl: 59.60 | Time: 2834s
+Step 1110 | Total Loss: 16.4507 | Avg Ppl: 61.11 | Time: 2860s
+Step 1120 | Total Loss: 15.4686 | Avg Ppl: 47.81 | Time: 2885s
+Step 1130 | Total Loss: 15.8507 | Avg Ppl: 52.60 | Time: 2911s
+Step 1140 | Total Loss: 15.3765 | Avg Ppl: 46.72 | Time: 2937s
+Step 1150 | Total Loss: 15.8347 | Avg Ppl: 52.39 | Time: 2963s
+Step 1160 | Total Loss: 15.4533 | Avg Ppl: 47.62 | Time: 2988s
+Step 1170 | Total Loss: 15.8412 | Avg Ppl: 52.47 | Time: 3014s
+Step 1180 | Total Loss: 15.5646 | Avg Ppl: 48.97 | Time: 3040s
+Step 1190 | Total Loss: 15.7186 | Avg Ppl: 50.89 | Time: 3065s
+Step 1200 | Total Loss: 15.8777 | Avg Ppl: 52.95 | Time: 3091s
+Step 1210 | Total Loss: 15.0966 | Avg Ppl: 43.56 | Time: 3117s
+Step 1220 | Total Loss: 16.1251 | Avg Ppl: 56.33 | Time: 3143s
+Step 1230 | Total Loss: 15.6001 | Avg Ppl: 49.40 | Time: 3169s
+Step 1240 | Total Loss: 15.6411 | Avg Ppl: 49.91 | Time: 3194s
+Step 1250 | Total Loss: 15.6636 | Avg Ppl: 50.19 | Time: 3220s
+Step 1260 | Total Loss: 16.1551 | Avg Ppl: 56.76 | Time: 3246s
+Step 1270 | Total Loss: 15.6649 | Avg Ppl: 50.21 | Time: 3272s
+Step 1280 | Total Loss: 16.1440 | Avg Ppl: 56.60 | Time: 3297s
+Step 1290 | Total Loss: 15.7268 | Avg Ppl: 50.99 | Time: 3323s
+Step 1300 | Total Loss: 14.8789 | Avg Ppl: 41.25 | Time: 3349s
+Step 1310 | Total Loss: 15.7134 | Avg Ppl: 50.82 | Time: 3374s
+Step 1320 | Total Loss: 15.3103 | Avg Ppl: 45.95 | Time: 3400s
+Step 1330 | Total Loss: 15.9229 | Avg Ppl: 53.56 | Time: 3426s
+🏁 Epoch 4/10
+Step 1340 | Total Loss: 15.3051 | Avg Ppl: 45.89 | Time: 3452s
+Step 1350 | Total Loss: 15.4001 | Avg Ppl: 46.99 | Time: 3478s
+Step 1360 | Total Loss: 15.7013 | Avg Ppl: 50.67 | Time: 3504s
+Step 1370 | Total Loss: 15.5150 | Avg Ppl: 48.36 | Time: 3529s
+Step 1380 | Total Loss: 15.6927 | Avg Ppl: 50.56 | Time: 3555s
+Step 1390 | Total Loss: 15.6932 | Avg Ppl: 50.57 | Time: 3581s
+Step 1400 | Total Loss: 15.0178 | Avg Ppl: 42.71 | Time: 3606s
+Step 1410 | Total Loss: 15.4669 | Avg Ppl: 47.79 | Time: 3632s
+Step 1420 | Total Loss: 15.2227 | Avg Ppl: 44.96 | Time: 3658s
+Step 1430 | Total Loss: 15.0920 | Avg Ppl: 43.51 | Time: 3684s
+Step 1440 | Total Loss: 15.7691 | Avg Ppl: 51.54 | Time: 3709s
+Step 1450 | Total Loss: 16.1030 | Avg Ppl: 56.02 | Time: 3735s
+Step 1460 | Total Loss: 15.0125 | Avg Ppl: 42.65 | Time: 3761s
+Step 1470 | Total Loss: 15.5938 | Avg Ppl: 49.33 | Time: 3787s
+Step 1480 | Total Loss: 15.3589 | Avg Ppl: 46.51 | Time: 3812s
+Step 1490 | Total Loss: 15.2090 | Avg Ppl: 44.80 | Time: 3838s
+Step 1500 | Total Loss: 15.5869 | Avg Ppl: 49.24 | Time: 3864s
+Step 1510 | Total Loss: 15.2076 | Avg Ppl: 44.79 | Time: 3890s
+Step 1520 | Total Loss: 15.3224 | Avg Ppl: 46.09 | Time: 3916s
+Step 1530 | Total Loss: 15.7836 | Avg Ppl: 51.72 | Time: 3941s
+Step 1540 | Total Loss: 15.8872 | Avg Ppl: 53.08 | Time: 3967s
+Step 1550 | Total Loss: 15.7954 | Avg Ppl: 51.88 | Time: 3993s
+Step 1560 | Total Loss: 15.5262 | Avg Ppl: 48.50 | Time: 4019s
+Step 1570 | Total Loss: 15.3609 | Avg Ppl: 46.54 | Time: 4044s
+Step 1580 | Total Loss: 15.4632 | Avg Ppl: 47.74 | Time: 4070s
+Step 1590 | Total Loss: 14.8274 | Avg Ppl: 40.73 | Time: 4096s
+Step 1600 | Total Loss: 16.0416 | Avg Ppl: 55.17 | Time: 4122s
+Step 1610 | Total Loss: 15.3924 | Avg Ppl: 46.90 | Time: 4148s
+Step 1620 | Total Loss: 15.7465 | Avg Ppl: 51.24 | Time: 4174s
+Step 1630 | Total Loss: 15.6595 | Avg Ppl: 50.14 | Time: 4200s
+Step 1640 | Total Loss: 15.5469 | Avg Ppl: 48.75 | Time: 4226s
+Step 1650 | Total Loss: 15.1611 | Avg Ppl: 44.27 | Time: 4251s
+Step 1660 | Total Loss: 15.7432 | Avg Ppl: 51.20 | Time: 4277s
+Step 1670 | Total Loss: 15.3719 | Avg Ppl: 46.66 | Time: 4303s
+Step 1680 | Total Loss: 15.1771 | Avg Ppl: 44.45 | Time: 4329s
+Step 1690 | Total Loss: 15.5679 | Avg Ppl: 49.01 | Time: 4355s
+Step 1700 | Total Loss: 15.4997 | Avg Ppl: 48.18 | Time: 4380s
+Step 1710 | Total Loss: 15.3119 | Avg Ppl: 45.97 | Time: 4406s
+Step 1720 | Total Loss: 15.5739 | Avg Ppl: 49.08 | Time: 4432s
+Step 1730 | Total Loss: 15.6123 | Avg Ppl: 49.55 | Time: 4458s
+Step 1740 | Total Loss: 15.3152 | Avg Ppl: 46.01 | Time: 4484s
+Step 1750 | Total Loss: 15.0547 | Avg Ppl: 43.11 | Time: 4509s
+Step 1760 | Total Loss: 15.7836 | Avg Ppl: 51.72 | Time: 4535s
+Step 1770 | Total Loss: 15.1837 | Avg Ppl: 44.52 | Time: 4561s
+Step 1780 | Total Loss: 15.2416 | Avg Ppl: 45.17 | Time: 4586s
+🏁 Epoch 5/10
+Step 1790 | Total Loss: 15.4317 | Avg Ppl: 47.37 | Time: 4613s
+Step 1800 | Total Loss: 15.1589 | Avg Ppl: 44.24 | Time: 4638s
+Step 1810 | Total Loss: 15.1970 | Avg Ppl: 44.67 | Time: 4664s
+Step 1820 | Total Loss: 14.9888 | Avg Ppl: 42.40 | Time: 4690s
+Step 1830 | Total Loss: 15.4246 | Avg Ppl: 47.28 | Time: 4716s
+Step 1840 | Total Loss: 15.0974 | Avg Ppl: 43.57 | Time: 4741s
+Step 1850 | Total Loss: 15.0618 | Avg Ppl: 43.18 | Time: 4767s
+Step 1860 | Total Loss: 15.1607 | Avg Ppl: 44.26 | Time: 4793s
+Step 1870 | Total Loss: 15.5593 | Avg Ppl: 48.90 | Time: 4818s
+Step 1880 | Total Loss: 15.0454 | Avg Ppl: 43.01 | Time: 4844s
+Step 1890 | Total Loss: 15.4647 | Avg Ppl: 47.76 | Time: 4870s
+Step 1900 | Total Loss: 15.2029 | Avg Ppl: 44.73 | Time: 4896s
+Step 1910 | Total Loss: 15.3937 | Avg Ppl: 46.92 | Time: 4921s
+Step 1920 | Total Loss: 15.3852 | Avg Ppl: 46.82 | Time: 4947s
+Step 1930 | Total Loss: 14.9191 | Avg Ppl: 41.67 | Time: 4973s
+Step 1940 | Total Loss: 15.2744 | Avg Ppl: 45.54 | Time: 4998s
+Step 1950 | Total Loss: 15.0513 | Avg Ppl: 43.07 | Time: 5024s
+Step 1960 | Total Loss: 15.6714 | Avg Ppl: 50.29 | Time: 5050s
+Step 1970 | Total Loss: 14.9158 | Avg Ppl: 41.64 | Time: 5075s
+Step 1980 | Total Loss: 15.1938 | Avg Ppl: 44.63 | Time: 5101s
+Step 1990 | Total Loss: 15.5627 | Avg Ppl: 48.94 | Time: 5127s
+Step 2000 | Total Loss: 15.1940 | Avg Ppl: 44.63 | Time: 5153s
+💾 Checkpoint saved.
+Step 2010 | Total Loss: 14.7664 | Avg Ppl: 40.11 | Time: 5178s
+Step 2020 | Total Loss: 14.8572 | Avg Ppl: 41.03 | Time: 5204s
+Step 2030 | Total Loss: 15.0956 | Avg Ppl: 43.55 | Time: 5230s
+Step 2040 | Total Loss: 15.2827 | Avg Ppl: 45.64 | Time: 5256s
+Step 2050 | Total Loss: 15.1575 | Avg Ppl: 44.23 | Time: 5281s
+Step 2060 | Total Loss: 15.4588 | Avg Ppl: 47.69 | Time: 5307s
+Step 2070 | Total Loss: 14.7658 | Avg Ppl: 40.10 | Time: 5333s
+Step 2080 | Total Loss: 15.2816 | Avg Ppl: 45.62 | Time: 5358s
+Step 2090 | Total Loss: 14.8846 | Avg Ppl: 41.31 | Time: 5384s
+Step 2100 | Total Loss: 15.2899 | Avg Ppl: 45.72 | Time: 5410s
+Step 2110 | Total Loss: 14.7179 | Avg Ppl: 39.63 | Time: 5436s
+Step 2120 | Total Loss: 15.2834 | Avg Ppl: 45.64 | Time: 5461s
+Step 2130 | Total Loss: 14.9725 | Avg Ppl: 42.23 | Time: 5487s
+Step 2140 | Total Loss: 15.0106 | Avg Ppl: 42.63 | Time: 5513s
+Step 2150 | Total Loss: 15.2006 | Avg Ppl: 44.71 | Time: 5538s
+Step 2160 | Total Loss: 15.2799 | Avg Ppl: 45.60 | Time: 5564s
+Step 2170 | Total Loss: 15.3085 | Avg Ppl: 45.93 | Time: 5590s
+Step 2180 | Total Loss: 15.3295 | Avg Ppl: 46.17 | Time: 5616s
+Step 2190 | Total Loss: 15.3866 | Avg Ppl: 46.84 | Time: 5641s
+Step 2200 | Total Loss: 15.5739 | Avg Ppl: 49.08 | Time: 5667s
+Step 2210 | Total Loss: 15.3055 | Avg Ppl: 45.90 | Time: 5693s
+Step 2220 | Total Loss: 15.1284 | Avg Ppl: 43.91 | Time: 5718s
+Step 2230 | Total Loss: 15.7731 | Avg Ppl: 51.59 | Time: 5744s
+🏁 Epoch 6/10
+Step 2240 | Total Loss: 14.9906 | Avg Ppl: 42.42 | Time: 5770s
+Step 2250 | Total Loss: 15.1169 | Avg Ppl: 43.78 | Time: 5796s
+Step 2260 | Total Loss: 15.0280 | Avg Ppl: 42.82 | Time: 5822s
+Step 2270 | Total Loss: 15.0601 | Avg Ppl: 43.16 | Time: 5848s
+Step 2280 | Total Loss: 14.9910 | Avg Ppl: 42.43 | Time: 5873s
+Step 2290 | Total Loss: 14.9074 | Avg Ppl: 41.55 | Time: 5899s
+Step 2300 | Total Loss: 14.4617 | Avg Ppl: 37.17 | Time: 5925s
+Step 2310 | Total Loss: 14.8754 | Avg Ppl: 41.22 | Time: 5951s
+Step 2320 | Total Loss: 14.3275 | Avg Ppl: 35.94 | Time: 5976s
+Step 2330 | Total Loss: 15.3304 | Avg Ppl: 46.18 | Time: 6002s
+Step 2340 | Total Loss: 14.8617 | Avg Ppl: 41.08 | Time: 6028s
+Step 2350 | Total Loss: 14.9726 | Avg Ppl: 42.23 | Time: 6054s
+Step 2360 | Total Loss: 15.0739 | Avg Ppl: 43.31 | Time: 6079s
+Step 2370 | Total Loss: 14.3869 | Avg Ppl: 36.48 | Time: 6105s
+Step 2380 | Total Loss: 15.5019 | Avg Ppl: 48.21 | Time: 6131s
+Step 2390 | Total Loss: 14.5807 | Avg Ppl: 38.29 | Time: 6157s
+Step 2400 | Total Loss: 15.2916 | Avg Ppl: 45.74 | Time: 6182s
+Step 2410 | Total Loss: 14.9443 | Avg Ppl: 41.93 | Time: 6208s
+Step 2420 | Total Loss: 14.9448 | Avg Ppl: 41.94 | Time: 6234s
+Step 2430 | Total Loss: 14.9927 | Avg Ppl: 42.44 | Time: 6260s
+Step 2440 | Total Loss: 15.0575 | Avg Ppl: 43.14 | Time: 6286s
+Step 2450 | Total Loss: 14.1934 | Avg Ppl: 34.76 | Time: 6311s
+Step 2460 | Total Loss: 15.0039 | Avg Ppl: 42.56 | Time: 6337s
+Step 2470 | Total Loss: 14.6757 | Avg Ppl: 39.21 | Time: 6363s
+Step 2480 | Total Loss: 15.0869 | Avg Ppl: 43.46 | Time: 6388s
+Step 2490 | Total Loss: 15.1390 | Avg Ppl: 44.03 | Time: 6414s
+Step 2500 | Total Loss: 14.3439 | Avg Ppl: 36.09 | Time: 6440s
+Step 2510 | Total Loss: 14.1850 | Avg Ppl: 34.68 | Time: 6466s
+Step 2520 | Total Loss: 14.6789 | Avg Ppl: 39.24 | Time: 6492s
+Step 2530 | Total Loss: 15.1860 | Avg Ppl: 44.54 | Time: 6518s
+Step 2540 | Total Loss: 14.5783 | Avg Ppl: 38.27 | Time: 6543s
+Step 2550 | Total Loss: 14.7830 | Avg Ppl: 40.28 | Time: 6569s
+Step 2560 | Total Loss: 14.7858 | Avg Ppl: 40.30 | Time: 6595s
+Step 2570 | Total Loss: 15.0427 | Avg Ppl: 42.98 | Time: 6621s
+Step 2580 | Total Loss: 14.5338 | Avg Ppl: 37.84 | Time: 6647s
+Step 2590 | Total Loss: 15.1666 | Avg Ppl: 44.33 | Time: 6672s
+Step 2600 | Total Loss: 15.0049 | Avg Ppl: 42.57 | Time: 6698s
+Step 2610 | Total Loss: 14.9208 | Avg Ppl: 41.69 | Time: 6724s
+Step 2620 | Total Loss: 14.9699 | Avg Ppl: 42.20 | Time: 6750s
+Step 2630 | Total Loss: 14.8359 | Avg Ppl: 40.81 | Time: 6776s
+Step 2640 | Total Loss: 15.2151 | Avg Ppl: 44.87 | Time: 6801s
+Step 2650 | Total Loss: 14.9459 | Avg Ppl: 41.95 | Time: 6827s
+Step 2660 | Total Loss: 15.0256 | Avg Ppl: 42.79 | Time: 6853s
+Step 2670 | Total Loss: 14.9174 | Avg Ppl: 41.65 | Time: 6879s
+🏁 Epoch 7/10
+Step 2680 | Total Loss: 14.5780 | Avg Ppl: 38.26 | Time: 6905s
+Step 2690 | Total Loss: 14.3837 | Avg Ppl: 36.45 | Time: 6931s
+Step 2700 | Total Loss: 14.4827 | Avg Ppl: 37.36 | Time: 6956s
+Step 2710 | Total Loss: 14.4733 | Avg Ppl: 37.27 | Time: 6982s
+Step 2720 | Total Loss: 14.8431 | Avg Ppl: 40.89 | Time: 7008s
+Step 2730 | Total Loss: 15.1602 | Avg Ppl: 44.26 | Time: 7034s
+Step 2740 | Total Loss: 14.5952 | Avg Ppl: 38.43 | Time: 7059s
+Step 2750 | Total Loss: 14.8036 | Avg Ppl: 40.48 | Time: 7085s
+Step 2760 | Total Loss: 14.8460 | Avg Ppl: 40.92 | Time: 7111s
+Step 2770 | Total Loss: 14.6962 | Avg Ppl: 39.41 | Time: 7136s
+Step 2780 | Total Loss: 14.9811 | Avg Ppl: 42.32 | Time: 7162s
+Step 2790 | Total Loss: 15.1385 | Avg Ppl: 44.02 | Time: 7188s
+Step 2800 | Total Loss: 14.9365 | Avg Ppl: 41.85 | Time: 7214s
+Step 2810 | Total Loss: 14.8392 | Avg Ppl: 40.85 | Time: 7239s
+Step 2820 | Total Loss: 14.8873 | Avg Ppl: 41.34 | Time: 7265s
+Step 2830 | Total Loss: 14.6488 | Avg Ppl: 38.95 | Time: 7291s
+Step 2840 | Total Loss: 15.2044 | Avg Ppl: 44.75 | Time: 7317s
+Step 2850 | Total Loss: 14.7463 | Avg Ppl: 39.91 | Time: 7342s
+Step 2860 | Total Loss: 14.5800 | Avg Ppl: 38.28 | Time: 7368s
+Step 2870 | Total Loss: 15.0142 | Avg Ppl: 42.67 | Time: 7394s
+Step 2880 | Total Loss: 14.8257 | Avg Ppl: 40.71 | Time: 7420s
+Step 2890 | Total Loss: 14.7748 | Avg Ppl: 40.19 | Time: 7445s
+Step 2900 | Total Loss: 15.0631 | Avg Ppl: 43.20 | Time: 7471s
+Step 2910 | Total Loss: 14.8809 | Avg Ppl: 41.27 | Time: 7497s
+Step 2920 | Total Loss: 14.6585 | Avg Ppl: 39.04 | Time: 7523s
+Step 2930 | Total Loss: 14.3923 | Avg Ppl: 36.53 | Time: 7548s
+Step 2940 | Total Loss: 15.0072 | Avg Ppl: 42.60 | Time: 7574s
+Step 2950 | Total Loss: 15.2440 | Avg Ppl: 45.20 | Time: 7600s
+Step 2960 | Total Loss: 14.7134 | Avg Ppl: 39.58 | Time: 7626s
+Step 2970 | Total Loss: 15.1066 | Avg Ppl: 43.67 | Time: 7651s
+Step 2980 | Total Loss: 14.8018 | Avg Ppl: 40.47 | Time: 7677s
+Step 2990 | Total Loss: 15.2326 | Avg Ppl: 45.07 | Time: 7703s
+Step 3000 | Total Loss: 14.7620 | Avg Ppl: 40.07 | Time: 7729s
+💾 Checkpoint saved.
+Step 3010 | Total Loss: 13.8469 | Avg Ppl: 31.87 | Time: 7755s
+Step 3020 | Total Loss: 14.9442 | Avg Ppl: 41.93 | Time: 7781s
+Step 3030 | Total Loss: 14.6234 | Avg Ppl: 38.70 | Time: 7806s
+Step 3040 | Total Loss: 14.9329 | Avg Ppl: 41.81 | Time: 7832s
+Step 3050 | Total Loss: 15.1527 | Avg Ppl: 44.18 | Time: 7858s
+Step 3060 | Total Loss: 15.0186 | Avg Ppl: 42.72 | Time: 7883s
+Step 3070 | Total Loss: 14.6986 | Avg Ppl: 39.44 | Time: 7909s
+Step 3080 | Total Loss: 14.6218 | Avg Ppl: 38.69 | Time: 7935s
+Step 3090 | Total Loss: 14.7125 | Avg Ppl: 39.57 | Time: 7960s
+Step 3100 | Total Loss: 14.5628 | Avg Ppl: 38.12 | Time: 7986s
+Step 3110 | Total Loss: 15.2024 | Avg Ppl: 44.73 | Time: 8012s
+Step 3120 | Total Loss: 14.7557 | Avg Ppl: 40.00 | Time: 8038s
+🏁 Epoch 8/10
+Step 3130 | Total Loss: 14.4388 | Avg Ppl: 36.96 | Time: 8064s
+Step 3140 | Total Loss: 14.6434 | Avg Ppl: 38.89 | Time: 8090s
+Step 3150 | Total Loss: 14.4586 | Avg Ppl: 37.14 | Time: 8115s
+Step 3160 | Total Loss: 14.4481 | Avg Ppl: 37.04 | Time: 8141s
+Step 3170 | Total Loss: 14.3435 | Avg Ppl: 36.09 | Time: 8167s
+Step 3180 | Total Loss: 14.5232 | Avg Ppl: 37.74 | Time: 8192s
+Step 3190 | Total Loss: 14.8987 | Avg Ppl: 41.46 | Time: 8218s
+Step 3200 | Total Loss: 14.3749 | Avg Ppl: 36.37 | Time: 8244s
+Step 3210 | Total Loss: 14.6337 | Avg Ppl: 38.80 | Time: 8270s
+Step 3220 | Total Loss: 14.6178 | Avg Ppl: 38.65 | Time: 8295s
+Step 3230 | Total Loss: 14.8301 | Avg Ppl: 40.75 | Time: 8321s
+Step 3240 | Total Loss: 14.9569 | Avg Ppl: 42.07 | Time: 8347s
+Step 3250 | Total Loss: 14.2938 | Avg Ppl: 35.64 | Time: 8373s
+Step 3260 | Total Loss: 14.8450 | Avg Ppl: 40.90 | Time: 8398s
+Step 3270 | Total Loss: 14.6062 | Avg Ppl: 38.53 | Time: 8424s
+Step 3280 | Total Loss: 14.4566 | Avg Ppl: 37.12 | Time: 8450s
+Step 3290 | Total Loss: 14.9877 | Avg Ppl: 42.39 | Time: 8476s
+Step 3300 | Total Loss: 14.5193 | Avg Ppl: 37.71 | Time: 8501s
+Step 3310 | Total Loss: 14.7345 | Avg Ppl: 39.79 | Time: 8527s
+Step 3320 | Total Loss: 14.4404 | Avg Ppl: 36.97 | Time: 8553s
+Step 3330 | Total Loss: 14.7967 | Avg Ppl: 40.41 | Time: 8579s
+Step 3340 | Total Loss: 14.4094 | Avg Ppl: 36.68 | Time: 8604s
+Step 3350 | Total Loss: 14.1935 | Avg Ppl: 34.76 | Time: 8630s
+Step 3360 | Total Loss: 14.7027 | Avg Ppl: 39.48 | Time: 8656s
+Step 3370 | Total Loss: 14.1151 | Avg Ppl: 34.08 | Time: 8682s
+Step 3380 | Total Loss: 14.6909 | Avg Ppl: 39.36 | Time: 8708s
+Step 3390 | Total Loss: 14.8596 | Avg Ppl: 41.05 | Time: 8733s
+Step 3400 | Total Loss: 14.9332 | Avg Ppl: 41.82 | Time: 8759s
+Step 3410 | Total Loss: 14.5000 | Avg Ppl: 37.52 | Time: 8785s
+Step 3420 | Total Loss: 14.7284 | Avg Ppl: 39.73 | Time: 8810s
+Step 3430 | Total Loss: 14.7985 | Avg Ppl: 40.43 | Time: 8836s
+Step 3440 | Total Loss: 14.5353 | Avg Ppl: 37.86 | Time: 8862s
+Step 3450 | Total Loss: 14.6190 | Avg Ppl: 38.66 | Time: 8888s
+Step 3460 | Total Loss: 14.6589 | Avg Ppl: 39.05 | Time: 8913s
+Step 3470 | Total Loss: 14.8602 | Avg Ppl: 41.06 | Time: 8939s
+Step 3480 | Total Loss: 14.3844 | Avg Ppl: 36.46 | Time: 8965s
+Step 3490 | Total Loss: 14.3714 | Avg Ppl: 36.34 | Time: 8991s
+Step 3500 | Total Loss: 14.7320 | Avg Ppl: 39.77 | Time: 9016s
+Step 3510 | Total Loss: 14.8437 | Avg Ppl: 40.89 | Time: 9042s
+Step 3520 | Total Loss: 13.9196 | Avg Ppl: 32.46 | Time: 9068s
+Step 3530 | Total Loss: 14.8212 | Avg Ppl: 40.66 | Time: 9093s
+Step 3540 | Total Loss: 14.5785 | Avg Ppl: 38.27 | Time: 9119s
+Step 3550 | Total Loss: 14.5617 | Avg Ppl: 38.11 | Time: 9145s
+Step 3560 | Total Loss: 14.3166 | Avg Ppl: 35.84 | Time: 9171s
+🏁 Epoch 9/10
+Step 3570 | Total Loss: 14.5366 | Avg Ppl: 37.87 | Time: 9197s
+Step 3580 | Total Loss: 13.9216 | Avg Ppl: 32.47 | Time: 9223s
+Step 3590 | Total Loss: 14.6790 | Avg Ppl: 39.24 | Time: 9249s
+Step 3600 | Total Loss: 14.4085 | Avg Ppl: 36.68 | Time: 9274s
+Step 3610 | Total Loss: 14.5581 | Avg Ppl: 38.07 | Time: 9300s
+Step 3620 | Total Loss: 14.8085 | Avg Ppl: 40.53 | Time: 9326s
+Step 3630 | Total Loss: 14.5602 | Avg Ppl: 38.09 | Time: 9352s
+Step 3640 | Total Loss: 14.1432 | Avg Ppl: 34.32 | Time: 9378s
+Step 3650 | Total Loss: 14.4910 | Avg Ppl: 37.44 | Time: 9404s
+Step 3660 | Total Loss: 14.5848 | Avg Ppl: 38.33 | Time: 9429s
+Step 3670 | Total Loss: 14.6372 | Avg Ppl: 38.83 | Time: 9455s
+Step 3680 | Total Loss: 14.7192 | Avg Ppl: 39.64 | Time: 9481s
+Step 3690 | Total Loss: 14.6007 | Avg Ppl: 38.48 | Time: 9507s
+Step 3700 | Total Loss: 14.8047 | Avg Ppl: 40.49 | Time: 9532s
+Step 3710 | Total Loss: 14.4033 | Avg Ppl: 36.63 | Time: 9558s
+Step 3720 | Total Loss: 14.7519 | Avg Ppl: 39.96 | Time: 9584s
+Step 3730 | Total Loss: 14.7558 | Avg Ppl: 40.00 | Time: 9610s
+Step 3740 | Total Loss: 14.5930 | Avg Ppl: 38.41 | Time: 9635s
+Step 3750 | Total Loss: 14.5317 | Avg Ppl: 37.82 | Time: 9661s
+Step 3760 | Total Loss: 14.6542 | Avg Ppl: 39.00 | Time: 9687s
+Step 3770 | Total Loss: 14.4750 | Avg Ppl: 37.29 | Time: 9713s
+Step 3780 | Total Loss: 14.3163 | Avg Ppl: 35.84 | Time: 9738s
+Step 3790 | Total Loss: 14.3596 | Avg Ppl: 36.23 | Time: 9764s
+Step 3800 | Total Loss: 14.5768 | Avg Ppl: 38.25 | Time: 9790s
+Step 3810 | Total Loss: 14.9789 | Avg Ppl: 42.30 | Time: 9816s
+Step 3820 | Total Loss: 14.9093 | Avg Ppl: 41.57 | Time: 9842s
+Step 3830 | Total Loss: 14.6327 | Avg Ppl: 38.79 | Time: 9867s
+Step 3840 | Total Loss: 13.9797 | Avg Ppl: 32.95 | Time: 9893s
+Step 3850 | Total Loss: 14.4731 | Avg Ppl: 37.27 | Time: 9919s
+Step 3860 | Total Loss: 14.5755 | Avg Ppl: 38.24 | Time: 9945s
+Step 3870 | Total Loss: 14.3582 | Avg Ppl: 36.22 | Time: 9971s
+Step 3880 | Total Loss: 15.1502 | Avg Ppl: 44.15 | Time: 9997s
+Step 3890 | Total Loss: 14.2129 | Avg Ppl: 34.93 | Time: 10022s
+Step 3900 | Total Loss: 15.0334 | Avg Ppl: 42.88 | Time: 10048s
+Step 3910 | Total Loss: 14.7256 | Avg Ppl: 39.70 | Time: 10074s
+Step 3920 | Total Loss: 14.9038 | Avg Ppl: 41.51 | Time: 10100s
+Step 3930 | Total Loss: 14.8404 | Avg Ppl: 40.86 | Time: 10126s
+Step 3940 | Total Loss: 14.9558 | Avg Ppl: 42.05 | Time: 10151s
+Step 3950 | Total Loss: 15.0361 | Avg Ppl: 42.91 | Time: 10177s
+Step 3960 | Total Loss: 14.4044 | Avg Ppl: 36.64 | Time: 10203s
+Step 3970 | Total Loss: 15.2433 | Avg Ppl: 45.19 | Time: 10229s
+Step 3980 | Total Loss: 14.5875 | Avg Ppl: 38.35 | Time: 10255s
+Step 3990 | Total Loss: 14.5496 | Avg Ppl: 37.99 | Time: 10281s
+Step 4000 | Total Loss: 14.6896 | Avg Ppl: 39.35 | Time: 10306s
+💾 Checkpoint saved.
+Step 4010 | Total Loss: 14.5912 | Avg Ppl: 38.39 | Time: 10332s
+🏁 Epoch 10/10
+Step 4020 | Total Loss: 14.6495 | Avg Ppl: 38.95 | Time: 10358s
+Step 4030 | Total Loss: 14.4101 | Avg Ppl: 36.69 | Time: 10384s
+Step 4040 | Total Loss: 14.4620 | Avg Ppl: 37.17 | Time: 10410s
+Step 4050 | Total Loss: 14.9119 | Avg Ppl: 41.60 | Time: 10436s
+Step 4060 | Total Loss: 14.4500 | Avg Ppl: 37.06 | Time: 10461s
+Step 4070 | Total Loss: 14.2947 | Avg Ppl: 35.65 | Time: 10487s
+Step 4080 | Total Loss: 14.4617 | Avg Ppl: 37.17 | Time: 10513s
+Step 4090 | Total Loss: 14.2776 | Avg Ppl: 35.50 | Time: 10539s
+Step 4100 | Total Loss: 14.5274 | Avg Ppl: 37.78 | Time: 10565s
+Step 4110 | Total Loss: 14.8381 | Avg Ppl: 40.83 | Time: 10591s
+Step 4120 | Total Loss: 13.8993 | Avg Ppl: 32.29 | Time: 10616s
+Step 4130 | Total Loss: 14.2808 | Avg Ppl: 35.52 | Time: 10642s
+Step 4140 | Total Loss: 14.9076 | Avg Ppl: 41.55 | Time: 10668s
+Step 4150 | Total Loss: 14.3698 | Avg Ppl: 36.32 | Time: 10694s
+Step 4160 | Total Loss: 14.4689 | Avg Ppl: 37.23 | Time: 10719s
+Step 4170 | Total Loss: 14.4821 | Avg Ppl: 37.36 | Time: 10745s
+Step 4180 | Total Loss: 14.4741 | Avg Ppl: 37.28 | Time: 10771s
+Step 4190 | Total Loss: 14.4661 | Avg Ppl: 37.21 | Time: 10796s
+Step 4200 | Total Loss: 14.7448 | Avg Ppl: 39.89 | Time: 10822s
+Step 4210 | Total Loss: 14.5432 | Avg Ppl: 37.93 | Time: 10848s
+Step 4220 | Total Loss: 14.3310 | Avg Ppl: 35.97 | Time: 10874s
+Step 4230 | Total Loss: 14.3017 | Avg Ppl: 35.71 | Time: 10900s
+Step 4240 | Total Loss: 14.6952 | Avg Ppl: 39.40 | Time: 10926s
+Step 4250 | Total Loss: 14.8533 | Avg Ppl: 40.99 | Time: 10952s
+Step 4260 | Total Loss: 14.5496 | Avg Ppl: 37.99 | Time: 10977s
+Step 4270 | Total Loss: 14.0822 | Avg Ppl: 33.80 | Time: 11003s
+Step 4280 | Total Loss: 13.8967 | Avg Ppl: 32.27 | Time: 11029s
+Step 4290 | Total Loss: 14.2636 | Avg Ppl: 35.37 | Time: 11054s
+Step 4300 | Total Loss: 14.6148 | Avg Ppl: 38.62 | Time: 11080s
+Step 4310 | Total Loss: 14.2939 | Avg Ppl: 35.64 | Time: 11106s
+Step 4320 | Total Loss: 14.6600 | Avg Ppl: 39.06 | Time: 11131s
+Step 4330 | Total Loss: 14.1371 | Avg Ppl: 34.27 | Time: 11157s
+Step 4340 | Total Loss: 14.3428 | Avg Ppl: 36.08 | Time: 11183s
+Step 4350 | Total Loss: 14.1852 | Avg Ppl: 34.68 | Time: 11209s
+Step 4360 | Total Loss: 14.3879 | Avg Ppl: 36.49 | Time: 11234s
+Step 4370 | Total Loss: 15.1496 | Avg Ppl: 44.14 | Time: 11260s
+Step 4380 | Total Loss: 14.7494 | Avg Ppl: 39.94 | Time: 11286s
+Step 4390 | Total Loss: 14.5399 | Avg Ppl: 37.90 | Time: 11312s
+Step 4400 | Total Loss: 14.8604 | Avg Ppl: 41.06 | Time: 11337s
+Step 4410 | Total Loss: 14.6582 | Avg Ppl: 39.04 | Time: 11363s
+Step 4420 | Total Loss: 14.2983 | Avg Ppl: 35.68 | Time: 11389s
+Step 4430 | Total Loss: 14.6889 | Avg Ppl: 39.34 | Time: 11415s
+Step 4440 | Total Loss: 14.4085 | Avg Ppl: 36.68 | Time: 11441s
+Step 4450 | Total Loss: 14.9370 | Avg Ppl: 41.86 | Time: 11466s
+Step 4460 | Total Loss: 14.6625 | Avg Ppl: 39.08 | Time: 11492s
+
+
+
+
+
+
+
+
+
+
+
+"""
+SOTA Benchmark: Transformer Multi-Codebook
+==========================================
+Ce script entraîne une baseline Transformer (style MusicGen/GPT) sur la même tâche 
+que "SoundTrack" (Hybrid INN).
+
+Objectif :
+- Comparer INN vs Transformer sur la génération Multi-Codebook.
+- Configuration "Iso-Paramètres" (~24M params).
+- Utilise la même stratégie "Summed Embeddings" pour une comparaison architecturale directe.
+"""
+
+import os
+import shutil
+import time
+import math
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchaudio
+import soundfile as sf
+import glob
+from torch.utils.data import DataLoader, Dataset
+from transformers import EncodecModel, AutoProcessor
+
+# ==============================================================================
+# CONFIGURATION (Doit matcher SoundTrack)
+# ==============================================================================
+CONFIG = {
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "sample_rate": 24000,
+    "vocab_size": 1024,
+    "n_codebooks": 4,
+    "seq_len": 450,       # ~6 sec
+    "batch_size": 64,     # Match INN
+    "epochs": 10,
+    "lr": 5e-4,           # Transformer demande souvent un LR plus bas que LSTM/INN
+    "log_dir": "./multicodebook_baseline_logs"
+}
+
+if not os.path.exists(CONFIG["log_dir"]):
+    os.makedirs(CONFIG["log_dir"])
+
+# ==============================================================================
+# DATASET & TOKENIZER (Copie Exacte de inn_multicodebook.py)
+# ==============================================================================
+class LibriSpeechMultiCodebook(Dataset):
+    def __init__(self, root, url="train-clean-100"):
+        self.files = sorted(glob.glob(os.path.join(root, "LibriSpeech", url, "**", "*.flac"), recursive=True))
+        if len(self.files) == 0:
+            print(f"Dataset not found in {root}. Please run inn_multicodebook.py first to download.")
+            # Fallback simple
+            os.makedirs(root, exist_ok=True)
+            torchaudio.datasets.LIBRISPEECH(root=root, url=url, download=True)
+            self.files = sorted(glob.glob(os.path.join(root, "LibriSpeech", url, "**", "*.flac"), recursive=True))
+        
+        print(f"📚 Dataset: {len(self.files)} files")
+        self.resampler = torchaudio.transforms.Resample(orig_freq=16000, new_freq=CONFIG["sample_rate"])
+
+    def __len__(self): return len(self.files)
+
+    def __getitem__(self, idx):
+        try:
+            wav, _ = sf.read(self.files[idx])
+            waveform = torch.from_numpy(wav).float()
+            if waveform.ndim == 1: waveform = waveform.unsqueeze(0)
+            else: waveform = waveform.t()
+            return self.resampler(waveform)
+        except: return torch.zeros(1, CONFIG["sample_rate"])
+
+class AudioTokenizer:
+    def __init__(self, device):
+        self.device = device
+        self.model = EncodecModel.from_pretrained("facebook/encodec_24khz").to(device)
+        self.processor = AutoProcessor.from_pretrained("facebook/encodec_24khz")
+        self.model.eval()
+
+    @torch.no_grad()
+    def encode(self, waveform):
+        raw_audio = [w.squeeze(0).cpu().numpy() for w in waveform]
+        inputs = self.processor(raw_audio=raw_audio, sampling_rate=CONFIG["sample_rate"], return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        target_bandwidth = CONFIG["n_codebooks"] * 0.75 
+        outputs = self.model.encode(**inputs, bandwidth=target_bandwidth)
+        return outputs.audio_codes[0].squeeze(0).squeeze(0)
+
+# ==============================================================================
+# SOTA BASELINE: TRANSFORMER
+# ==============================================================================
+class Transformer_Baseline(nn.Module):
+    def __init__(self, vocab_size, d_model, n_head, n_layers, n_codebooks=4):
+        super().__init__()
+        self.n_codebooks = n_codebooks
+        self.d_model = d_model
+        
+        # Embeddings (Summed strategy matching SoundTrack)
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(vocab_size + 1, d_model, padding_idx=vocab_size) 
+            for _ in range(n_codebooks)
+        ])
+        
+        # Positional Encoding (Crucial for Transformer, not needed for LSTM/INN)
+        self.pos_embedding = nn.Embedding(2048, d_model)
+        
+        # Transformer Core
+        # NormBefore est souvent meilleur pour la convergence audio
+        encoder_layer = nn.TransformerEncoderLayer(d_model, n_head, dim_feedforward=d_model*4, batch_first=True, norm_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, n_layers)
+        
+        # Heads
+        self.heads = nn.ModuleList([nn.Linear(d_model, vocab_size) for _ in range(n_codebooks)])
+        
+    def forward(self, x):
+        # x: (Batch, K, T)
+        B, K, T = x.size()
+        
+        # Input Fusion (Summed)
+        x_fused = torch.zeros(B, T, self.d_model, device=x.device)
+        for k in range(self.n_codebooks):
+            x_fused += self.embeddings[k](x[:, k, :])
+            
+        # Add Positional Embedding
+        positions = torch.arange(0, T, device=x.device).unsqueeze(0)
+        x_fused = x_fused + self.pos_embedding(positions)
+        
+        # Causal Mask
+        mask = torch.triu(torch.ones(T, T) * float('-inf'), diagonal=1).to(x.device)
+        
+        # Transformer Forward
+        feat = self.transformer(x_fused, mask=mask, is_causal=True)
+        
+        # Multi-Head Prediction
+        return torch.stack([h(feat) for h in self.heads], dim=1)
+
+# ==============================================================================
+# TRAINING LOOP
+# ==============================================================================
+def train():
+    print("🚀 LAUNCHING TRANSFORMER MULTI-CODEBOOK BASELINE")
+    torch.set_float32_matmul_precision('high')
+    
+    tokenizer = AudioTokenizer(CONFIG["device"])
+    ds = LibriSpeechMultiCodebook(root="./librispeech_data")
+    
+    def collate_fn(batch):
+        max_len = min(max([w.size(-1) for w in batch]), 24000*10)
+        padded = torch.zeros(len(batch), 1, max_len)
+        for i, w in enumerate(batch):
+            sl = min(w.size(-1), max_len)
+            padded[i, :, :sl] = w[:, :sl]
+        return padded
+
+    dl = DataLoader(ds, batch_size=CONFIG["batch_size"], shuffle=True, collate_fn=collate_fn, num_workers=4)
+    
+    # Configuration pour ~24M paramètres
+    # SoundTrack: ~24M params
+    # Transformer:
+    # d_model=512
+    # 1 Layer ~ 3.1M params (Attn + FFN)
+    # 6 Layers ~ 18.6M params
+    # + Embeddings (2M) + Heads (2M) ~= 22.6M
+    # C'est très proche.
+    
+    model = Transformer_Baseline(
+        vocab_size=CONFIG["vocab_size"],
+        d_model=512,
+        n_head=8,
+        n_layers=6,  # Tuned for ~23-24M params
+        n_codebooks=CONFIG["n_codebooks"]
+    ).to(CONFIG["device"])
+    
+    print(f"📊 Parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    
+    optimizer = optim.AdamW(model.parameters(), lr=CONFIG["lr"])
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG["epochs"] * len(dl))
+    criterion = nn.CrossEntropyLoss()
+    
+    model.train()
+    step = 0
+    start_time = time.time()
+    
+    for epoch in range(CONFIG["epochs"]):
+        print(f"🏁 Epoch {epoch+1}/{CONFIG['epochs']}")
+        for batch_waves in dl:
+            batch_waves = batch_waves.to(CONFIG["device"])
+            
+            with torch.no_grad():
+                codes = torch.stack([tokenizer.encode(w.unsqueeze(0)) for w in batch_waves])
+                codes = codes.to(CONFIG["device"])
+            
+            if codes.size(-1) > CONFIG["seq_len"]:
+                codes = codes[:, :, :CONFIG["seq_len"]]
+                
+            inputs = codes[:, :, :-1]
+            targets = codes[:, :, 1:]
+            
+            if inputs.size(-1) < 10: continue
+
+            optimizer.zero_grad()
+            logits = model(inputs) # (B, 4, T, Vocab)
+            
+            loss = 0
+            for k in range(CONFIG["n_codebooks"]):
+                loss += criterion(logits[:, k, :, :].reshape(-1, CONFIG["vocab_size"]), targets[:, k, :].reshape(-1))
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            
+            step += 1
+            if step % 10 == 0:
+                elapsed = time.time() - start_time
+                avg_loss = loss.item() / 4
+                ppl = math.exp(avg_loss)
+                print(f"Transformer | Step {step} | Total Loss: {loss.item():.4f} | Avg Ppl: {ppl:.2f} | Time: {elapsed:.0f}s")
+                
+            if step % 1000 == 0:
+                torch.save(model.state_dict(), f"{CONFIG['log_dir']}/transformer_baseline_{step}.pt")
+
+if __name__ == "__main__":
+    train()
+
+
+
+🚀 LAUNCHING TRANSFORMER MULTI-CODEBOOK BASELINE
+/usr/local/lib/python3.12/dist-packages/torch/__init__.py:1617: UserWarning: Please use the new API settings to control TF32 behavior, such as torch.backends.cudnn.conv.fp32_precision = 'tf32' or torch.backends.cuda.matmul.fp32_precision = 'ieee'. Old settings, e.g, torch.backends.cuda.matmul.allow_tf32 = True, torch.backends.cudnn.allow_tf32 = True, allowTF32CuDNN() and allowTF32CuBLAS() will be deprecated after Pytorch 2.9. Please see https://pytorch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:80.)
+  _C._set_float32_matmul_precision(precision)
+/usr/local/lib/python3.12/dist-packages/huggingface_hub/utils/_auth.py:94: UserWarning: 
+The secret `HF_TOKEN` does not exist in your Colab secrets.
+To authenticate with the Hugging Face Hub, create a token in your settings tab (https://huggingface.co/settings/tokens), set it as secret in your Google Colab and restart your session.
+You will be able to reuse this secret in all of your notebooks.
+Please note that authentication is recommended but still optional to access public models or datasets.
+  warnings.warn(
+config.json: 100%
+ 809/809 [00:00<00:00, 102kB/s]
+model.safetensors: 100%
+ 93.1M/93.1M [00:01<00:00, 14.6MB/s]
+preprocessor_config.json: 100%
+ 234/234 [00:00<00:00, 31.3kB/s]
+Using a slow image processor as `use_fast` is unset and a slow processor was saved with this model. `use_fast=True` will be the default behavior in v4.52, even if the model was saved with a slow processor. This will result in minor differences in outputs. You'll still be able to use a slow processor with `use_fast=False`.
+Dataset not found in ./librispeech_data. Please run inn_multicodebook.py first to download.
+100%|██████████| 5.95G/5.95G [06:05<00:00, 17.5MB/s]
+📚 Dataset: 28539 files
+📊 Parameters: 24,163,328
+🏁 Epoch 1/10
+/usr/local/lib/python3.12/dist-packages/torch/nn/modules/transformer.py:392: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(
+Transformer | Step 10 | Total Loss: 24.3505 | Avg Ppl: 440.37 | Time: 25s
+Transformer | Step 20 | Total Loss: 22.2731 | Avg Ppl: 261.98 | Time: 47s
+Transformer | Step 30 | Total Loss: 21.3932 | Avg Ppl: 210.25 | Time: 69s
+Transformer | Step 40 | Total Loss: 20.4221 | Avg Ppl: 164.93 | Time: 91s
+Transformer | Step 50 | Total Loss: 20.1601 | Avg Ppl: 154.47 | Time: 113s
+Transformer | Step 60 | Total Loss: 19.5662 | Avg Ppl: 133.16 | Time: 135s
+Transformer | Step 70 | Total Loss: 19.7880 | Avg Ppl: 140.75 | Time: 157s
+Transformer | Step 80 | Total Loss: 19.6630 | Avg Ppl: 136.42 | Time: 178s
+Transformer | Step 90 | Total Loss: 18.8067 | Avg Ppl: 110.13 | Time: 200s
+Transformer | Step 100 | Total Loss: 19.0542 | Avg Ppl: 117.16 | Time: 222s
+Transformer | Step 110 | Total Loss: 18.9154 | Avg Ppl: 113.17 | Time: 244s
+Transformer | Step 120 | Total Loss: 18.9393 | Avg Ppl: 113.84 | Time: 266s
+Transformer | Step 130 | Total Loss: 18.8420 | Avg Ppl: 111.11 | Time: 288s
+Transformer | Step 140 | Total Loss: 18.7563 | Avg Ppl: 108.75 | Time: 310s
+Transformer | Step 150 | Total Loss: 18.3132 | Avg Ppl: 97.35 | Time: 332s
+Transformer | Step 160 | Total Loss: 18.8403 | Avg Ppl: 111.06 | Time: 354s
+Transformer | Step 170 | Total Loss: 18.4291 | Avg Ppl: 100.21 | Time: 375s
+Transformer | Step 180 | Total Loss: 17.9912 | Avg Ppl: 89.82 | Time: 397s
+Transformer | Step 190 | Total Loss: 18.5548 | Avg Ppl: 103.41 | Time: 419s
+Transformer | Step 200 | Total Loss: 18.3738 | Avg Ppl: 98.83 | Time: 441s
+Transformer | Step 210 | Total Loss: 18.5386 | Avg Ppl: 102.99 | Time: 463s
+Transformer | Step 220 | Total Loss: 18.4384 | Avg Ppl: 100.44 | Time: 485s
+Transformer | Step 230 | Total Loss: 18.0969 | Avg Ppl: 92.22 | Time: 507s
+Transformer | Step 240 | Total Loss: 18.4626 | Avg Ppl: 101.05 | Time: 529s
+Transformer | Step 250 | Total Loss: 17.3875 | Avg Ppl: 77.24 | Time: 551s
+Transformer | Step 260 | Total Loss: 18.6898 | Avg Ppl: 106.96 | Time: 573s
+Transformer | Step 270 | Total Loss: 18.1029 | Avg Ppl: 92.36 | Time: 595s
+Transformer | Step 280 | Total Loss: 17.5157 | Avg Ppl: 79.75 | Time: 617s
+Transformer | Step 290 | Total Loss: 18.1824 | Avg Ppl: 94.22 | Time: 639s
+Transformer | Step 300 | Total Loss: 17.2483 | Avg Ppl: 74.59 | Time: 661s
+Transformer | Step 310 | Total Loss: 18.6184 | Avg Ppl: 105.07 | Time: 683s
+Transformer | Step 320 | Total Loss: 17.6091 | Avg Ppl: 81.64 | Time: 705s
+Transformer | Step 330 | Total Loss: 17.4498 | Avg Ppl: 78.45 | Time: 727s
+Transformer | Step 340 | Total Loss: 17.9083 | Avg Ppl: 87.98 | Time: 749s
+Transformer | Step 350 | Total Loss: 17.9427 | Avg Ppl: 88.74 | Time: 771s
+Transformer | Step 360 | Total Loss: 17.1486 | Avg Ppl: 72.76 | Time: 793s
+Transformer | Step 370 | Total Loss: 17.6591 | Avg Ppl: 82.66 | Time: 815s
+Transformer | Step 380 | Total Loss: 17.1540 | Avg Ppl: 72.86 | Time: 836s
+Transformer | Step 390 | Total Loss: 17.6499 | Avg Ppl: 82.47 | Time: 858s
+Transformer | Step 400 | Total Loss: 17.7308 | Avg Ppl: 84.16 | Time: 880s
+Transformer | Step 410 | Total Loss: 17.8370 | Avg Ppl: 86.42 | Time: 902s
+Transformer | Step 420 | Total Loss: 17.7291 | Avg Ppl: 84.12 | Time: 924s
+Transformer | Step 430 | Total Loss: 17.5860 | Avg Ppl: 81.17 | Time: 947s
+Transformer | Step 440 | Total Loss: 17.5875 | Avg Ppl: 81.20 | Time: 968s
+🏁 Epoch 2/10
+Transformer | Step 450 | Total Loss: 16.9434 | Avg Ppl: 69.12 | Time: 991s
+Transformer | Step 460 | Total Loss: 17.6499 | Avg Ppl: 82.47 | Time: 1013s
+Transformer | Step 470 | Total Loss: 17.1126 | Avg Ppl: 72.11 | Time: 1035s
+Transformer | Step 480 | Total Loss: 17.8029 | Avg Ppl: 85.69 | Time: 1057s
+Transformer | Step 490 | Total Loss: 17.3249 | Avg Ppl: 76.04 | Time: 1079s
+Transformer | Step 500 | Total Loss: 17.8663 | Avg Ppl: 87.06 | Time: 1101s
+Transformer | Step 510 | Total Loss: 17.3313 | Avg Ppl: 76.16 | Time: 1123s
+Transformer | Step 520 | Total Loss: 17.9472 | Avg Ppl: 88.84 | Time: 1145s
+Transformer | Step 530 | Total Loss: 17.1514 | Avg Ppl: 72.81 | Time: 1167s
+Transformer | Step 540 | Total Loss: 17.1138 | Avg Ppl: 72.13 | Time: 1189s
+Transformer | Step 550 | Total Loss: 16.8584 | Avg Ppl: 67.67 | Time: 1211s
+Transformer | Step 560 | Total Loss: 17.3874 | Avg Ppl: 77.23 | Time: 1233s
+Transformer | Step 570 | Total Loss: 17.1463 | Avg Ppl: 72.72 | Time: 1255s
+Transformer | Step 580 | Total Loss: 17.2910 | Avg Ppl: 75.40 | Time: 1277s
+Transformer | Step 590 | Total Loss: 16.7637 | Avg Ppl: 66.08 | Time: 1299s
+Transformer | Step 600 | Total Loss: 17.1183 | Avg Ppl: 72.21 | Time: 1321s
+Transformer | Step 610 | Total Loss: 16.9456 | Avg Ppl: 69.16 | Time: 1343s
+Transformer | Step 620 | Total Loss: 17.2240 | Avg Ppl: 74.14 | Time: 1365s
+Transformer | Step 630 | Total Loss: 17.3946 | Avg Ppl: 77.37 | Time: 1387s
+Transformer | Step 640 | Total Loss: 17.7383 | Avg Ppl: 84.32 | Time: 1409s
+Transformer | Step 650 | Total Loss: 16.8541 | Avg Ppl: 67.59 | Time: 1431s
+Transformer | Step 660 | Total Loss: 17.1159 | Avg Ppl: 72.17 | Time: 1453s
+Transformer | Step 670 | Total Loss: 16.6662 | Avg Ppl: 64.49 | Time: 1475s
+Transformer | Step 680 | Total Loss: 16.4814 | Avg Ppl: 61.58 | Time: 1497s
+Transformer | Step 690 | Total Loss: 17.4028 | Avg Ppl: 77.53 | Time: 1519s
+Transformer | Step 700 | Total Loss: 17.1239 | Avg Ppl: 72.31 | Time: 1541s
+Transformer | Step 710 | Total Loss: 17.7760 | Avg Ppl: 85.12 | Time: 1563s
+Transformer | Step 720 | Total Loss: 16.8560 | Avg Ppl: 67.63 | Time: 1585s
+Transformer | Step 730 | Total Loss: 16.9514 | Avg Ppl: 69.26 | Time: 1607s
+Transformer | Step 740 | Total Loss: 16.9809 | Avg Ppl: 69.77 | Time: 1629s
+Transformer | Step 750 | Total Loss: 16.9126 | Avg Ppl: 68.59 | Time: 1652s
+Transformer | Step 760 | Total Loss: 16.9189 | Avg Ppl: 68.70 | Time: 1674s
+Transformer | Step 770 | Total Loss: 16.5492 | Avg Ppl: 62.63 | Time: 1696s
+Transformer | Step 780 | Total Loss: 17.0149 | Avg Ppl: 70.37 | Time: 1718s
+Transformer | Step 790 | Total Loss: 16.8819 | Avg Ppl: 68.07 | Time: 1740s
+Transformer | Step 800 | Total Loss: 17.1748 | Avg Ppl: 73.24 | Time: 1762s
+Transformer | Step 810 | Total Loss: 16.6557 | Avg Ppl: 64.32 | Time: 1784s
+Transformer | Step 820 | Total Loss: 16.8708 | Avg Ppl: 67.88 | Time: 1806s
+Transformer | Step 830 | Total Loss: 16.8974 | Avg Ppl: 68.33 | Time: 1828s
+Transformer | Step 840 | Total Loss: 17.1759 | Avg Ppl: 73.26 | Time: 1850s
+Transformer | Step 850 | Total Loss: 16.3891 | Avg Ppl: 60.18 | Time: 1872s
+Transformer | Step 860 | Total Loss: 16.7449 | Avg Ppl: 65.77 | Time: 1894s
+Transformer | Step 870 | Total Loss: 16.6683 | Avg Ppl: 64.53 | Time: 1916s
+Transformer | Step 880 | Total Loss: 16.8623 | Avg Ppl: 67.73 | Time: 1938s
+Transformer | Step 890 | Total Loss: 16.3944 | Avg Ppl: 60.26 | Time: 1960s
+🏁 Epoch 3/10
+Transformer | Step 900 | Total Loss: 17.1676 | Avg Ppl: 73.10 | Time: 1983s
+Transformer | Step 910 | Total Loss: 16.7775 | Avg Ppl: 66.31 | Time: 2005s
+Transformer | Step 920 | Total Loss: 16.1674 | Avg Ppl: 56.93 | Time: 2027s
+Transformer | Step 930 | Total Loss: 17.2309 | Avg Ppl: 74.27 | Time: 2049s
+Transformer | Step 940 | Total Loss: 16.8020 | Avg Ppl: 66.72 | Time: 2071s
+Transformer | Step 950 | Total Loss: 16.3815 | Avg Ppl: 60.06 | Time: 2093s
+Transformer | Step 960 | Total Loss: 17.0551 | Avg Ppl: 71.08 | Time: 2115s
+Transformer | Step 970 | Total Loss: 16.5863 | Avg Ppl: 63.22 | Time: 2137s
+Transformer | Step 980 | Total Loss: 16.8462 | Avg Ppl: 67.46 | Time: 2159s
+Transformer | Step 990 | Total Loss: 16.7260 | Avg Ppl: 65.46 | Time: 2181s
+Transformer | Step 1000 | Total Loss: 16.6021 | Avg Ppl: 63.47 | Time: 2204s
+Transformer | Step 1010 | Total Loss: 16.8185 | Avg Ppl: 66.99 | Time: 2226s
+Transformer | Step 1020 | Total Loss: 16.2491 | Avg Ppl: 58.11 | Time: 2248s
+Transformer | Step 1030 | Total Loss: 16.8886 | Avg Ppl: 68.18 | Time: 2270s
+Transformer | Step 1040 | Total Loss: 15.8813 | Avg Ppl: 53.00 | Time: 2292s
+Transformer | Step 1050 | Total Loss: 16.7391 | Avg Ppl: 65.68 | Time: 2314s
+Transformer | Step 1060 | Total Loss: 16.5045 | Avg Ppl: 61.94 | Time: 2336s
+Transformer | Step 1070 | Total Loss: 16.9315 | Avg Ppl: 68.91 | Time: 2358s
+Transformer | Step 1080 | Total Loss: 16.3491 | Avg Ppl: 59.58 | Time: 2380s
+Transformer | Step 1090 | Total Loss: 16.3279 | Avg Ppl: 59.26 | Time: 2402s
+Transformer | Step 1100 | Total Loss: 16.7816 | Avg Ppl: 66.38 | Time: 2424s
+Transformer | Step 1110 | Total Loss: 16.1299 | Avg Ppl: 56.40 | Time: 2446s
+Transformer | Step 1120 | Total Loss: 16.8092 | Avg Ppl: 66.84 | Time: 2468s
+Transformer | Step 1130 | Total Loss: 16.7575 | Avg Ppl: 65.98 | Time: 2490s
+Transformer | Step 1140 | Total Loss: 16.1981 | Avg Ppl: 57.37 | Time: 2512s
+Transformer | Step 1150 | Total Loss: 15.9141 | Avg Ppl: 53.44 | Time: 2535s
+Transformer | Step 1160 | Total Loss: 16.1105 | Avg Ppl: 56.13 | Time: 2557s
+Transformer | Step 1170 | Total Loss: 16.7506 | Avg Ppl: 65.87 | Time: 2579s
+Transformer | Step 1180 | Total Loss: 16.9071 | Avg Ppl: 68.50 | Time: 2601s
+Transformer | Step 1190 | Total Loss: 16.2170 | Avg Ppl: 57.64 | Time: 2623s
+Transformer | Step 1200 | Total Loss: 16.7579 | Avg Ppl: 65.99 | Time: 2645s
+Transformer | Step 1210 | Total Loss: 16.6916 | Avg Ppl: 64.90 | Time: 2667s
+Transformer | Step 1220 | Total Loss: 16.8428 | Avg Ppl: 67.40 | Time: 2689s
+Transformer | Step 1230 | Total Loss: 16.4450 | Avg Ppl: 61.02 | Time: 2711s
+Transformer | Step 1240 | Total Loss: 16.4715 | Avg Ppl: 61.43 | Time: 2733s
+Transformer | Step 1250 | Total Loss: 16.4412 | Avg Ppl: 60.97 | Time: 2755s
+Transformer | Step 1260 | Total Loss: 16.5427 | Avg Ppl: 62.53 | Time: 2777s
+Transformer | Step 1270 | Total Loss: 15.7887 | Avg Ppl: 51.79 | Time: 2799s
+Transformer | Step 1280 | Total Loss: 16.6235 | Avg Ppl: 63.81 | Time: 2821s
+Transformer | Step 1290 | Total Loss: 15.9986 | Avg Ppl: 54.58 | Time: 2843s
+Transformer | Step 1300 | Total Loss: 16.3546 | Avg Ppl: 59.66 | Time: 2865s
+Transformer | Step 1310 | Total Loss: 15.9171 | Avg Ppl: 53.48 | Time: 2887s
+Transformer | Step 1320 | Total Loss: 16.6252 | Avg Ppl: 63.83 | Time: 2909s
+Transformer | Step 1330 | Total Loss: 16.4492 | Avg Ppl: 61.09 | Time: 2931s
+🏁 Epoch 4/10
+Transformer | Step 1340 | Total Loss: 16.4918 | Avg Ppl: 61.74 | Time: 2954s
+Transformer | Step 1350 | Total Loss: 16.5370 | Avg Ppl: 62.44 | Time: 2976s
+Transformer | Step 1360 | Total Loss: 15.4412 | Avg Ppl: 47.48 | Time: 2998s
+Transformer | Step 1370 | Total Loss: 16.1970 | Avg Ppl: 57.35 | Time: 3020s
+Transformer | Step 1380 | Total Loss: 16.0255 | Avg Ppl: 54.95 | Time: 3042s
+Transformer | Step 1390 | Total Loss: 16.4427 | Avg Ppl: 60.99 | Time: 3064s
+Transformer | Step 1400 | Total Loss: 15.9337 | Avg Ppl: 53.70 | Time: 3086s
+Transformer | Step 1410 | Total Loss: 16.5106 | Avg Ppl: 62.03 | Time: 3108s
+Transformer | Step 1420 | Total Loss: 16.2727 | Avg Ppl: 58.45 | Time: 3130s
+Transformer | Step 1430 | Total Loss: 16.1502 | Avg Ppl: 56.69 | Time: 3152s
+Transformer | Step 1440 | Total Loss: 16.2619 | Avg Ppl: 58.29 | Time: 3174s
+Transformer | Step 1450 | Total Loss: 16.3270 | Avg Ppl: 59.25 | Time: 3197s
+Transformer | Step 1460 | Total Loss: 16.3487 | Avg Ppl: 59.57 | Time: 3219s
+Transformer | Step 1470 | Total Loss: 15.5440 | Avg Ppl: 48.72 | Time: 3241s
+Transformer | Step 1480 | Total Loss: 16.0966 | Avg Ppl: 55.93 | Time: 3263s
+Transformer | Step 1490 | Total Loss: 16.0294 | Avg Ppl: 55.00 | Time: 3285s
+Transformer | Step 1500 | Total Loss: 16.0038 | Avg Ppl: 54.65 | Time: 3307s
+Transformer | Step 1510 | Total Loss: 16.1653 | Avg Ppl: 56.90 | Time: 3329s
+Transformer | Step 1520 | Total Loss: 16.1012 | Avg Ppl: 56.00 | Time: 3351s
+Transformer | Step 1530 | Total Loss: 16.7423 | Avg Ppl: 65.73 | Time: 3373s
+Transformer | Step 1540 | Total Loss: 16.4328 | Avg Ppl: 60.84 | Time: 3395s
+Transformer | Step 1550 | Total Loss: 16.0204 | Avg Ppl: 54.88 | Time: 3417s
+Transformer | Step 1560 | Total Loss: 16.0482 | Avg Ppl: 55.26 | Time: 3439s
+Transformer | Step 1570 | Total Loss: 15.8916 | Avg Ppl: 53.14 | Time: 3461s
+Transformer | Step 1580 | Total Loss: 16.1055 | Avg Ppl: 56.06 | Time: 3483s
+Transformer | Step 1590 | Total Loss: 15.8907 | Avg Ppl: 53.13 | Time: 3505s
+Transformer | Step 1600 | Total Loss: 15.6111 | Avg Ppl: 49.54 | Time: 3528s
+Transformer | Step 1610 | Total Loss: 15.8335 | Avg Ppl: 52.37 | Time: 3550s
+Transformer | Step 1620 | Total Loss: 16.3706 | Avg Ppl: 59.90 | Time: 3572s
+Transformer | Step 1630 | Total Loss: 15.3718 | Avg Ppl: 46.66 | Time: 3594s
+Transformer | Step 1640 | Total Loss: 16.0008 | Avg Ppl: 54.61 | Time: 3616s
+Transformer | Step 1650 | Total Loss: 15.9414 | Avg Ppl: 53.80 | Time: 3638s
+Transformer | Step 1660 | Total Loss: 16.1129 | Avg Ppl: 56.16 | Time: 3660s
+Transformer | Step 1670 | Total Loss: 15.8172 | Avg Ppl: 52.16 | Time: 3682s
+Transformer | Step 1680 | Total Loss: 15.6600 | Avg Ppl: 50.15 | Time: 3704s
+Transformer | Step 1690 | Total Loss: 16.6386 | Avg Ppl: 64.05 | Time: 3726s
+Transformer | Step 1700 | Total Loss: 16.0536 | Avg Ppl: 55.33 | Time: 3748s
+Transformer | Step 1710 | Total Loss: 16.3898 | Avg Ppl: 60.19 | Time: 3770s
+Transformer | Step 1720 | Total Loss: 16.5371 | Avg Ppl: 62.44 | Time: 3792s
+Transformer | Step 1730 | Total Loss: 16.1329 | Avg Ppl: 56.44 | Time: 3813s
+Transformer | Step 1740 | Total Loss: 16.8917 | Avg Ppl: 68.23 | Time: 3835s
+Transformer | Step 1750 | Total Loss: 15.9190 | Avg Ppl: 53.50 | Time: 3857s
+Transformer | Step 1760 | Total Loss: 16.1948 | Avg Ppl: 57.32 | Time: 3879s
+Transformer | Step 1770 | Total Loss: 15.3931 | Avg Ppl: 46.91 | Time: 3901s
+Transformer | Step 1780 | Total Loss: 16.0565 | Avg Ppl: 55.38 | Time: 3923s
+🏁 Epoch 5/10
+Transformer | Step 1790 | Total Loss: 15.7611 | Avg Ppl: 51.43 | Time: 3945s
+Transformer | Step 1800 | Total Loss: 16.1197 | Avg Ppl: 56.26 | Time: 3967s
+Transformer | Step 1810 | Total Loss: 16.4007 | Avg Ppl: 60.35 | Time: 3989s
+Transformer | Step 1820 | Total Loss: 16.0096 | Avg Ppl: 54.73 | Time: 4011s
+Transformer | Step 1830 | Total Loss: 16.0348 | Avg Ppl: 55.08 | Time: 4033s
+Transformer | Step 1840 | Total Loss: 15.7479 | Avg Ppl: 51.26 | Time: 4055s
+Transformer | Step 1850 | Total Loss: 16.0526 | Avg Ppl: 55.32 | Time: 4077s
+Transformer | Step 1860 | Total Loss: 16.2174 | Avg Ppl: 57.65 | Time: 4099s
+Transformer | Step 1870 | Total Loss: 16.2523 | Avg Ppl: 58.15 | Time: 4121s
+Transformer | Step 1880 | Total Loss: 16.1517 | Avg Ppl: 56.71 | Time: 4142s
+Transformer | Step 1890 | Total Loss: 15.9298 | Avg Ppl: 53.65 | Time: 4164s
+Transformer | Step 1900 | Total Loss: 15.7665 | Avg Ppl: 51.50 | Time: 4186s
+Transformer | Step 1910 | Total Loss: 15.5422 | Avg Ppl: 48.69 | Time: 4208s
+Transformer | Step 1920 | Total Loss: 15.2357 | Avg Ppl: 45.10 | Time: 4230s
+Transformer | Step 1930 | Total Loss: 15.1815 | Avg Ppl: 44.49 | Time: 4252s
+Transformer | Step 1940 | Total Loss: 15.6109 | Avg Ppl: 49.54 | Time: 4274s
+Transformer | Step 1950 | Total Loss: 15.7629 | Avg Ppl: 51.46 | Time: 4296s
+Transformer | Step 1960 | Total Loss: 15.3594 | Avg Ppl: 46.52 | Time: 4318s
+Transformer | Step 1970 | Total Loss: 16.0145 | Avg Ppl: 54.80 | Time: 4340s
+Transformer | Step 1980 | Total Loss: 16.1032 | Avg Ppl: 56.02 | Time: 4362s
+Transformer | Step 1990 | Total Loss: 16.3063 | Avg Ppl: 58.94 | Time: 4383s
+Transformer | Step 2000 | Total Loss: 15.3334 | Avg Ppl: 46.22 | Time: 4405s
+Transformer | Step 2010 | Total Loss: 15.9491 | Avg Ppl: 53.91 | Time: 4427s
+Transformer | Step 2020 | Total Loss: 16.1445 | Avg Ppl: 56.61 | Time: 4449s
+Transformer | Step 2030 | Total Loss: 16.1638 | Avg Ppl: 56.88 | Time: 4471s
+Transformer | Step 2040 | Total Loss: 15.7831 | Avg Ppl: 51.72 | Time: 4493s
+Transformer | Step 2050 | Total Loss: 15.4040 | Avg Ppl: 47.04 | Time: 4515s
+Transformer | Step 2060 | Total Loss: 16.4077 | Avg Ppl: 60.46 | Time: 4537s
+Transformer | Step 2070 | Total Loss: 15.9567 | Avg Ppl: 54.01 | Time: 4559s
+Transformer | Step 2080 | Total Loss: 15.9197 | Avg Ppl: 53.51 | Time: 4581s
+Transformer | Step 2090 | Total Loss: 15.9881 | Avg Ppl: 54.44 | Time: 4603s
+Transformer | Step 2100 | Total Loss: 15.9764 | Avg Ppl: 54.28 | Time: 4625s
+Transformer | Step 2110 | Total Loss: 16.2298 | Avg Ppl: 57.83 | Time: 4646s
+Transformer | Step 2120 | Total Loss: 15.9177 | Avg Ppl: 53.49 | Time: 4668s
+Transformer | Step 2130 | Total Loss: 16.0367 | Avg Ppl: 55.10 | Time: 4690s
+Transformer | Step 2140 | Total Loss: 16.3787 | Avg Ppl: 60.02 | Time: 4712s
+Transformer | Step 2150 | Total Loss: 15.8666 | Avg Ppl: 52.81 | Time: 4734s
+Transformer | Step 2160 | Total Loss: 15.8327 | Avg Ppl: 52.36 | Time: 4756s
+Transformer | Step 2170 | Total Loss: 15.5830 | Avg Ppl: 49.19 | Time: 4778s
+Transformer | Step 2180 | Total Loss: 16.1892 | Avg Ppl: 57.24 | Time: 4800s
+Transformer | Step 2190 | Total Loss: 16.2465 | Avg Ppl: 58.07 | Time: 4822s
+Transformer | Step 2200 | Total Loss: 15.8580 | Avg Ppl: 52.69 | Time: 4844s
+Transformer | Step 2210 | Total Loss: 16.3340 | Avg Ppl: 59.35 | Time: 4866s
+Transformer | Step 2220 | Total Loss: 16.0476 | Avg Ppl: 55.25 | Time: 4888s
+Transformer | Step 2230 | Total Loss: 16.0762 | Avg Ppl: 55.65 | Time: 4909s
+🏁 Epoch 6/10
+Transformer | Step 2240 | Total Loss: 15.7965 | Avg Ppl: 51.89 | Time: 4932s
+Transformer | Step 2250 | Total Loss: 15.6270 | Avg Ppl: 49.74 | Time: 4955s
+Transformer | Step 2260 | Total Loss: 15.7259 | Avg Ppl: 50.98 | Time: 4977s
+Transformer | Step 2270 | Total Loss: 15.8324 | Avg Ppl: 52.36 | Time: 4999s
+Transformer | Step 2280 | Total Loss: 15.6894 | Avg Ppl: 50.52 | Time: 5021s
+Transformer | Step 2290 | Total Loss: 15.7111 | Avg Ppl: 50.79 | Time: 5043s
+Transformer | Step 2300 | Total Loss: 15.8019 | Avg Ppl: 51.96 | Time: 5065s
+Transformer | Step 2310 | Total Loss: 15.5464 | Avg Ppl: 48.75 | Time: 5087s
+Transformer | Step 2320 | Total Loss: 16.3015 | Avg Ppl: 58.87 | Time: 5109s
+Transformer | Step 2330 | Total Loss: 15.4530 | Avg Ppl: 47.62 | Time: 5131s
+Transformer | Step 2340 | Total Loss: 15.2801 | Avg Ppl: 45.61 | Time: 5153s
+Transformer | Step 2350 | Total Loss: 16.0704 | Avg Ppl: 55.57 | Time: 5175s
+Transformer | Step 2360 | Total Loss: 16.1216 | Avg Ppl: 56.28 | Time: 5197s
+Transformer | Step 2370 | Total Loss: 15.6528 | Avg Ppl: 50.06 | Time: 5219s
+Transformer | Step 2380 | Total Loss: 15.8183 | Avg Ppl: 52.17 | Time: 5240s
+Transformer | Step 2390 | Total Loss: 16.0047 | Avg Ppl: 54.66 | Time: 5262s
+Transformer | Step 2400 | Total Loss: 15.9091 | Avg Ppl: 53.37 | Time: 5284s
+Transformer | Step 2410 | Total Loss: 15.1149 | Avg Ppl: 43.76 | Time: 5306s
+Transformer | Step 2420 | Total Loss: 15.6874 | Avg Ppl: 50.49 | Time: 5328s
+Transformer | Step 2430 | Total Loss: 15.4766 | Avg Ppl: 47.90 | Time: 5350s
+Transformer | Step 2440 | Total Loss: 15.8750 | Avg Ppl: 52.92 | Time: 5372s
+Transformer | Step 2450 | Total Loss: 16.0719 | Avg Ppl: 55.59 | Time: 5394s
+Transformer | Step 2460 | Total Loss: 15.8263 | Avg Ppl: 52.28 | Time: 5416s
+Transformer | Step 2470 | Total Loss: 15.8007 | Avg Ppl: 51.94 | Time: 5438s
+Transformer | Step 2480 | Total Loss: 15.6820 | Avg Ppl: 50.43 | Time: 5460s
+Transformer | Step 2490 | Total Loss: 15.4420 | Avg Ppl: 47.49 | Time: 5482s
+Transformer | Step 2500 | Total Loss: 15.9696 | Avg Ppl: 54.18 | Time: 5505s
+Transformer | Step 2510 | Total Loss: 16.1036 | Avg Ppl: 56.03 | Time: 5527s
+Transformer | Step 2520 | Total Loss: 15.8473 | Avg Ppl: 52.55 | Time: 5549s
+Transformer | Step 2530 | Total Loss: 15.8490 | Avg Ppl: 52.57 | Time: 5570s
+Transformer | Step 2540 | Total Loss: 16.1766 | Avg Ppl: 57.06 | Time: 5592s
+Transformer | Step 2550 | Total Loss: 16.3468 | Avg Ppl: 59.54 | Time: 5614s
+Transformer | Step 2560 | Total Loss: 15.5060 | Avg Ppl: 48.26 | Time: 5636s
+Transformer | Step 2570 | Total Loss: 15.7254 | Avg Ppl: 50.98 | Time: 5658s
+Transformer | Step 2580 | Total Loss: 15.8854 | Avg Ppl: 53.06 | Time: 5680s
+Transformer | Step 2590 | Total Loss: 16.0170 | Avg Ppl: 54.83 | Time: 5702s
+Transformer | Step 2600 | Total Loss: 15.3955 | Avg Ppl: 46.94 | Time: 5724s
+Transformer | Step 2610 | Total Loss: 15.4010 | Avg Ppl: 47.00 | Time: 5747s
+Transformer | Step 2620 | Total Loss: 15.9617 | Avg Ppl: 54.08 | Time: 5769s
+Transformer | Step 2630 | Total Loss: 15.6452 | Avg Ppl: 49.96 | Time: 5790s
+Transformer | Step 2640 | Total Loss: 15.2192 | Avg Ppl: 44.92 | Time: 5812s
+Transformer | Step 2650 | Total Loss: 15.6818 | Avg Ppl: 50.42 | Time: 5834s
+Transformer | Step 2660 | Total Loss: 15.4028 | Avg Ppl: 47.03 | Time: 5856s
+Transformer | Step 2670 | Total Loss: 16.1030 | Avg Ppl: 56.02 | Time: 5878s
+🏁 Epoch 7/10
+Transformer | Step 2680 | Total Loss: 15.5005 | Avg Ppl: 48.19 | Time: 5901s
+Transformer | Step 2690 | Total Loss: 15.2873 | Avg Ppl: 45.69 | Time: 5923s
+Transformer | Step 2700 | Total Loss: 15.9707 | Avg Ppl: 54.20 | Time: 5945s
+Transformer | Step 2710 | Total Loss: 16.0208 | Avg Ppl: 54.88 | Time: 5967s
+Transformer | Step 2720 | Total Loss: 15.5997 | Avg Ppl: 49.40 | Time: 5988s
+Transformer | Step 2730 | Total Loss: 15.5481 | Avg Ppl: 48.77 | Time: 6010s
+Transformer | Step 2740 | Total Loss: 15.8135 | Avg Ppl: 52.11 | Time: 6032s
+Transformer | Step 2750 | Total Loss: 15.4412 | Avg Ppl: 47.48 | Time: 6054s
+Transformer | Step 2760 | Total Loss: 15.7225 | Avg Ppl: 50.94 | Time: 6076s
+Transformer | Step 2770 | Total Loss: 15.6212 | Avg Ppl: 49.67 | Time: 6098s
+Transformer | Step 2780 | Total Loss: 15.6216 | Avg Ppl: 49.67 | Time: 6120s
+Transformer | Step 2790 | Total Loss: 15.3312 | Avg Ppl: 46.19 | Time: 6142s
+Transformer | Step 2800 | Total Loss: 15.4037 | Avg Ppl: 47.04 | Time: 6164s
+Transformer | Step 2810 | Total Loss: 15.6042 | Avg Ppl: 49.45 | Time: 6186s
+Transformer | Step 2820 | Total Loss: 14.9107 | Avg Ppl: 41.58 | Time: 6208s
+Transformer | Step 2830 | Total Loss: 16.0882 | Avg Ppl: 55.81 | Time: 6230s
+Transformer | Step 2840 | Total Loss: 15.3615 | Avg Ppl: 46.54 | Time: 6252s
+Transformer | Step 2850 | Total Loss: 15.3676 | Avg Ppl: 46.61 | Time: 6274s
+Transformer | Step 2860 | Total Loss: 15.6069 | Avg Ppl: 49.49 | Time: 6296s
+Transformer | Step 2870 | Total Loss: 15.9106 | Avg Ppl: 53.39 | Time: 6318s
+Transformer | Step 2880 | Total Loss: 15.6622 | Avg Ppl: 50.18 | Time: 6340s
+Transformer | Step 2890 | Total Loss: 15.6210 | Avg Ppl: 49.66 | Time: 6362s
+Transformer | Step 2900 | Total Loss: 16.0574 | Avg Ppl: 55.39 | Time: 6384s
+Transformer | Step 2910 | Total Loss: 15.6055 | Avg Ppl: 49.47 | Time: 6405s
+Transformer | Step 2920 | Total Loss: 15.2459 | Avg Ppl: 45.22 | Time: 6427s
+Transformer | Step 2930 | Total Loss: 15.6509 | Avg Ppl: 50.03 | Time: 6449s
+Transformer | Step 2940 | Total Loss: 15.2112 | Avg Ppl: 44.83 | Time: 6471s
+Transformer | Step 2950 | Total Loss: 15.9237 | Avg Ppl: 53.57 | Time: 6493s
+Transformer | Step 2960 | Total Loss: 15.3565 | Avg Ppl: 46.48 | Time: 6515s
+Transformer | Step 2970 | Total Loss: 15.5408 | Avg Ppl: 48.68 | Time: 6537s
+Transformer | Step 2980 | Total Loss: 15.3909 | Avg Ppl: 46.89 | Time: 6559s
+Transformer | Step 2990 | Total Loss: 15.7927 | Avg Ppl: 51.84 | Time: 6581s
+Transformer | Step 3000 | Total Loss: 15.6997 | Avg Ppl: 50.65 | Time: 6603s
+Transformer | Step 3010 | Total Loss: 15.9159 | Avg Ppl: 53.46 | Time: 6625s
+Transformer | Step 3020 | Total Loss: 15.6738 | Avg Ppl: 50.32 | Time: 6647s
+Transformer | Step 3030 | Total Loss: 16.1081 | Avg Ppl: 56.09 | Time: 6669s
+Transformer | Step 3040 | Total Loss: 15.5604 | Avg Ppl: 48.92 | Time: 6691s
+Transformer | Step 3050 | Total Loss: 15.6331 | Avg Ppl: 49.81 | Time: 6713s
+Transformer | Step 3060 | Total Loss: 15.5176 | Avg Ppl: 48.40 | Time: 6734s
+Transformer | Step 3070 | Total Loss: 15.4545 | Avg Ppl: 47.64 | Time: 6756s
+Transformer | Step 3080 | Total Loss: 15.5978 | Avg Ppl: 49.38 | Time: 6778s
+Transformer | Step 3090 | Total Loss: 15.5244 | Avg Ppl: 48.48 | Time: 6800s
+Transformer | Step 3100 | Total Loss: 15.5141 | Avg Ppl: 48.35 | Time: 6822s
+Transformer | Step 3110 | Total Loss: 15.7131 | Avg Ppl: 50.82 | Time: 6844s
+Transformer | Step 3120 | Total Loss: 15.5476 | Avg Ppl: 48.76 | Time: 6866s
+🏁 Epoch 8/10
+Transformer | Step 3130 | Total Loss: 15.8592 | Avg Ppl: 52.71 | Time: 6889s
+Transformer | Step 3140 | Total Loss: 14.6626 | Avg Ppl: 39.08 | Time: 6911s
+Transformer | Step 3150 | Total Loss: 15.2391 | Avg Ppl: 45.14 | Time: 6933s
+Transformer | Step 3160 | Total Loss: 15.4597 | Avg Ppl: 47.70 | Time: 6954s
+Transformer | Step 3170 | Total Loss: 15.4554 | Avg Ppl: 47.65 | Time: 6976s
+Transformer | Step 3180 | Total Loss: 15.7686 | Avg Ppl: 51.53 | Time: 6998s
+Transformer | Step 3190 | Total Loss: 15.7541 | Avg Ppl: 51.34 | Time: 7020s
+Transformer | Step 3200 | Total Loss: 15.4604 | Avg Ppl: 47.71 | Time: 7042s
+Transformer | Step 3210 | Total Loss: 15.6942 | Avg Ppl: 50.58 | Time: 7064s
+Transformer | Step 3220 | Total Loss: 15.3126 | Avg Ppl: 45.98 | Time: 7086s
+Transformer | Step 3230 | Total Loss: 15.5354 | Avg Ppl: 48.61 | Time: 7108s
+Transformer | Step 3240 | Total Loss: 15.0309 | Avg Ppl: 42.85 | Time: 7130s
+Transformer | Step 3250 | Total Loss: 15.5607 | Avg Ppl: 48.92 | Time: 7152s
+Transformer | Step 3260 | Total Loss: 15.5713 | Avg Ppl: 49.05 | Time: 7173s
+Transformer | Step 3270 | Total Loss: 15.0808 | Avg Ppl: 43.39 | Time: 7195s
+Transformer | Step 3280 | Total Loss: 15.1784 | Avg Ppl: 44.46 | Time: 7217s
+Transformer | Step 3290 | Total Loss: 15.3002 | Avg Ppl: 45.84 | Time: 7239s
+Transformer | Step 3300 | Total Loss: 15.4238 | Avg Ppl: 47.27 | Time: 7261s
+Transformer | Step 3310 | Total Loss: 15.8528 | Avg Ppl: 52.63 | Time: 7283s
+Transformer | Step 3320 | Total Loss: 15.5626 | Avg Ppl: 48.94 | Time: 7306s
+Transformer | Step 3330 | Total Loss: 15.5335 | Avg Ppl: 48.59 | Time: 7328s
+Transformer | Step 3340 | Total Loss: 15.9897 | Avg Ppl: 54.46 | Time: 7350s
+Transformer | Step 3350 | Total Loss: 15.8516 | Avg Ppl: 52.61 | Time: 7371s
+Transformer | Step 3360 | Total Loss: 15.6672 | Avg Ppl: 50.24 | Time: 7393s
+Transformer | Step 3370 | Total Loss: 15.4137 | Avg Ppl: 47.15 | Time: 7415s
+Transformer | Step 3380 | Total Loss: 15.5526 | Avg Ppl: 48.82 | Time: 7437s
+Transformer | Step 3390 | Total Loss: 15.5376 | Avg Ppl: 48.64 | Time: 7459s
+Transformer | Step 3400 | Total Loss: 15.8279 | Avg Ppl: 52.30 | Time: 7481s
+Transformer | Step 3410 | Total Loss: 15.6384 | Avg Ppl: 49.88 | Time: 7503s
+Transformer | Step 3420 | Total Loss: 15.5851 | Avg Ppl: 49.22 | Time: 7525s
+Transformer | Step 3430 | Total Loss: 15.7940 | Avg Ppl: 51.86 | Time: 7547s
+Transformer | Step 3440 | Total Loss: 15.3164 | Avg Ppl: 46.02 | Time: 7569s
+Transformer | Step 3450 | Total Loss: 15.2411 | Avg Ppl: 45.16 | Time: 7591s
+Transformer | Step 3460 | Total Loss: 15.7254 | Avg Ppl: 50.98 | Time: 7613s
+Transformer | Step 3470 | Total Loss: 15.2714 | Avg Ppl: 45.51 | Time: 7634s
+Transformer | Step 3480 | Total Loss: 15.6579 | Avg Ppl: 50.12 | Time: 7656s
+Transformer | Step 3490 | Total Loss: 15.2806 | Avg Ppl: 45.61 | Time: 7678s
+Transformer | Step 3500 | Total Loss: 16.1967 | Avg Ppl: 57.35 | Time: 7700s
+Transformer | Step 3510 | Total Loss: 16.0591 | Avg Ppl: 55.41 | Time: 7722s
+Transformer | Step 3520 | Total Loss: 15.8943 | Avg Ppl: 53.17 | Time: 7744s
+Transformer | Step 3530 | Total Loss: 15.5708 | Avg Ppl: 49.04 | Time: 7766s
+Transformer | Step 3540 | Total Loss: 15.5322 | Avg Ppl: 48.57 | Time: 7788s
+Transformer | Step 3550 | Total Loss: 15.5465 | Avg Ppl: 48.75 | Time: 7810s
+Transformer | Step 3560 | Total Loss: 15.6068 | Avg Ppl: 49.49 | Time: 7832s
+🏁 Epoch 9/10
+Transformer | Step 3570 | Total Loss: 15.4563 | Avg Ppl: 47.66 | Time: 7854s
+Transformer | Step 3580 | Total Loss: 15.7067 | Avg Ppl: 50.74 | Time: 7876s
+Transformer | Step 3590 | Total Loss: 15.3375 | Avg Ppl: 46.26 | Time: 7898s
+Transformer | Step 3600 | Total Loss: 15.0320 | Avg Ppl: 42.86 | Time: 7920s
+Transformer | Step 3610 | Total Loss: 15.6301 | Avg Ppl: 49.78 | Time: 7942s
+Transformer | Step 3620 | Total Loss: 15.5286 | Avg Ppl: 48.53 | Time: 7964s
+Transformer | Step 3630 | Total Loss: 15.3976 | Avg Ppl: 46.97 | Time: 7986s
+Transformer | Step 3640 | Total Loss: 15.3245 | Avg Ppl: 46.11 | Time: 8008s
+Transformer | Step 3650 | Total Loss: 15.5097 | Avg Ppl: 48.30 | Time: 8030s
+Transformer | Step 3660 | Total Loss: 15.5201 | Avg Ppl: 48.43 | Time: 8051s
+Transformer | Step 3670 | Total Loss: 15.6163 | Avg Ppl: 49.60 | Time: 8073s
+Transformer | Step 3680 | Total Loss: 15.8082 | Avg Ppl: 52.04 | Time: 8095s
+Transformer | Step 3690 | Total Loss: 15.6404 | Avg Ppl: 49.90 | Time: 8117s
+Transformer | Step 3700 | Total Loss: 15.6978 | Avg Ppl: 50.63 | Time: 8139s
+Transformer | Step 3710 | Total Loss: 15.6486 | Avg Ppl: 50.01 | Time: 8161s
+Transformer | Step 3720 | Total Loss: 14.9818 | Avg Ppl: 42.33 | Time: 8183s
+Transformer | Step 3730 | Total Loss: 15.7752 | Avg Ppl: 51.61 | Time: 8205s
+Transformer | Step 3740 | Total Loss: 15.8250 | Avg Ppl: 52.26 | Time: 8227s
+Transformer | Step 3750 | Total Loss: 15.4566 | Avg Ppl: 47.66 | Time: 8249s
+Transformer | Step 3760 | Total Loss: 15.0559 | Avg Ppl: 43.12 | Time: 8271s
+Transformer | Step 3770 | Total Loss: 15.5202 | Avg Ppl: 48.43 | Time: 8292s
+Transformer | Step 3780 | Total Loss: 15.4208 | Avg Ppl: 47.24 | Time: 8314s
+Transformer | Step 3790 | Total Loss: 16.0534 | Avg Ppl: 55.33 | Time: 8336s
+Transformer | Step 3800 | Total Loss: 15.7938 | Avg Ppl: 51.86 | Time: 8358s
+Transformer | Step 3810 | Total Loss: 15.8082 | Avg Ppl: 52.04 | Time: 8380s
+Transformer | Step 3820 | Total Loss: 15.6675 | Avg Ppl: 50.24 | Time: 8402s
+Transformer | Step 3830 | Total Loss: 16.0429 | Avg Ppl: 55.19 | Time: 8424s
+Transformer | Step 3840 | Total Loss: 15.3061 | Avg Ppl: 45.90 | Time: 8446s
+Transformer | Step 3850 | Total Loss: 15.1406 | Avg Ppl: 44.04 | Time: 8468s
+Transformer | Step 3860 | Total Loss: 15.4946 | Avg Ppl: 48.12 | Time: 8490s
+Transformer | Step 3870 | Total Loss: 15.1202 | Avg Ppl: 43.82 | Time: 8512s
+Transformer | Step 3880 | Total Loss: 14.5000 | Avg Ppl: 37.52 | Time: 8534s
+Transformer | Step 3890 | Total Loss: 14.9563 | Avg Ppl: 42.06 | Time: 8556s
+Transformer | Step 3900 | Total Loss: 14.8888 | Avg Ppl: 41.36 | Time: 8578s
+Transformer | Step 3910 | Total Loss: 15.1996 | Avg Ppl: 44.70 | Time: 8600s
+Transformer | Step 3920 | Total Loss: 15.4593 | Avg Ppl: 47.70 | Time: 8622s
+Transformer | Step 3930 | Total Loss: 15.3679 | Avg Ppl: 46.62 | Time: 8644s
+Transformer | Step 3940 | Total Loss: 15.8614 | Avg Ppl: 52.74 | Time: 8666s
+Transformer | Step 3950 | Total Loss: 15.4883 | Avg Ppl: 48.04 | Time: 8688s
+Transformer | Step 3960 | Total Loss: 15.8134 | Avg Ppl: 52.11 | Time: 8710s
+Transformer | Step 3970 | Total Loss: 15.4607 | Avg Ppl: 47.71 | Time: 8732s
+Transformer | Step 3980 | Total Loss: 15.4624 | Avg Ppl: 47.73 | Time: 8754s
+Transformer | Step 3990 | Total Loss: 15.2450 | Avg Ppl: 45.21 | Time: 8776s
+Transformer | Step 4000 | Total Loss: 15.8874 | Avg Ppl: 53.08 | Time: 8798s
+Transformer | Step 4010 | Total Loss: 15.5663 | Avg Ppl: 48.99 | Time: 8820s
+🏁 Epoch 10/10
+Transformer | Step 4020 | Total Loss: 15.1486 | Avg Ppl: 44.13 | Time: 8843s
+Transformer | Step 4030 | Total Loss: 15.5622 | Avg Ppl: 48.94 | Time: 8865s
+Transformer | Step 4040 | Total Loss: 15.8706 | Avg Ppl: 52.86 | Time: 8887s
+Transformer | Step 4050 | Total Loss: 14.9940 | Avg Ppl: 42.46 | Time: 8910s
+Transformer | Step 4060 | Total Loss: 15.3520 | Avg Ppl: 46.43 | Time: 8933s
+Transformer | Step 4070 | Total Loss: 15.4141 | Avg Ppl: 47.16 | Time: 8955s
+Transformer | Step 4080 | Total Loss: 15.6085 | Avg Ppl: 49.51 | Time: 8977s
+Transformer | Step 4090 | Total Loss: 15.5863 | Avg Ppl: 49.23 | Time: 8999s
+Transformer | Step 4100 | Total Loss: 15.1866 | Avg Ppl: 44.55 | Time: 9021s
+Transformer | Step 4110 | Total Loss: 15.6534 | Avg Ppl: 50.07 | Time: 9043s
+Transformer | Step 4120 | Total Loss: 15.3199 | Avg Ppl: 46.06 | Time: 9065s
+Transformer | Step 4130 | Total Loss: 15.1451 | Avg Ppl: 44.09 | Time: 9088s
+Transformer | Step 4140 | Total Loss: 15.2625 | Avg Ppl: 45.41 | Time: 9110s
+Transformer | Step 4150 | Total Loss: 15.3858 | Avg Ppl: 46.83 | Time: 9132s
+Transformer | Step 4160 | Total Loss: 15.8724 | Avg Ppl: 52.88 | Time: 9155s
+Transformer | Step 4170 | Total Loss: 15.0802 | Avg Ppl: 43.38 | Time: 9178s
+Transformer | Step 4180 | Total Loss: 15.0400 | Avg Ppl: 42.95 | Time: 9200s
+Transformer | Step 4190 | Total Loss: 15.4061 | Avg Ppl: 47.06 | Time: 9223s
+Transformer | Step 4200 | Total Loss: 15.5306 | Avg Ppl: 48.55 | Time: 9245s
+Transformer | Step 4210 | Total Loss: 15.6244 | Avg Ppl: 49.70 | Time: 9268s
+Transformer | Step 4220 | Total Loss: 15.2296 | Avg Ppl: 45.03 | Time: 9290s
+Transformer | Step 4230 | Total Loss: 15.3460 | Avg Ppl: 46.36 | Time: 9312s
+Transformer | Step 4240 | Total Loss: 15.3640 | Avg Ppl: 46.57 | Time: 9334s
+Transformer | Step 4250 | Total Loss: 15.4192 | Avg Ppl: 47.22 | Time: 9356s
+Transformer | Step 4260 | Total Loss: 15.6260 | Avg Ppl: 49.72 | Time: 9378s
+Transformer | Step 4270 | Total Loss: 15.0556 | Avg Ppl: 43.12 | Time: 9400s
+Transformer | Step 4280 | Total Loss: 15.6871 | Avg Ppl: 50.49 | Time: 9422s
+Transformer | Step 4290 | Total Loss: 15.5814 | Avg Ppl: 49.17 | Time: 9444s
+Transformer | Step 4300 | Total Loss: 15.8228 | Avg Ppl: 52.23 | Time: 9466s
+Transformer | Step 4310 | Total Loss: 15.3170 | Avg Ppl: 46.03 | Time: 9488s
+Transformer | Step 4320 | Total Loss: 15.1964 | Avg Ppl: 44.66 | Time: 9510s
+Transformer | Step 4330 | Total Loss: 15.8151 | Avg Ppl: 52.13 | Time: 9532s
+Transformer | Step 4340 | Total Loss: 15.1996 | Avg Ppl: 44.70 | Time: 9554s
+Transformer | Step 4350 | Total Loss: 15.6368 | Avg Ppl: 49.86 | Time: 9576s
+Transformer | Step 4360 | Total Loss: 15.3634 | Avg Ppl: 46.57 | Time: 9598s
+Transformer | Step 4370 | Total Loss: 15.4073 | Avg Ppl: 47.08 | Time: 9620s
+Transformer | Step 4380 | Total Loss: 15.1560 | Avg Ppl: 44.21 | Time: 9642s
+Transformer | Step 4390 | Total Loss: 15.6771 | Avg Ppl: 50.36 | Time: 9664s
+Transformer | Step 4400 | Total Loss: 15.4443 | Avg Ppl: 47.52 | Time: 9686s
+Transformer | Step 4410 | Total Loss: 15.4279 | Avg Ppl: 47.32 | Time: 9708s
+Transformer | Step 4420 | Total Loss: 16.1369 | Avg Ppl: 56.50 | Time: 9730s
+Transformer | Step 4430 | Total Loss: 15.4819 | Avg Ppl: 47.97 | Time: 9752s
+Transformer | Step 4440 | Total Loss: 15.2771 | Avg Ppl: 45.57 | Time: 9775s
+Transformer | Step 4450 | Total Loss: 14.9959 | Avg Ppl: 42.48 | Time: 9798s
+Transformer | Step 4460 | Total Loss: 15.7339 | Avg Ppl: 51.08 | Time: 9820s

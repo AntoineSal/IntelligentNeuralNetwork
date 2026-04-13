@@ -1,0 +1,435 @@
+
+"""
+Top-Tier Paper Benchmark: Efficient Audio Modeling
+==================================================
+Comparaison rigoureuse "Iso-Parameter" (~4.2M) entre :
+1. INN (Intelligent Neural Network) - Ours
+2. WaveNet (Causal Dilated Convolutions) - Baseline SOTA Efficiency
+3. Transformer (Attention Only) - Baseline SOTA Generalist
+
+Task: Discrete Audio Token Modeling (LibriSpeech -> EnCodec)
+Metric: Bits per Dimension (BPD) & Perplexity (Ppl)
+"""
+
+import os
+import time
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import torchaudio
+import soundfile as sf
+import glob
+import pandas as pd
+from torch.utils.data import DataLoader, Dataset
+from transformers import EncodecModel, AutoProcessor
+
+# ==============================================================================
+# CONFIGURATION SCIENTIFIQUE
+# ==============================================================================
+CONFIG = {
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "sample_rate": 24000,
+    "vocab_size": 1024,
+    "seq_len": 600,       # Context Length
+    "batch_size": 64,     # A100 optimized
+    "epochs": 20,         # Long run for convergence analysis
+    "lr": 5e-4,           # Standard AdamW LR
+    "seed": 42,
+    "target_params": 4_200_000, # La cible pour l'équité
+    "log_dir": "./benchmark_logs"
+}
+
+if not os.path.exists(CONFIG["log_dir"]):
+    os.makedirs(CONFIG["log_dir"])
+
+# ==============================================================================
+# 1. INN ARCHITECTURE (Ours)
+# ==============================================================================
+class INN_Neuron(nn.Module):
+    def __init__(self, d_model, d_rnn, n_heads):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.norm = nn.LayerNorm(d_model)
+        self.lstm = nn.LSTMCell(d_model, d_rnn)
+        self.out_proj = nn.Linear(d_rnn, d_model)
+
+    def forward(self, x, hidden_state):
+        hx, cx = hidden_state
+        hx_new, cx_new = self.lstm(x, (hx, cx))
+        return self.out_proj(hx_new), (hx_new, cx_new)
+
+class INN_Model(nn.Module):
+    def __init__(self, vocab_size, d_model, n_neurons, d_rnn, n_heads):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.neurons = nn.ModuleList([INN_Neuron(d_model, d_rnn, n_heads) for _ in range(n_neurons)])
+        # Attention Mixer (The secret sauce)
+        self.mixer_attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.norm_mix = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size)
+
+        self.n_neurons = n_neurons
+        self.d_rnn = d_rnn
+
+    def init_states(self, batch_size, device):
+        return [(torch.zeros(batch_size, self.d_rnn, device=device),
+                 torch.zeros(batch_size, self.d_rnn, device=device))
+                for _ in range(self.n_neurons)]
+
+    def forward(self, x):
+        # x: (batch, seq_len)
+        batch_size, seq_len = x.size()
+        x_emb = self.embedding(x).transpose(0, 1) # (seq, batch, d_model)
+
+        states = self.init_states(batch_size, x.device)
+        logits_seq = []
+
+        for t in range(seq_len):
+            xt = x_emb[t]
+            neuron_outputs = []
+            new_states = []
+            for i, neuron in enumerate(self.neurons):
+                out, state = neuron(xt, states[i])
+                neuron_outputs.append(out)
+                new_states.append(state)
+            states = new_states
+
+            # Attention Mixing
+            neuron_stack = torch.stack(neuron_outputs, dim=1) # (batch, n_neurons, d_model)
+            query = xt.unsqueeze(1)
+            attn_out, _ = self.mixer_attn(query, neuron_stack, neuron_stack)
+            mixed = self.norm_mix(attn_out.squeeze(1) + xt)
+            logits_seq.append(self.head(mixed))
+
+        return torch.stack(logits_seq, dim=1)
+
+# ==============================================================================
+# 2. WAVENET ARCHITECTURE (Baseline 1 - Corrected Causal Padding)
+# ==============================================================================
+class CausalConv1d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation=1):
+        super().__init__()
+        self.padding = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, padding=0, dilation=dilation)
+
+    def forward(self, x):
+        # Explicit Left Padding for strict causality
+        # x: (batch, channels, time)
+        if self.padding > 0:
+            x = F.pad(x, (self.padding, 0)) # (Left, Right)
+        return self.conv(x)
+
+class ResidualBlock(nn.Module):
+    def __init__(self, res_channels, skip_channels, dilation):
+        super().__init__()
+        self.filter_conv = CausalConv1d(res_channels, res_channels, 2, dilation)
+        self.gate_conv = CausalConv1d(res_channels, res_channels, 2, dilation)
+        self.res_conv = nn.Conv1d(res_channels, res_channels, 1)
+        self.skip_conv = nn.Conv1d(res_channels, skip_channels, 1)
+
+    def forward(self, x):
+        filter_out = torch.tanh(self.filter_conv(x))
+        gate_out = torch.sigmoid(self.gate_conv(x))
+        x_gated = filter_out * gate_out
+        res_out = self.res_conv(x_gated)
+        skip_out = self.skip_conv(x_gated)
+        return (x + res_out) * math.sqrt(0.5), skip_out
+
+class WaveNet_Model(nn.Module):
+    def __init__(self, vocab_size, d_model, n_layers, n_blocks):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+
+        # Stacks of dilated convs
+        self.layers = nn.ModuleList()
+        # To match params, we use d_model as residual channels
+        for _ in range(n_blocks):
+            for i in range(n_layers):
+                dilation = 2 ** i
+                self.layers.append(ResidualBlock(d_model, d_model, dilation))
+
+        self.end_conv_1 = nn.Conv1d(d_model, d_model, 1)
+        self.end_conv_2 = nn.Conv1d(d_model, vocab_size, 1)
+
+    def forward(self, x):
+        # x: (batch, seq_len)
+        x = self.embedding(x).transpose(1, 2) # (batch, d_model, seq_len)
+
+        skip_connections = []
+        for layer in self.layers:
+            x, skip = layer(x)
+            skip_connections.append(skip)
+
+        out = sum(skip_connections)
+        out = F.relu(out)
+        out = F.relu(self.end_conv_1(out))
+        logits = self.end_conv_2(out)
+
+        return logits.transpose(1, 2) # (batch, seq_len, vocab)
+
+# ==============================================================================
+# 3. TRANSFORMER ARCHITECTURE (Baseline 2 - Generalist King)
+# ==============================================================================
+class Transformer_Model(nn.Module):
+    def __init__(self, vocab_size, d_model, n_head, n_layers):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_encoder = nn.Parameter(torch.zeros(1, 1024, d_model))
+
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_head, batch_first=True, dim_feedforward=d_model*4)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.head = nn.Linear(d_model, vocab_size)
+
+    def forward(self, x):
+        seq_len = x.size(1)
+        mask = torch.triu(torch.ones(seq_len, seq_len) * float('-inf'), diagonal=1).to(x.device)
+        x = self.embedding(x) + self.pos_encoder[:, :seq_len, :]
+        x = self.transformer(x, mask=mask, is_causal=True)
+        return self.head(x)
+
+# ==============================================================================
+# DATASET & UTILS
+# ==============================================================================
+class LibriSpeechTokenized(Dataset):
+    def __init__(self, root, url="dev-clean"):
+        self.files = sorted(glob.glob(os.path.join(root, "LibriSpeech", url, "**", "*.flac"), recursive=True))
+        if len(self.files) == 0:
+            print("Downloading LibriSpeech...")
+            torchaudio.datasets.LIBRISPEECH(root=root, url=url, download=True)
+            self.files = sorted(glob.glob(os.path.join(root, "LibriSpeech", url, "**", "*.flac"), recursive=True))
+        self.resampler = torchaudio.transforms.Resample(orig_freq=16000, new_freq=CONFIG["sample_rate"])
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        try:
+            wav, sr = sf.read(self.files[idx])
+            waveform = torch.from_numpy(wav).float()
+            if waveform.ndim == 1: waveform = waveform.unsqueeze(0)
+            else: waveform = waveform.t()
+            return self.resampler(waveform)
+        except: return torch.zeros(1, CONFIG["sample_rate"])
+
+class AudioTokenizer:
+    def __init__(self, device):
+        self.device = device # FIX: Store device
+        self.model = EncodecModel.from_pretrained("facebook/encodec_24khz").to(device)
+        self.processor = AutoProcessor.from_pretrained("facebook/encodec_24khz")
+        self.model.eval()
+
+    @torch.no_grad()
+    def encode(self, waveform):
+        raw_audio = [w.squeeze(0).cpu().numpy() for w in waveform]
+        inputs = self.processor(raw_audio=raw_audio, sampling_rate=CONFIG["sample_rate"], return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        outputs = self.model.encode(**inputs)
+        raw_codes = outputs.audio_codes[0]
+        if raw_codes.ndim == 4: raw_codes = raw_codes.squeeze(0)
+        return raw_codes[:, 0, :]
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+# ==============================================================================
+# MAIN BENCHMARK LOOP
+# ==============================================================================
+def run_benchmark(model_name, model, dl, tokenizer):
+    print(f"\n🥊 STARTING BENCHMARK: {model_name}")
+    print(f"📊 Parameters: {count_parameters(model):,}")
+
+    model = model.to(CONFIG["device"])
+    optimizer = optim.AdamW(model.parameters(), lr=CONFIG["lr"])
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG["epochs"] * len(dl))
+    criterion = nn.CrossEntropyLoss()
+
+    stats = []
+    start_time = time.time()
+    step = 0
+
+    model.train()
+
+    for epoch in range(CONFIG["epochs"]):
+        for batch_waves in dl:
+            batch_waves = batch_waves.to(CONFIG["device"])
+            with torch.no_grad():
+                tokens = tokenizer.encode(batch_waves)
+
+            if tokens.size(1) > CONFIG["seq_len"]: tokens = tokens[:, :CONFIG["seq_len"]]
+            inputs, targets = tokens[:, :-1], tokens[:, 1:]
+            if inputs.size(1) < 10: continue
+
+            optimizer.zero_grad()
+            logits = model(inputs)
+            loss = criterion(logits.reshape(-1, CONFIG["vocab_size"]), targets.reshape(-1))
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+
+            step += 1
+            if step % 50 == 0:
+                ppl = math.exp(loss.item())
+                bits_per_token = loss.item() / math.log(2)
+                elapsed = time.time() - start_time
+                print(f"{model_name} | Step {step} | Loss: {loss.item():.4f} | Ppl: {ppl:.2f} | Bits/Tok: {bits_per_token:.3f} | Time: {elapsed:.0f}s")
+                stats.append({
+                    "model": model_name,
+                    "step": step,
+                    "loss": loss.item(),
+                    "ppl": ppl,
+                    "bits_per_token": bits_per_token,
+                    "time": elapsed
+                })
+
+    # Save Model
+    torch.save(model.state_dict(), f"{CONFIG['log_dir']}/{model_name}_final.pt")
+    return stats
+
+def main():
+    print("🚀 LAUNCHING TOP-TIER AUDIO BENCHMARK (ISO-PARAMS ~4.2M)")
+
+    tokenizer = AudioTokenizer(CONFIG["device"])
+    ds = LibriSpeechTokenized(root="./librispeech_data")
+
+    def collate_fn(batch):
+        max_len = min(max([w.size(-1) for w in batch]), 24000*8)
+        padded = torch.zeros(len(batch), 1, max_len)
+        for i, w in enumerate(batch):
+            sl = min(w.size(-1), max_len)
+            padded[i, :, :sl] = w[:, :sl]
+        return padded
+
+    dl = DataLoader(ds, batch_size=CONFIG["batch_size"], shuffle=True, collate_fn=collate_fn, num_workers=0)
+
+    # --- MODEL SETUP (CALIBRATED FOR ~4.2M PARAMS) ---
+
+    # 1. INN (Reference - Efficient Distributed)
+    # 16 Neurones légers (128 dim). C'est la force de l'INN: plein de petits experts.
+    # Params: 16 * (LSTM(128,128) + Attn(128)) + Mixer(128) + Embed
+    inn_model = INN_Model(
+        vocab_size=CONFIG["vocab_size"], d_model=128, n_neurons=16, d_rnn=128, n_heads=4
+    )
+
+    # 2. WaveNet (Tiny - Deep)
+    # Channels: 128. Depth: 3 blocks of 10 layers = 30 layers total.
+    # C'est très profond mais fin (128 channels).
+    wavenet_model = WaveNet_Model(
+        vocab_size=CONFIG["vocab_size"], d_model=128, n_layers=10, n_blocks=3
+    )
+
+    # 3. Transformer (Tiny - Standard)
+    # d_model=256, n_layers=6.
+    # Architecture classique pour cette taille.
+    transformer_model = Transformer_Model(
+        vocab_size=CONFIG["vocab_size"], d_model=256, n_head=4, n_layers=6
+    )
+
+    models = [
+        ("INN", inn_model),
+        ("WaveNet", wavenet_model),
+        ("Transformer", transformer_model)
+    ]
+
+    all_stats = []
+
+    for name, model in models:
+        stats = run_benchmark(name, model, dl, tokenizer)
+        all_stats.extend(stats)
+
+    # Save CSV
+    df = pd.DataFrame(all_stats)
+    df.to_csv(f"{CONFIG['log_dir']}/benchmark_results.csv", index=False)
+    print("\n✅ Benchmark Complete. Results saved to benchmark_results.csv")
+
+if __name__ == "__main__":
+    main()
+
+
+
+🚀 LAUNCHING TOP-TIER AUDIO BENCHMARK (ISO-PARAMS ~4.2M)
+
+🥊 STARTING BENCHMARK: INN
+📊 Parameters: 3,768,064
+INN | Step 50 | Loss: 3.6962 | Ppl: 40.29 | Bits/Tok: 5.332 | Time: 401s
+INN | Step 100 | Loss: 3.4609 | Ppl: 31.84 | Bits/Tok: 4.993 | Time: 787s
+INN | Step 150 | Loss: 3.2204 | Ppl: 25.04 | Bits/Tok: 4.646 | Time: 1174s
+INN | Step 200 | Loss: 2.9436 | Ppl: 18.98 | Bits/Tok: 4.247 | Time: 1560s
+INN | Step 250 | Loss: 2.7912 | Ppl: 16.30 | Bits/Tok: 4.027 | Time: 1947s
+INN | Step 300 | Loss: 2.8889 | Ppl: 17.97 | Bits/Tok: 4.168 | Time: 2335s
+INN | Step 350 | Loss: 2.8338 | Ppl: 17.01 | Bits/Tok: 4.088 | Time: 2726s
+INN | Step 400 | Loss: 2.8505 | Ppl: 17.30 | Bits/Tok: 4.112 | Time: 3119s
+INN | Step 450 | Loss: 2.7252 | Ppl: 15.26 | Bits/Tok: 3.932 | Time: 3512s
+INN | Step 500 | Loss: 2.7524 | Ppl: 15.68 | Bits/Tok: 3.971 | Time: 3905s
+INN | Step 550 | Loss: 2.9069 | Ppl: 18.30 | Bits/Tok: 4.194 | Time: 4295s
+INN | Step 600 | Loss: 2.8359 | Ppl: 17.05 | Bits/Tok: 4.091 | Time: 4684s
+INN | Step 650 | Loss: 2.5172 | Ppl: 12.39 | Bits/Tok: 3.632 | Time: 5076s
+INN | Step 700 | Loss: 2.7636 | Ppl: 15.86 | Bits/Tok: 3.987 | Time: 5468s
+INN | Step 750 | Loss: 2.8474 | Ppl: 17.24 | Bits/Tok: 4.108 | Time: 5859s
+INN | Step 800 | Loss: 2.5760 | Ppl: 13.14 | Bits/Tok: 3.716 | Time: 6251s
+INN | Step 850 | Loss: 2.7138 | Ppl: 15.09 | Bits/Tok: 3.915 | Time: 6640s
+
+🥊 STARTING BENCHMARK: WaveNet
+📊 Parameters: 3,244,160
+WaveNet | Step 50 | Loss: 3.6087 | Ppl: 36.92 | Bits/Tok: 5.206 | Time: 29s
+WaveNet | Step 100 | Loss: 3.3230 | Ppl: 27.74 | Bits/Tok: 4.794 | Time: 57s
+WaveNet | Step 150 | Loss: 3.0449 | Ppl: 21.01 | Bits/Tok: 4.393 | Time: 85s
+WaveNet | Step 200 | Loss: 2.9965 | Ppl: 20.01 | Bits/Tok: 4.323 | Time: 113s
+WaveNet | Step 250 | Loss: 2.9271 | Ppl: 18.67 | Bits/Tok: 4.223 | Time: 141s
+WaveNet | Step 300 | Loss: 2.8440 | Ppl: 17.18 | Bits/Tok: 4.103 | Time: 169s
+WaveNet | Step 350 | Loss: 2.8755 | Ppl: 17.73 | Bits/Tok: 4.148 | Time: 197s
+WaveNet | Step 400 | Loss: 2.8158 | Ppl: 16.71 | Bits/Tok: 4.062 | Time: 225s
+WaveNet | Step 450 | Loss: 2.6515 | Ppl: 14.18 | Bits/Tok: 3.825 | Time: 253s
+WaveNet | Step 500 | Loss: 2.8725 | Ppl: 17.68 | Bits/Tok: 4.144 | Time: 281s
+WaveNet | Step 550 | Loss: 2.7592 | Ppl: 15.79 | Bits/Tok: 3.981 | Time: 309s
+WaveNet | Step 600 | Loss: 2.6657 | Ppl: 14.38 | Bits/Tok: 3.846 | Time: 337s
+WaveNet | Step 650 | Loss: 2.7912 | Ppl: 16.30 | Bits/Tok: 4.027 | Time: 365s
+WaveNet | Step 700 | Loss: 2.7740 | Ppl: 16.02 | Bits/Tok: 4.002 | Time: 393s
+WaveNet | Step 750 | Loss: 2.9361 | Ppl: 18.84 | Bits/Tok: 4.236 | Time: 421s
+WaveNet | Step 800 | Loss: 2.8260 | Ppl: 16.88 | Bits/Tok: 4.077 | Time: 449s
+WaveNet | Step 850 | Loss: 2.6483 | Ppl: 14.13 | Bits/Tok: 3.821 | Time: 477s
+
+🥊 STARTING BENCHMARK: Transformer
+📊 Parameters: 5,526,016
+Transformer | Step 50 | Loss: 3.2253 | Ppl: 25.16 | Bits/Tok: 4.653 | Time: 26s
+Transformer | Step 100 | Loss: 2.8307 | Ppl: 16.96 | Bits/Tok: 4.084 | Time: 53s
+Transformer | Step 150 | Loss: 2.7454 | Ppl: 15.57 | Bits/Tok: 3.961 | Time: 79s
+Transformer | Step 200 | Loss: 2.5073 | Ppl: 12.27 | Bits/Tok: 3.617 | Time: 106s
+Transformer | Step 250 | Loss: 2.9321 | Ppl: 18.77 | Bits/Tok: 4.230 | Time: 132s
+Transformer | Step 300 | Loss: 2.4515 | Ppl: 11.61 | Bits/Tok: 3.537 | Time: 159s
+Transformer | Step 350 | Loss: 2.7861 | Ppl: 16.22 | Bits/Tok: 4.020 | Time: 185s
+Transformer | Step 400 | Loss: 2.4361 | Ppl: 11.43 | Bits/Tok: 3.515 | Time: 211s
+Transformer | Step 450 | Loss: 2.5679 | Ppl: 13.04 | Bits/Tok: 3.705 | Time: 238s
+Transformer | Step 500 | Loss: 2.5078 | Ppl: 12.28 | Bits/Tok: 3.618 | Time: 264s
+Transformer | Step 550 | Loss: 2.5717 | Ppl: 13.09 | Bits/Tok: 3.710 | Time: 291s
+Transformer | Step 600 | Loss: 2.3771 | Ppl: 10.77 | Bits/Tok: 3.429 | Time: 317s
+Transformer | Step 650 | Loss: 2.6329 | Ppl: 13.91 | Bits/Tok: 3.798 | Time: 344s
+Transformer | Step 700 | Loss: 2.6303 | Ppl: 13.88 | Bits/Tok: 3.795 | Time: 370s
+Transformer | Step 750 | Loss: 2.4633 | Ppl: 11.74 | Bits/Tok: 3.554 | Time: 396s
+Transformer | Step 800 | Loss: 2.5362 | Ppl: 12.63 | Bits/Tok: 3.659 | Time: 423s
+Transformer | Step 850 | Loss: 2.6184 | Ppl: 13.71 | Bits/Tok: 3.778 | Time: 450s
+
+✅ Benchmark Complete. Results saved to benchmark_results.csv
+
+
+🚀 RELAUNCHING TRANSFORMER (ISO-PARAMS ~3.8M)
+📊 New Transformer Params: 3,946,496
+Transformer-4L | Step 50 | Loss: 3.3353 | Ppl: 28.09 | Bits/Tok: 4.812 | Time: 27s
+Transformer-4L | Step 100 | Loss: 2.9127 | Ppl: 18.41 | Bits/Tok: 4.202 | Time: 53s
+Transformer-4L | Step 150 | Loss: 2.8447 | Ppl: 17.20 | Bits/Tok: 4.104 | Time: 79s
+Transformer-4L | Step 200 | Loss: 2.8346 | Ppl: 17.02 | Bits/Tok: 4.089 | Time: 106s
+Transformer-4L | Step 250 | Loss: 2.6847 | Ppl: 14.65 | Bits/Tok: 3.873 | Time: 132s
+Transformer-4L | Step 300 | Loss: 2.9566 | Ppl: 19.23 | Bits/Tok: 4.265 | Time: 158s
+Transformer-4L | Step 350 | Loss: 2.6322 | Ppl: 13.90 | Bits/Tok: 3.797 | Time: 184s
+Transformer-4L | Step 400 | Loss: 2.8590 | Ppl: 17.44 | Bits/Tok: 4.125 | Time: 210s
+Transformer-4L | Step 450 | Loss: 2.5085 | Ppl: 12.29 | Bits/Tok: 3.619 | Time: 236s
+Transformer-4L | Step 500 | Loss: 2.6573 | Ppl: 14.26 | Bits/Tok: 3.834 | Time: 262s
+Transformer-4L | Step 550 | Loss: 2.6285 | Ppl: 13.85 | Bits/Tok: 3.792 | Time: 289s
+Transformer-4L | Step 600 | Loss: 2.4615 | Ppl: 11.72 | Bits/Tok: 3.551 | Time: 315s
+Transformer-4L | Step 650 | Loss: 2.4494 | Ppl: 11.58 | Bits/Tok: 3.534 | Time: 341s
+Transformer-4L | Step 700 | Loss: 2.4633 | Ppl: 11.74 | Bits/Tok: 3.554 | Time: 367s
+Transformer-4L | Step 750 | Loss: 2.7528 | Ppl: 15.69 | Bits/Tok: 3.971 | Time: 393s
+Transformer-4L | Step 800 | Loss: 2.6921 | Ppl: 14.76 | Bits/Tok: 3.884 | Time: 419s
+Transformer-4L | Step 850 | Loss: 2.5921 | Ppl: 13.36 | Bits/Tok: 3.740 | Time: 446s

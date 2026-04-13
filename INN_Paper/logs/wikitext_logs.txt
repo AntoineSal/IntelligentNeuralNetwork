@@ -1,0 +1,1274 @@
+⚠️ Installing mamba-ssm...
+✅ mamba-ssm installed
+✅ datasets already installed
+Device: cuda
+Config: {'dataset': 'wikitext-2', 'd_model': 256, 'n_neurons': 32, 'n_layers': 6, 'dropout': 0.4, 'weight_decay': 0.1, 'lr': 0.0003, 'batch_size': 32, 'seq_len': 128, 'epochs': 20, 'grad_clip': 0.25, 'save_every': 5}
+
+=== Loading WikiText-2 ===
+/usr/local/lib/python3.12/dist-packages/huggingface_hub/utils/_auth.py:94: UserWarning: 
+The secret `HF_TOKEN` does not exist in your Colab secrets.
+To authenticate with the Hugging Face Hub, create a token in your settings tab (https://huggingface.co/settings/tokens), set it as secret in your Google Colab and restart your session.
+You will be able to reuse this secret in all of your notebooks.
+Please note that authentication is recommended but still optional to access public models or datasets.
+  warnings.warn(
+README.md: 
+ 10.5k/? [00:00<00:00, 951kB/s]
+wikitext-2-raw-v1/test-00000-of-00001.pa(…): 100%
+ 733k/733k [00:00<00:00, 220kB/s]
+wikitext-2-raw-v1/train-00000-of-00001.p(…): 100%
+ 6.36M/6.36M [00:00<00:00, 372kB/s]
+wikitext-2-raw-v1/validation-00000-of-00(…): 100%
+ 657k/657k [00:00<00:00, 905kB/s]
+Generating test split: 100%
+ 4358/4358 [00:00<00:00, 83299.66 examples/s]
+Generating train split: 100%
+ 36718/36718 [00:00<00:00, 640759.12 examples/s]
+Generating validation split: 100%
+ 3760/3760 [00:00<00:00, 226536.76 examples/s]
+Train examples: 36718
+Valid examples: 3760
+
+=== Building vocabulary ===
+Vocabulary size: 1013
+
+=== Tokenizing data ===
+Train tokens: 10,892,990
+Valid tokens: 1,142,150
+Batched train shape: torch.Size([340405, 32])
+Batched valid shape: torch.Size([35692, 32])
+
+=== Initializing Model ===
+Model parameters: 4,472,565
+
+=== Starting Training ===
+Batches per epoch: 2659
+Total steps: 53180
+Epoch 1/20 | Batch 50/2659 | Loss: 6.3174 | Train PPL: 802.36 | LR: 1.21e-05 | Speed: 8903 tok/s
+Epoch 1/20 | Batch 100/2659 | Loss: 5.5918 | Train PPL: 550.32 | LR: 1.23e-05 | Speed: 8909 tok/s
+Epoch 1/20 | Batch 150/2659 | Loss: 5.1619 | Train PPL: 400.35 | LR: 1.26e-05 | Speed: 8911 tok/s
+Epoch 1/20 | Batch 200/2659 | Loss: 4.8011 | Train PPL: 309.24 | LR: 1.30e-05 | Speed: 8912 tok/s
+Epoch 1/20 | Batch 250/2659 | Loss: 4.4622 | Train PPL: 247.85 | LR: 1.36e-05 | Speed: 8912 tok/s
+Epoch 1/20 | Batch 300/2659 | Loss: 4.1758 | Train PPL: 203.18 | LR: 1.43e-05 | Speed: 8913 tok/s
+Epoch 1/20 | Batch 350/2659 | Loss: 3.9082 | Train PPL: 168.98 | LR: 1.51e-05 | Speed: 8913 tok/s
+Epoch 1/20 | Batch 400/2659 | Loss: 3.6166 | Train PPL: 141.96 | LR: 1.60e-05 | Speed: 8913 tok/s
+Epoch 1/20 | Batch 450/2659 | Loss: 3.3830 | Train PPL: 120.52 | LR: 1.71e-05 | Speed: 8913 tok/s
+Epoch 1/20 | Batch 500/2659 | Loss: 3.1751 | Train PPL: 103.42 | LR: 1.82e-05 | Speed: 8914 tok/s
+Epoch 1/20 | Batch 550/2659 | Loss: 2.9647 | Train PPL: 89.63 | LR: 1.95e-05 | Speed: 8914 tok/s
+Epoch 1/20 | Batch 600/2659 | Loss: 2.8395 | Train PPL: 78.50 | LR: 2.10e-05 | Speed: 8914 tok/s
+Epoch 1/20 | Batch 650/2659 | Loss: 2.7224 | Train PPL: 69.33 | LR: 2.25e-05 | Speed: 8914 tok/s
+Epoch 1/20 | Batch 700/2659 | Loss: 2.5571 | Train PPL: 61.75 | LR: 2.41e-05 | Speed: 8914 tok/s
+Epoch 1/20 | Batch 750/2659 | Loss: 2.5214 | Train PPL: 55.54 | LR: 2.59e-05 | Speed: 8914 tok/s
+Epoch 1/20 | Batch 800/2659 | Loss: 2.4039 | Train PPL: 50.37 | LR: 2.78e-05 | Speed: 8914 tok/s
+Epoch 1/20 | Batch 850/2659 | Loss: 2.3423 | Train PPL: 46.03 | LR: 2.98e-05 | Speed: 8914 tok/s
+Epoch 1/20 | Batch 900/2659 | Loss: 2.3039 | Train PPL: 42.35 | LR: 3.19e-05 | Speed: 8914 tok/s
+Epoch 1/20 | Batch 950/2659 | Loss: 2.2452 | Train PPL: 39.22 | LR: 3.41e-05 | Speed: 8914 tok/s
+Epoch 1/20 | Batch 1000/2659 | Loss: 2.1759 | Train PPL: 36.51 | LR: 3.64e-05 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 1050/2659 | Loss: 2.1865 | Train PPL: 34.16 | LR: 3.88e-05 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 1100/2659 | Loss: 2.1323 | Train PPL: 32.10 | LR: 4.14e-05 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 1150/2659 | Loss: 2.2179 | Train PPL: 30.32 | LR: 4.40e-05 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 1200/2659 | Loss: 2.0906 | Train PPL: 28.71 | LR: 4.67e-05 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 1250/2659 | Loss: 2.0950 | Train PPL: 27.28 | LR: 4.95e-05 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 1300/2659 | Loss: 2.0190 | Train PPL: 25.99 | LR: 5.24e-05 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 1350/2659 | Loss: 1.9502 | Train PPL: 24.82 | LR: 5.54e-05 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 1400/2659 | Loss: 2.0092 | Train PPL: 23.75 | LR: 5.85e-05 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 1450/2659 | Loss: 1.9132 | Train PPL: 22.77 | LR: 6.17e-05 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 1500/2659 | Loss: 1.8811 | Train PPL: 21.88 | LR: 6.49e-05 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 1550/2659 | Loss: 1.8566 | Train PPL: 21.07 | LR: 6.83e-05 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 1600/2659 | Loss: 1.8478 | Train PPL: 20.31 | LR: 7.17e-05 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 1650/2659 | Loss: 1.8334 | Train PPL: 19.61 | LR: 7.52e-05 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 1700/2659 | Loss: 1.8575 | Train PPL: 18.97 | LR: 7.87e-05 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 1750/2659 | Loss: 1.8398 | Train PPL: 18.38 | LR: 8.24e-05 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 1800/2659 | Loss: 1.7505 | Train PPL: 17.83 | LR: 8.60e-05 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 1850/2659 | Loss: 1.7388 | Train PPL: 17.30 | LR: 8.98e-05 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 1900/2659 | Loss: 1.7392 | Train PPL: 16.81 | LR: 9.36e-05 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 1950/2659 | Loss: 1.7175 | Train PPL: 16.34 | LR: 9.75e-05 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 2000/2659 | Loss: 1.7028 | Train PPL: 15.91 | LR: 1.01e-04 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 2050/2659 | Loss: 1.6768 | Train PPL: 15.51 | LR: 1.05e-04 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 2100/2659 | Loss: 1.6964 | Train PPL: 15.13 | LR: 1.09e-04 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 2150/2659 | Loss: 1.7360 | Train PPL: 14.78 | LR: 1.13e-04 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 2200/2659 | Loss: 1.6841 | Train PPL: 14.44 | LR: 1.17e-04 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 2250/2659 | Loss: 1.6521 | Train PPL: 14.12 | LR: 1.22e-04 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 2300/2659 | Loss: 1.6221 | Train PPL: 13.80 | LR: 1.26e-04 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 2350/2659 | Loss: 1.5880 | Train PPL: 13.51 | LR: 1.30e-04 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 2400/2659 | Loss: 1.5683 | Train PPL: 13.23 | LR: 1.34e-04 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 2450/2659 | Loss: 1.5905 | Train PPL: 12.97 | LR: 1.38e-04 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 2500/2659 | Loss: 1.6628 | Train PPL: 12.73 | LR: 1.43e-04 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 2550/2659 | Loss: 1.5716 | Train PPL: 12.49 | LR: 1.47e-04 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 2600/2659 | Loss: 1.5853 | Train PPL: 12.27 | LR: 1.51e-04 | Speed: 8915 tok/s
+Epoch 1/20 | Batch 2650/2659 | Loss: 1.6419 | Train PPL: 12.06 | LR: 1.55e-04 | Speed: 8915 tok/s
+
+============================================================
+Epoch 1 Complete | Time: 1253.5s
+Train PPL: 12.02 | Valid PPL: 5.25
+============================================================
+
+🔥 New best! Valid PPL: 5.25
+
+Epoch 2/20 | Batch 50/2659 | Loss: 1.5493 | Train PPL: 4.82 | LR: 1.60e-04 | Speed: 8916 tok/s
+Epoch 2/20 | Batch 100/2659 | Loss: 1.5532 | Train PPL: 4.78 | LR: 1.65e-04 | Speed: 8916 tok/s
+Epoch 2/20 | Batch 150/2659 | Loss: 1.5017 | Train PPL: 4.76 | LR: 1.69e-04 | Speed: 8916 tok/s
+Epoch 2/20 | Batch 200/2659 | Loss: 1.5448 | Train PPL: 4.73 | LR: 1.73e-04 | Speed: 8916 tok/s
+Epoch 2/20 | Batch 250/2659 | Loss: 1.5297 | Train PPL: 4.72 | LR: 1.77e-04 | Speed: 8916 tok/s
+Epoch 2/20 | Batch 300/2659 | Loss: 1.5426 | Train PPL: 4.70 | LR: 1.82e-04 | Speed: 8916 tok/s
+Epoch 2/20 | Batch 350/2659 | Loss: 1.5669 | Train PPL: 4.68 | LR: 1.86e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 400/2659 | Loss: 1.4992 | Train PPL: 4.68 | LR: 1.90e-04 | Speed: 8916 tok/s
+Epoch 2/20 | Batch 450/2659 | Loss: 1.5172 | Train PPL: 4.67 | LR: 1.94e-04 | Speed: 8916 tok/s
+Epoch 2/20 | Batch 500/2659 | Loss: 1.5134 | Train PPL: 4.66 | LR: 1.98e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 550/2659 | Loss: 1.4718 | Train PPL: 4.65 | LR: 2.02e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 600/2659 | Loss: 1.5350 | Train PPL: 4.63 | LR: 2.06e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 650/2659 | Loss: 1.4999 | Train PPL: 4.61 | LR: 2.10e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 700/2659 | Loss: 1.4518 | Train PPL: 4.59 | LR: 2.14e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 750/2659 | Loss: 1.5282 | Train PPL: 4.58 | LR: 2.18e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 800/2659 | Loss: 1.4857 | Train PPL: 4.56 | LR: 2.22e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 850/2659 | Loss: 1.4611 | Train PPL: 4.54 | LR: 2.25e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 900/2659 | Loss: 1.4754 | Train PPL: 4.53 | LR: 2.29e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 950/2659 | Loss: 1.4349 | Train PPL: 4.52 | LR: 2.33e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 1000/2659 | Loss: 1.4019 | Train PPL: 4.51 | LR: 2.36e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 1050/2659 | Loss: 1.4250 | Train PPL: 4.50 | LR: 2.40e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 1100/2659 | Loss: 1.4010 | Train PPL: 4.48 | LR: 2.43e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 1150/2659 | Loss: 1.5626 | Train PPL: 4.48 | LR: 2.47e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 1200/2659 | Loss: 1.4208 | Train PPL: 4.47 | LR: 2.50e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 1250/2659 | Loss: 1.4715 | Train PPL: 4.46 | LR: 2.53e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 1300/2659 | Loss: 1.3713 | Train PPL: 4.44 | LR: 2.56e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 1350/2659 | Loss: 1.3912 | Train PPL: 4.43 | LR: 2.59e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 1400/2659 | Loss: 1.4488 | Train PPL: 4.42 | LR: 2.62e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 1450/2659 | Loss: 1.3913 | Train PPL: 4.41 | LR: 2.65e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 1500/2659 | Loss: 1.3726 | Train PPL: 4.40 | LR: 2.68e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 1550/2659 | Loss: 1.3492 | Train PPL: 4.39 | LR: 2.70e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 1600/2659 | Loss: 1.3682 | Train PPL: 4.38 | LR: 2.73e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 1650/2659 | Loss: 1.4158 | Train PPL: 4.37 | LR: 2.75e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 1700/2659 | Loss: 1.4235 | Train PPL: 4.36 | LR: 2.78e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 1750/2659 | Loss: 1.4177 | Train PPL: 4.35 | LR: 2.80e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 1800/2659 | Loss: 1.3272 | Train PPL: 4.34 | LR: 2.82e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 1850/2659 | Loss: 1.3378 | Train PPL: 4.33 | LR: 2.84e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 1900/2659 | Loss: 1.3153 | Train PPL: 4.32 | LR: 2.86e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 1950/2659 | Loss: 1.3474 | Train PPL: 4.30 | LR: 2.88e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 2000/2659 | Loss: 1.3582 | Train PPL: 4.29 | LR: 2.89e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 2050/2659 | Loss: 1.3243 | Train PPL: 4.28 | LR: 2.91e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 2100/2659 | Loss: 1.4049 | Train PPL: 4.27 | LR: 2.92e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 2150/2659 | Loss: 1.4146 | Train PPL: 4.27 | LR: 2.94e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 2200/2659 | Loss: 1.3664 | Train PPL: 4.26 | LR: 2.95e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 2250/2659 | Loss: 1.3577 | Train PPL: 4.25 | LR: 2.96e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 2300/2659 | Loss: 1.3287 | Train PPL: 4.24 | LR: 2.97e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 2350/2659 | Loss: 1.3186 | Train PPL: 4.23 | LR: 2.98e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 2400/2659 | Loss: 1.3023 | Train PPL: 4.22 | LR: 2.98e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 2450/2659 | Loss: 1.3511 | Train PPL: 4.21 | LR: 2.99e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 2500/2659 | Loss: 1.4254 | Train PPL: 4.21 | LR: 2.99e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 2550/2659 | Loss: 1.3331 | Train PPL: 4.20 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 2600/2659 | Loss: 1.3519 | Train PPL: 4.19 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 2/20 | Batch 2650/2659 | Loss: 1.4016 | Train PPL: 4.19 | LR: 3.00e-04 | Speed: 8915 tok/s
+
+============================================================
+Epoch 2 Complete | Time: 1253.6s
+Train PPL: 4.19 | Valid PPL: 4.32
+============================================================
+
+🔥 New best! Valid PPL: 4.32
+
+Epoch 3/20 | Batch 50/2659 | Loss: 1.3567 | Train PPL: 3.89 | LR: 3.00e-04 | Speed: 8913 tok/s
+Epoch 3/20 | Batch 100/2659 | Loss: 1.3349 | Train PPL: 3.85 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 150/2659 | Loss: 1.2816 | Train PPL: 3.84 | LR: 3.00e-04 | Speed: 8914 tok/s
+Epoch 3/20 | Batch 200/2659 | Loss: 1.3446 | Train PPL: 3.83 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 250/2659 | Loss: 1.3518 | Train PPL: 3.83 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 300/2659 | Loss: 1.3633 | Train PPL: 3.83 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 350/2659 | Loss: 1.3888 | Train PPL: 3.83 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 400/2659 | Loss: 1.3138 | Train PPL: 3.83 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 450/2659 | Loss: 1.3480 | Train PPL: 3.83 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 500/2659 | Loss: 1.3309 | Train PPL: 3.83 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 550/2659 | Loss: 1.2936 | Train PPL: 3.83 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 600/2659 | Loss: 1.3620 | Train PPL: 3.83 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 650/2659 | Loss: 1.3424 | Train PPL: 3.82 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 700/2659 | Loss: 1.3176 | Train PPL: 3.81 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 750/2659 | Loss: 1.3708 | Train PPL: 3.81 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 800/2659 | Loss: 1.3461 | Train PPL: 3.81 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 850/2659 | Loss: 1.3065 | Train PPL: 3.80 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 900/2659 | Loss: 1.3462 | Train PPL: 3.80 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 950/2659 | Loss: 1.2952 | Train PPL: 3.80 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 1000/2659 | Loss: 1.2730 | Train PPL: 3.79 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 1050/2659 | Loss: 1.2928 | Train PPL: 3.79 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 1100/2659 | Loss: 1.2760 | Train PPL: 3.79 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 1150/2659 | Loss: 1.4326 | Train PPL: 3.79 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 1200/2659 | Loss: 1.2993 | Train PPL: 3.78 | LR: 3.00e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 1250/2659 | Loss: 1.3397 | Train PPL: 3.78 | LR: 2.99e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 1300/2659 | Loss: 1.2661 | Train PPL: 3.78 | LR: 2.99e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 1350/2659 | Loss: 1.2764 | Train PPL: 3.77 | LR: 2.99e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 1400/2659 | Loss: 1.3270 | Train PPL: 3.77 | LR: 2.99e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 1450/2659 | Loss: 1.2983 | Train PPL: 3.77 | LR: 2.99e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 1500/2659 | Loss: 1.2737 | Train PPL: 3.76 | LR: 2.99e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 1550/2659 | Loss: 1.2552 | Train PPL: 3.76 | LR: 2.99e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 1600/2659 | Loss: 1.2616 | Train PPL: 3.76 | LR: 2.99e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 1650/2659 | Loss: 1.3152 | Train PPL: 3.75 | LR: 2.99e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 1700/2659 | Loss: 1.3120 | Train PPL: 3.75 | LR: 2.99e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 1750/2659 | Loss: 1.3102 | Train PPL: 3.75 | LR: 2.99e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 1800/2659 | Loss: 1.2366 | Train PPL: 3.75 | LR: 2.99e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 1850/2659 | Loss: 1.2347 | Train PPL: 3.74 | LR: 2.99e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 1900/2659 | Loss: 1.2107 | Train PPL: 3.73 | LR: 2.99e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 1950/2659 | Loss: 1.2549 | Train PPL: 3.73 | LR: 2.99e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 2000/2659 | Loss: 1.2606 | Train PPL: 3.72 | LR: 2.99e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 2050/2659 | Loss: 1.2250 | Train PPL: 3.72 | LR: 2.99e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 2100/2659 | Loss: 1.3217 | Train PPL: 3.72 | LR: 2.99e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 2150/2659 | Loss: 1.3083 | Train PPL: 3.71 | LR: 2.99e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 2200/2659 | Loss: 1.2672 | Train PPL: 3.71 | LR: 2.98e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 2250/2659 | Loss: 1.2767 | Train PPL: 3.71 | LR: 2.98e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 2300/2659 | Loss: 1.2469 | Train PPL: 3.70 | LR: 2.98e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 2350/2659 | Loss: 1.2476 | Train PPL: 3.70 | LR: 2.98e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 2400/2659 | Loss: 1.2265 | Train PPL: 3.69 | LR: 2.98e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 2450/2659 | Loss: 1.2822 | Train PPL: 3.69 | LR: 2.98e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 2500/2659 | Loss: 1.3525 | Train PPL: 3.69 | LR: 2.98e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 2550/2659 | Loss: 1.2592 | Train PPL: 3.69 | LR: 2.98e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 2600/2659 | Loss: 1.2748 | Train PPL: 3.69 | LR: 2.98e-04 | Speed: 8915 tok/s
+Epoch 3/20 | Batch 2650/2659 | Loss: 1.3245 | Train PPL: 3.69 | LR: 2.98e-04 | Speed: 8915 tok/s
+
+============================================================
+Epoch 3 Complete | Time: 1253.6s
+Train PPL: 3.69 | Valid PPL: 4.08
+============================================================
+
+🔥 New best! Valid PPL: 4.08
+
+Epoch 4/20 | Batch 50/2659 | Loss: 1.2788 | Train PPL: 3.61 | LR: 2.98e-04 | Speed: 8916 tok/s
+Epoch 4/20 | Batch 100/2659 | Loss: 1.2571 | Train PPL: 3.57 | LR: 2.98e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 150/2659 | Loss: 1.2223 | Train PPL: 3.57 | LR: 2.97e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 200/2659 | Loss: 1.2649 | Train PPL: 3.56 | LR: 2.97e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 250/2659 | Loss: 1.2886 | Train PPL: 3.56 | LR: 2.97e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 300/2659 | Loss: 1.2950 | Train PPL: 3.56 | LR: 2.97e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 350/2659 | Loss: 1.3298 | Train PPL: 3.56 | LR: 2.97e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 400/2659 | Loss: 1.2464 | Train PPL: 3.57 | LR: 2.97e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 450/2659 | Loss: 1.2774 | Train PPL: 3.56 | LR: 2.97e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 500/2659 | Loss: 1.2577 | Train PPL: 3.57 | LR: 2.97e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 550/2659 | Loss: 1.2463 | Train PPL: 3.57 | LR: 2.97e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 600/2659 | Loss: 1.2886 | Train PPL: 3.57 | LR: 2.97e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 650/2659 | Loss: 1.2818 | Train PPL: 3.57 | LR: 2.96e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 700/2659 | Loss: 1.2474 | Train PPL: 3.56 | LR: 2.96e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 750/2659 | Loss: 1.3127 | Train PPL: 3.56 | LR: 2.96e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 800/2659 | Loss: 1.2764 | Train PPL: 3.56 | LR: 2.96e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 850/2659 | Loss: 1.2528 | Train PPL: 3.55 | LR: 2.96e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 900/2659 | Loss: 1.2920 | Train PPL: 3.55 | LR: 2.96e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 950/2659 | Loss: 1.2440 | Train PPL: 3.55 | LR: 2.96e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 1000/2659 | Loss: 1.2171 | Train PPL: 3.55 | LR: 2.96e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 1050/2659 | Loss: 1.2424 | Train PPL: 3.55 | LR: 2.96e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 1100/2659 | Loss: 1.2152 | Train PPL: 3.55 | LR: 2.95e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 1150/2659 | Loss: 1.3559 | Train PPL: 3.55 | LR: 2.95e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 1200/2659 | Loss: 1.2408 | Train PPL: 3.55 | LR: 2.95e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 1250/2659 | Loss: 1.2808 | Train PPL: 3.55 | LR: 2.95e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 1300/2659 | Loss: 1.2044 | Train PPL: 3.54 | LR: 2.95e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 1350/2659 | Loss: 1.2246 | Train PPL: 3.54 | LR: 2.95e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 1400/2659 | Loss: 1.2745 | Train PPL: 3.54 | LR: 2.95e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 1450/2659 | Loss: 1.2461 | Train PPL: 3.54 | LR: 2.95e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 1500/2659 | Loss: 1.2237 | Train PPL: 3.54 | LR: 2.94e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 1550/2659 | Loss: 1.2045 | Train PPL: 3.53 | LR: 2.94e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 1600/2659 | Loss: 1.2110 | Train PPL: 3.53 | LR: 2.94e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 1650/2659 | Loss: 1.2594 | Train PPL: 3.53 | LR: 2.94e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 1700/2659 | Loss: 1.2578 | Train PPL: 3.53 | LR: 2.94e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 1750/2659 | Loss: 1.2666 | Train PPL: 3.53 | LR: 2.94e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 1800/2659 | Loss: 1.1939 | Train PPL: 3.53 | LR: 2.94e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 1850/2659 | Loss: 1.1791 | Train PPL: 3.52 | LR: 2.93e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 1900/2659 | Loss: 1.1679 | Train PPL: 3.52 | LR: 2.93e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 1950/2659 | Loss: 1.1952 | Train PPL: 3.51 | LR: 2.93e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 2000/2659 | Loss: 1.2093 | Train PPL: 3.51 | LR: 2.93e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 2050/2659 | Loss: 1.1682 | Train PPL: 3.51 | LR: 2.93e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 2100/2659 | Loss: 1.2865 | Train PPL: 3.50 | LR: 2.93e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 2150/2659 | Loss: 1.2632 | Train PPL: 3.51 | LR: 2.93e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 2200/2659 | Loss: 1.2280 | Train PPL: 3.50 | LR: 2.92e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 2250/2659 | Loss: 1.2384 | Train PPL: 3.50 | LR: 2.92e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 2300/2659 | Loss: 1.2085 | Train PPL: 3.50 | LR: 2.92e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 2350/2659 | Loss: 1.2041 | Train PPL: 3.49 | LR: 2.92e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 2400/2659 | Loss: 1.1782 | Train PPL: 3.49 | LR: 2.92e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 2450/2659 | Loss: 1.2332 | Train PPL: 3.49 | LR: 2.92e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 2500/2659 | Loss: 1.3115 | Train PPL: 3.49 | LR: 2.91e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 2550/2659 | Loss: 1.2135 | Train PPL: 3.49 | LR: 2.91e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 2600/2659 | Loss: 1.2347 | Train PPL: 3.49 | LR: 2.91e-04 | Speed: 8915 tok/s
+Epoch 4/20 | Batch 2650/2659 | Loss: 1.2792 | Train PPL: 3.49 | LR: 2.91e-04 | Speed: 8915 tok/s
+
+============================================================
+Epoch 4 Complete | Time: 1253.6s
+Train PPL: 3.49 | Valid PPL: 3.97
+============================================================
+
+🔥 New best! Valid PPL: 3.97
+
+Epoch 5/20 | Batch 50/2659 | Loss: 1.2385 | Train PPL: 3.47 | LR: 2.91e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 100/2659 | Loss: 1.2150 | Train PPL: 3.43 | LR: 2.91e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 150/2659 | Loss: 1.1897 | Train PPL: 3.43 | LR: 2.90e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 200/2659 | Loss: 1.2175 | Train PPL: 3.42 | LR: 2.90e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 250/2659 | Loss: 1.2402 | Train PPL: 3.42 | LR: 2.90e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 300/2659 | Loss: 1.2619 | Train PPL: 3.42 | LR: 2.90e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 350/2659 | Loss: 1.2868 | Train PPL: 3.42 | LR: 2.90e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 400/2659 | Loss: 1.2049 | Train PPL: 3.43 | LR: 2.90e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 450/2659 | Loss: 1.2384 | Train PPL: 3.42 | LR: 2.89e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 500/2659 | Loss: 1.2131 | Train PPL: 3.43 | LR: 2.89e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 550/2659 | Loss: 1.2079 | Train PPL: 3.43 | LR: 2.89e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 600/2659 | Loss: 1.2527 | Train PPL: 3.43 | LR: 2.89e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 650/2659 | Loss: 1.2418 | Train PPL: 3.43 | LR: 2.89e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 700/2659 | Loss: 1.2083 | Train PPL: 3.43 | LR: 2.88e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 750/2659 | Loss: 1.2661 | Train PPL: 3.43 | LR: 2.88e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 800/2659 | Loss: 1.2377 | Train PPL: 3.42 | LR: 2.88e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 850/2659 | Loss: 1.2199 | Train PPL: 3.42 | LR: 2.88e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 900/2659 | Loss: 1.2621 | Train PPL: 3.42 | LR: 2.88e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 950/2659 | Loss: 1.2101 | Train PPL: 3.42 | LR: 2.87e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 1000/2659 | Loss: 1.1776 | Train PPL: 3.42 | LR: 2.87e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 1050/2659 | Loss: 1.2134 | Train PPL: 3.42 | LR: 2.87e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 1100/2659 | Loss: 1.1791 | Train PPL: 3.42 | LR: 2.87e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 1150/2659 | Loss: 1.3098 | Train PPL: 3.42 | LR: 2.87e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 1200/2659 | Loss: 1.2059 | Train PPL: 3.42 | LR: 2.86e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 1250/2659 | Loss: 1.2516 | Train PPL: 3.42 | LR: 2.86e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 1300/2659 | Loss: 1.1680 | Train PPL: 3.41 | LR: 2.86e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 1350/2659 | Loss: 1.2028 | Train PPL: 3.41 | LR: 2.86e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 1400/2659 | Loss: 1.2421 | Train PPL: 3.41 | LR: 2.86e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 1450/2659 | Loss: 1.2190 | Train PPL: 3.41 | LR: 2.85e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 1500/2659 | Loss: 1.1933 | Train PPL: 3.41 | LR: 2.85e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 1550/2659 | Loss: 1.1724 | Train PPL: 3.41 | LR: 2.85e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 1600/2659 | Loss: 1.1775 | Train PPL: 3.41 | LR: 2.85e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 1650/2659 | Loss: 1.2327 | Train PPL: 3.41 | LR: 2.85e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 1700/2659 | Loss: 1.2257 | Train PPL: 3.41 | LR: 2.84e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 1750/2659 | Loss: 1.2251 | Train PPL: 3.40 | LR: 2.84e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 1800/2659 | Loss: 1.1585 | Train PPL: 3.40 | LR: 2.84e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 1850/2659 | Loss: 1.1424 | Train PPL: 3.40 | LR: 2.84e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 1900/2659 | Loss: 1.1322 | Train PPL: 3.40 | LR: 2.83e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 1950/2659 | Loss: 1.1678 | Train PPL: 3.39 | LR: 2.83e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 2000/2659 | Loss: 1.1788 | Train PPL: 3.39 | LR: 2.83e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 2050/2659 | Loss: 1.1374 | Train PPL: 3.39 | LR: 2.83e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 2100/2659 | Loss: 1.2477 | Train PPL: 3.38 | LR: 2.83e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 2150/2659 | Loss: 1.2455 | Train PPL: 3.39 | LR: 2.82e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 2200/2659 | Loss: 1.1898 | Train PPL: 3.39 | LR: 2.82e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 2250/2659 | Loss: 1.2066 | Train PPL: 3.38 | LR: 2.82e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 2300/2659 | Loss: 1.1844 | Train PPL: 3.38 | LR: 2.82e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 2350/2659 | Loss: 1.1841 | Train PPL: 3.38 | LR: 2.81e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 2400/2659 | Loss: 1.1524 | Train PPL: 3.38 | LR: 2.81e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 2450/2659 | Loss: 1.2124 | Train PPL: 3.37 | LR: 2.81e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 2500/2659 | Loss: 1.2896 | Train PPL: 3.37 | LR: 2.81e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 2550/2659 | Loss: 1.1883 | Train PPL: 3.37 | LR: 2.80e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 2600/2659 | Loss: 1.2026 | Train PPL: 3.37 | LR: 2.80e-04 | Speed: 8913 tok/s
+Epoch 5/20 | Batch 2650/2659 | Loss: 1.2592 | Train PPL: 3.37 | LR: 2.80e-04 | Speed: 8913 tok/s
+
+============================================================
+Epoch 5 Complete | Time: 1253.9s
+Train PPL: 3.37 | Valid PPL: 3.91
+============================================================
+
+🔥 New best! Valid PPL: 3.91
+
+Epoch 6/20 | Batch 50/2659 | Loss: 1.2094 | Train PPL: 3.37 | LR: 2.80e-04 | Speed: 8916 tok/s
+Epoch 6/20 | Batch 100/2659 | Loss: 1.1925 | Train PPL: 3.34 | LR: 2.79e-04 | Speed: 8915 tok/s
+Epoch 6/20 | Batch 150/2659 | Loss: 1.1575 | Train PPL: 3.34 | LR: 2.79e-04 | Speed: 8915 tok/s
+Epoch 6/20 | Batch 200/2659 | Loss: 1.1816 | Train PPL: 3.33 | LR: 2.79e-04 | Speed: 8915 tok/s
+Epoch 6/20 | Batch 250/2659 | Loss: 1.2125 | Train PPL: 3.33 | LR: 2.79e-04 | Speed: 8915 tok/s
+Epoch 6/20 | Batch 300/2659 | Loss: 1.2352 | Train PPL: 3.33 | LR: 2.78e-04 | Speed: 8915 tok/s
+Epoch 6/20 | Batch 350/2659 | Loss: 1.2600 | Train PPL: 3.33 | LR: 2.78e-04 | Speed: 8915 tok/s
+Epoch 6/20 | Batch 400/2659 | Loss: 1.1808 | Train PPL: 3.33 | LR: 2.78e-04 | Speed: 8915 tok/s
+Epoch 6/20 | Batch 450/2659 | Loss: 1.2043 | Train PPL: 3.33 | LR: 2.78e-04 | Speed: 8915 tok/s
+Epoch 6/20 | Batch 500/2659 | Loss: 1.1911 | Train PPL: 3.34 | LR: 2.77e-04 | Speed: 8915 tok/s
+Epoch 6/20 | Batch 550/2659 | Loss: 1.1882 | Train PPL: 3.34 | LR: 2.77e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 600/2659 | Loss: 1.2284 | Train PPL: 3.34 | LR: 2.77e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 650/2659 | Loss: 1.2094 | Train PPL: 3.34 | LR: 2.77e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 700/2659 | Loss: 1.1894 | Train PPL: 3.34 | LR: 2.76e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 750/2659 | Loss: 1.2340 | Train PPL: 3.34 | LR: 2.76e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 800/2659 | Loss: 1.2124 | Train PPL: 3.33 | LR: 2.76e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 850/2659 | Loss: 1.1960 | Train PPL: 3.33 | LR: 2.75e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 900/2659 | Loss: 1.2343 | Train PPL: 3.33 | LR: 2.75e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 950/2659 | Loss: 1.1875 | Train PPL: 3.33 | LR: 2.75e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 1000/2659 | Loss: 1.1604 | Train PPL: 3.33 | LR: 2.75e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 1050/2659 | Loss: 1.1914 | Train PPL: 3.33 | LR: 2.74e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 1100/2659 | Loss: 1.1541 | Train PPL: 3.33 | LR: 2.74e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 1150/2659 | Loss: 1.2758 | Train PPL: 3.33 | LR: 2.74e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 1200/2659 | Loss: 1.1742 | Train PPL: 3.33 | LR: 2.74e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 1250/2659 | Loss: 1.2199 | Train PPL: 3.33 | LR: 2.73e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 1300/2659 | Loss: 1.1476 | Train PPL: 3.33 | LR: 2.73e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 1350/2659 | Loss: 1.1723 | Train PPL: 3.33 | LR: 2.73e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 1400/2659 | Loss: 1.2247 | Train PPL: 3.33 | LR: 2.72e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 1450/2659 | Loss: 1.1933 | Train PPL: 3.33 | LR: 2.72e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 1500/2659 | Loss: 1.1848 | Train PPL: 3.32 | LR: 2.72e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 1550/2659 | Loss: 1.1549 | Train PPL: 3.32 | LR: 2.72e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 1600/2659 | Loss: 1.1575 | Train PPL: 3.32 | LR: 2.71e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 1650/2659 | Loss: 1.2044 | Train PPL: 3.32 | LR: 2.71e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 1700/2659 | Loss: 1.1970 | Train PPL: 3.32 | LR: 2.71e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 1750/2659 | Loss: 1.2023 | Train PPL: 3.32 | LR: 2.70e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 1800/2659 | Loss: 1.1364 | Train PPL: 3.32 | LR: 2.70e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 1850/2659 | Loss: 1.1173 | Train PPL: 3.32 | LR: 2.70e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 1900/2659 | Loss: 1.1126 | Train PPL: 3.31 | LR: 2.70e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 1950/2659 | Loss: 1.1398 | Train PPL: 3.31 | LR: 2.69e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 2000/2659 | Loss: 1.1539 | Train PPL: 3.31 | LR: 2.69e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 2050/2659 | Loss: 1.1129 | Train PPL: 3.30 | LR: 2.69e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 2100/2659 | Loss: 1.2264 | Train PPL: 3.30 | LR: 2.68e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 2150/2659 | Loss: 1.2217 | Train PPL: 3.30 | LR: 2.68e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 2200/2659 | Loss: 1.1732 | Train PPL: 3.30 | LR: 2.68e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 2250/2659 | Loss: 1.1907 | Train PPL: 3.30 | LR: 2.67e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 2300/2659 | Loss: 1.1546 | Train PPL: 3.30 | LR: 2.67e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 2350/2659 | Loss: 1.1645 | Train PPL: 3.30 | LR: 2.67e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 2400/2659 | Loss: 1.1316 | Train PPL: 3.29 | LR: 2.66e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 2450/2659 | Loss: 1.1967 | Train PPL: 3.29 | LR: 2.66e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 2500/2659 | Loss: 1.2646 | Train PPL: 3.29 | LR: 2.66e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 2550/2659 | Loss: 1.1636 | Train PPL: 3.29 | LR: 2.66e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 2600/2659 | Loss: 1.1896 | Train PPL: 3.29 | LR: 2.65e-04 | Speed: 8914 tok/s
+Epoch 6/20 | Batch 2650/2659 | Loss: 1.2289 | Train PPL: 3.29 | LR: 2.65e-04 | Speed: 8914 tok/s
+
+============================================================
+Epoch 6 Complete | Time: 1253.7s
+Train PPL: 3.29 | Valid PPL: 3.86
+============================================================
+
+🔥 New best! Valid PPL: 3.86
+
+Epoch 7/20 | Batch 50/2659 | Loss: 1.1859 | Train PPL: 3.30 | LR: 2.65e-04 | Speed: 8915 tok/s
+Epoch 7/20 | Batch 100/2659 | Loss: 1.1672 | Train PPL: 3.27 | LR: 2.64e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 150/2659 | Loss: 1.1371 | Train PPL: 3.27 | LR: 2.64e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 200/2659 | Loss: 1.1617 | Train PPL: 3.26 | LR: 2.64e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 250/2659 | Loss: 1.1892 | Train PPL: 3.26 | LR: 2.63e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 300/2659 | Loss: 1.2214 | Train PPL: 3.26 | LR: 2.63e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 350/2659 | Loss: 1.2413 | Train PPL: 3.26 | LR: 2.63e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 400/2659 | Loss: 1.1603 | Train PPL: 3.27 | LR: 2.62e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 450/2659 | Loss: 1.1870 | Train PPL: 3.26 | LR: 2.62e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 500/2659 | Loss: 1.1642 | Train PPL: 3.27 | LR: 2.62e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 550/2659 | Loss: 1.1657 | Train PPL: 3.27 | LR: 2.61e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 600/2659 | Loss: 1.2101 | Train PPL: 3.27 | LR: 2.61e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 650/2659 | Loss: 1.1904 | Train PPL: 3.27 | LR: 2.61e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 700/2659 | Loss: 1.1615 | Train PPL: 3.27 | LR: 2.60e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 750/2659 | Loss: 1.2091 | Train PPL: 3.27 | LR: 2.60e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 800/2659 | Loss: 1.1928 | Train PPL: 3.27 | LR: 2.60e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 850/2659 | Loss: 1.1758 | Train PPL: 3.26 | LR: 2.59e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 900/2659 | Loss: 1.2161 | Train PPL: 3.26 | LR: 2.59e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 950/2659 | Loss: 1.1675 | Train PPL: 3.26 | LR: 2.59e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 1000/2659 | Loss: 1.1312 | Train PPL: 3.26 | LR: 2.58e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 1050/2659 | Loss: 1.1656 | Train PPL: 3.27 | LR: 2.58e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 1100/2659 | Loss: 1.1463 | Train PPL: 3.26 | LR: 2.58e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 1150/2659 | Loss: 1.2522 | Train PPL: 3.27 | LR: 2.57e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 1200/2659 | Loss: 1.1571 | Train PPL: 3.26 | LR: 2.57e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 1250/2659 | Loss: 1.2039 | Train PPL: 3.26 | LR: 2.57e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 1300/2659 | Loss: 1.1313 | Train PPL: 3.26 | LR: 2.56e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 1350/2659 | Loss: 1.1495 | Train PPL: 3.26 | LR: 2.56e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 1400/2659 | Loss: 1.2014 | Train PPL: 3.26 | LR: 2.56e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 1450/2659 | Loss: 1.1751 | Train PPL: 3.26 | LR: 2.55e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 1500/2659 | Loss: 1.1630 | Train PPL: 3.26 | LR: 2.55e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 1550/2659 | Loss: 1.1417 | Train PPL: 3.26 | LR: 2.54e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 1600/2659 | Loss: 1.1373 | Train PPL: 3.26 | LR: 2.54e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 1650/2659 | Loss: 1.1942 | Train PPL: 3.26 | LR: 2.54e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 1700/2659 | Loss: 1.1816 | Train PPL: 3.26 | LR: 2.53e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 1750/2659 | Loss: 1.1860 | Train PPL: 3.26 | LR: 2.53e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 1800/2659 | Loss: 1.1206 | Train PPL: 3.26 | LR: 2.53e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 1850/2659 | Loss: 1.0909 | Train PPL: 3.25 | LR: 2.52e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 1900/2659 | Loss: 1.0914 | Train PPL: 3.25 | LR: 2.52e-04 | Speed: 8914 tok/s
+Epoch 7/20 | Batch 1950/2659 | Loss: 1.1312 | Train PPL: 3.25 | LR: 2.52e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 2000/2659 | Loss: 1.1379 | Train PPL: 3.24 | LR: 2.51e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 2050/2659 | Loss: 1.0980 | Train PPL: 3.24 | LR: 2.51e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 2100/2659 | Loss: 1.2140 | Train PPL: 3.24 | LR: 2.51e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 2150/2659 | Loss: 1.2027 | Train PPL: 3.24 | LR: 2.50e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 2200/2659 | Loss: 1.1609 | Train PPL: 3.24 | LR: 2.50e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 2250/2659 | Loss: 1.1688 | Train PPL: 3.24 | LR: 2.49e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 2300/2659 | Loss: 1.1404 | Train PPL: 3.24 | LR: 2.49e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 2350/2659 | Loss: 1.1438 | Train PPL: 3.23 | LR: 2.49e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 2400/2659 | Loss: 1.1162 | Train PPL: 3.23 | LR: 2.48e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 2450/2659 | Loss: 1.1675 | Train PPL: 3.23 | LR: 2.48e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 2500/2659 | Loss: 1.2425 | Train PPL: 3.23 | LR: 2.48e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 2550/2659 | Loss: 1.1427 | Train PPL: 3.23 | LR: 2.47e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 2600/2659 | Loss: 1.1662 | Train PPL: 3.23 | LR: 2.47e-04 | Speed: 8913 tok/s
+Epoch 7/20 | Batch 2650/2659 | Loss: 1.2099 | Train PPL: 3.23 | LR: 2.46e-04 | Speed: 8913 tok/s
+
+============================================================
+Epoch 7 Complete | Time: 1253.8s
+Train PPL: 3.23 | Valid PPL: 3.82
+============================================================
+
+🔥 New best! Valid PPL: 3.82
+
+Epoch 8/20 | Batch 50/2659 | Loss: 1.1677 | Train PPL: 3.25 | LR: 2.46e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 100/2659 | Loss: 1.1545 | Train PPL: 3.21 | LR: 2.46e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 150/2659 | Loss: 1.1277 | Train PPL: 3.21 | LR: 2.45e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 200/2659 | Loss: 1.1420 | Train PPL: 3.20 | LR: 2.45e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 250/2659 | Loss: 1.1710 | Train PPL: 3.20 | LR: 2.44e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 300/2659 | Loss: 1.2055 | Train PPL: 3.21 | LR: 2.44e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 350/2659 | Loss: 1.2250 | Train PPL: 3.20 | LR: 2.44e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 400/2659 | Loss: 1.1463 | Train PPL: 3.21 | LR: 2.43e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 450/2659 | Loss: 1.1665 | Train PPL: 3.21 | LR: 2.43e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 500/2659 | Loss: 1.1512 | Train PPL: 3.21 | LR: 2.43e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 550/2659 | Loss: 1.1608 | Train PPL: 3.22 | LR: 2.42e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 600/2659 | Loss: 1.1923 | Train PPL: 3.22 | LR: 2.42e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 650/2659 | Loss: 1.1729 | Train PPL: 3.22 | LR: 2.41e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 700/2659 | Loss: 1.1466 | Train PPL: 3.21 | LR: 2.41e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 750/2659 | Loss: 1.1880 | Train PPL: 3.21 | LR: 2.41e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 800/2659 | Loss: 1.1754 | Train PPL: 3.21 | LR: 2.40e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 850/2659 | Loss: 1.1526 | Train PPL: 3.21 | LR: 2.40e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 900/2659 | Loss: 1.2005 | Train PPL: 3.21 | LR: 2.39e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 950/2659 | Loss: 1.1528 | Train PPL: 3.21 | LR: 2.39e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 1000/2659 | Loss: 1.1230 | Train PPL: 3.21 | LR: 2.39e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 1050/2659 | Loss: 1.1527 | Train PPL: 3.21 | LR: 2.38e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 1100/2659 | Loss: 1.1276 | Train PPL: 3.21 | LR: 2.38e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 1150/2659 | Loss: 1.2347 | Train PPL: 3.21 | LR: 2.37e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 1200/2659 | Loss: 1.1368 | Train PPL: 3.21 | LR: 2.37e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 1250/2659 | Loss: 1.1866 | Train PPL: 3.21 | LR: 2.37e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 1300/2659 | Loss: 1.1155 | Train PPL: 3.21 | LR: 2.36e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 1350/2659 | Loss: 1.1451 | Train PPL: 3.21 | LR: 2.36e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 1400/2659 | Loss: 1.1832 | Train PPL: 3.21 | LR: 2.35e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 1450/2659 | Loss: 1.1622 | Train PPL: 3.21 | LR: 2.35e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 1500/2659 | Loss: 1.1429 | Train PPL: 3.21 | LR: 2.35e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 1550/2659 | Loss: 1.1189 | Train PPL: 3.21 | LR: 2.34e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 1600/2659 | Loss: 1.1196 | Train PPL: 3.21 | LR: 2.34e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 1650/2659 | Loss: 1.1795 | Train PPL: 3.21 | LR: 2.33e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 1700/2659 | Loss: 1.1630 | Train PPL: 3.21 | LR: 2.33e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 1750/2659 | Loss: 1.1654 | Train PPL: 3.20 | LR: 2.33e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 1800/2659 | Loss: 1.1057 | Train PPL: 3.20 | LR: 2.32e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 1850/2659 | Loss: 1.0783 | Train PPL: 3.20 | LR: 2.32e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 1900/2659 | Loss: 1.0745 | Train PPL: 3.20 | LR: 2.31e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 1950/2659 | Loss: 1.1134 | Train PPL: 3.19 | LR: 2.31e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 2000/2659 | Loss: 1.1240 | Train PPL: 3.19 | LR: 2.30e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 2050/2659 | Loss: 1.0802 | Train PPL: 3.19 | LR: 2.30e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 2100/2659 | Loss: 1.1951 | Train PPL: 3.19 | LR: 2.30e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 2150/2659 | Loss: 1.1903 | Train PPL: 3.19 | LR: 2.29e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 2200/2659 | Loss: 1.1451 | Train PPL: 3.19 | LR: 2.29e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 2250/2659 | Loss: 1.1589 | Train PPL: 3.19 | LR: 2.28e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 2300/2659 | Loss: 1.1273 | Train PPL: 3.19 | LR: 2.28e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 2350/2659 | Loss: 1.1333 | Train PPL: 3.18 | LR: 2.28e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 2400/2659 | Loss: 1.1015 | Train PPL: 3.18 | LR: 2.27e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 2450/2659 | Loss: 1.1638 | Train PPL: 3.18 | LR: 2.27e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 2500/2659 | Loss: 1.2250 | Train PPL: 3.18 | LR: 2.26e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 2550/2659 | Loss: 1.1371 | Train PPL: 3.18 | LR: 2.26e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 2600/2659 | Loss: 1.1553 | Train PPL: 3.18 | LR: 2.25e-04 | Speed: 8915 tok/s
+Epoch 8/20 | Batch 2650/2659 | Loss: 1.1964 | Train PPL: 3.18 | LR: 2.25e-04 | Speed: 8915 tok/s
+
+============================================================
+Epoch 8 Complete | Time: 1253.6s
+Train PPL: 3.18 | Valid PPL: 3.79
+============================================================
+
+🔥 New best! Valid PPL: 3.79
+
+Epoch 9/20 | Batch 50/2659 | Loss: 1.1529 | Train PPL: 3.21 | LR: 2.24e-04 | Speed: 8915 tok/s
+Epoch 9/20 | Batch 100/2659 | Loss: 1.1382 | Train PPL: 3.17 | LR: 2.24e-04 | Speed: 8914 tok/s
+Epoch 9/20 | Batch 150/2659 | Loss: 1.1097 | Train PPL: 3.17 | LR: 2.24e-04 | Speed: 8914 tok/s
+Epoch 9/20 | Batch 200/2659 | Loss: 1.1300 | Train PPL: 3.16 | LR: 2.23e-04 | Speed: 8914 tok/s
+Epoch 9/20 | Batch 250/2659 | Loss: 1.1457 | Train PPL: 3.16 | LR: 2.23e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 300/2659 | Loss: 1.1937 | Train PPL: 3.16 | LR: 2.22e-04 | Speed: 8914 tok/s
+Epoch 9/20 | Batch 350/2659 | Loss: 1.2079 | Train PPL: 3.16 | LR: 2.22e-04 | Speed: 8914 tok/s
+Epoch 9/20 | Batch 400/2659 | Loss: 1.1294 | Train PPL: 3.17 | LR: 2.21e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 450/2659 | Loss: 1.1584 | Train PPL: 3.16 | LR: 2.21e-04 | Speed: 8914 tok/s
+Epoch 9/20 | Batch 500/2659 | Loss: 1.1369 | Train PPL: 3.17 | LR: 2.21e-04 | Speed: 8914 tok/s
+Epoch 9/20 | Batch 550/2659 | Loss: 1.1473 | Train PPL: 3.17 | LR: 2.20e-04 | Speed: 8914 tok/s
+Epoch 9/20 | Batch 600/2659 | Loss: 1.1722 | Train PPL: 3.17 | LR: 2.20e-04 | Speed: 8914 tok/s
+Epoch 9/20 | Batch 650/2659 | Loss: 1.1569 | Train PPL: 3.17 | LR: 2.19e-04 | Speed: 8914 tok/s
+Epoch 9/20 | Batch 700/2659 | Loss: 1.1395 | Train PPL: 3.17 | LR: 2.19e-04 | Speed: 8914 tok/s
+Epoch 9/20 | Batch 750/2659 | Loss: 1.1854 | Train PPL: 3.17 | LR: 2.18e-04 | Speed: 8914 tok/s
+Epoch 9/20 | Batch 800/2659 | Loss: 1.1637 | Train PPL: 3.17 | LR: 2.18e-04 | Speed: 8914 tok/s
+Epoch 9/20 | Batch 850/2659 | Loss: 1.1409 | Train PPL: 3.16 | LR: 2.18e-04 | Speed: 8914 tok/s
+Epoch 9/20 | Batch 900/2659 | Loss: 1.1880 | Train PPL: 3.16 | LR: 2.17e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 950/2659 | Loss: 1.1408 | Train PPL: 3.17 | LR: 2.17e-04 | Speed: 8914 tok/s
+Epoch 9/20 | Batch 1000/2659 | Loss: 1.1019 | Train PPL: 3.17 | LR: 2.16e-04 | Speed: 8914 tok/s
+Epoch 9/20 | Batch 1050/2659 | Loss: 1.1478 | Train PPL: 3.17 | LR: 2.16e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 1100/2659 | Loss: 1.1156 | Train PPL: 3.17 | LR: 2.15e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 1150/2659 | Loss: 1.2153 | Train PPL: 3.17 | LR: 2.15e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 1200/2659 | Loss: 1.1264 | Train PPL: 3.17 | LR: 2.14e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 1250/2659 | Loss: 1.1756 | Train PPL: 3.17 | LR: 2.14e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 1300/2659 | Loss: 1.1023 | Train PPL: 3.17 | LR: 2.14e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 1350/2659 | Loss: 1.1243 | Train PPL: 3.16 | LR: 2.13e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 1400/2659 | Loss: 1.1627 | Train PPL: 3.17 | LR: 2.13e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 1450/2659 | Loss: 1.1494 | Train PPL: 3.16 | LR: 2.12e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 1500/2659 | Loss: 1.1313 | Train PPL: 3.16 | LR: 2.12e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 1550/2659 | Loss: 1.1120 | Train PPL: 3.16 | LR: 2.11e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 1600/2659 | Loss: 1.1079 | Train PPL: 3.16 | LR: 2.11e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 1650/2659 | Loss: 1.1621 | Train PPL: 3.16 | LR: 2.10e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 1700/2659 | Loss: 1.1521 | Train PPL: 3.16 | LR: 2.10e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 1750/2659 | Loss: 1.1583 | Train PPL: 3.16 | LR: 2.10e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 1800/2659 | Loss: 1.0867 | Train PPL: 3.16 | LR: 2.09e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 1850/2659 | Loss: 1.0620 | Train PPL: 3.16 | LR: 2.09e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 1900/2659 | Loss: 1.0691 | Train PPL: 3.15 | LR: 2.08e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 1950/2659 | Loss: 1.1050 | Train PPL: 3.15 | LR: 2.08e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 2000/2659 | Loss: 1.1101 | Train PPL: 3.15 | LR: 2.07e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 2050/2659 | Loss: 1.0653 | Train PPL: 3.15 | LR: 2.07e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 2100/2659 | Loss: 1.1841 | Train PPL: 3.15 | LR: 2.06e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 2150/2659 | Loss: 1.1801 | Train PPL: 3.15 | LR: 2.06e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 2200/2659 | Loss: 1.1333 | Train PPL: 3.15 | LR: 2.05e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 2250/2659 | Loss: 1.1476 | Train PPL: 3.15 | LR: 2.05e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 2300/2659 | Loss: 1.1142 | Train PPL: 3.14 | LR: 2.05e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 2350/2659 | Loss: 1.1205 | Train PPL: 3.14 | LR: 2.04e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 2400/2659 | Loss: 1.0934 | Train PPL: 3.14 | LR: 2.04e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 2450/2659 | Loss: 1.1492 | Train PPL: 3.14 | LR: 2.03e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 2500/2659 | Loss: 1.2109 | Train PPL: 3.14 | LR: 2.03e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 2550/2659 | Loss: 1.1213 | Train PPL: 3.14 | LR: 2.02e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 2600/2659 | Loss: 1.1408 | Train PPL: 3.14 | LR: 2.02e-04 | Speed: 8913 tok/s
+Epoch 9/20 | Batch 2650/2659 | Loss: 1.1756 | Train PPL: 3.14 | LR: 2.01e-04 | Speed: 8913 tok/s
+
+============================================================
+Epoch 9 Complete | Time: 1253.9s
+Train PPL: 3.14 | Valid PPL: 3.76
+============================================================
+
+🔥 New best! Valid PPL: 3.76
+
+Epoch 10/20 | Batch 50/2659 | Loss: 1.1484 | Train PPL: 3.17 | LR: 2.01e-04 | Speed: 8913 tok/s
+Epoch 10/20 | Batch 100/2659 | Loss: 1.1326 | Train PPL: 3.13 | LR: 2.00e-04 | Speed: 8913 tok/s
+Epoch 10/20 | Batch 150/2659 | Loss: 1.0989 | Train PPL: 3.13 | LR: 2.00e-04 | Speed: 8913 tok/s
+Epoch 10/20 | Batch 200/2659 | Loss: 1.1177 | Train PPL: 3.12 | LR: 1.99e-04 | Speed: 8913 tok/s
+Epoch 10/20 | Batch 250/2659 | Loss: 1.1313 | Train PPL: 3.12 | LR: 1.99e-04 | Speed: 8913 tok/s
+Epoch 10/20 | Batch 300/2659 | Loss: 1.1756 | Train PPL: 3.12 | LR: 1.98e-04 | Speed: 8913 tok/s
+Epoch 10/20 | Batch 350/2659 | Loss: 1.1952 | Train PPL: 3.12 | LR: 1.98e-04 | Speed: 8913 tok/s
+Epoch 10/20 | Batch 400/2659 | Loss: 1.1200 | Train PPL: 3.13 | LR: 1.97e-04 | Speed: 8913 tok/s
+Epoch 10/20 | Batch 450/2659 | Loss: 1.1478 | Train PPL: 3.13 | LR: 1.97e-04 | Speed: 8913 tok/s
+Epoch 10/20 | Batch 500/2659 | Loss: 1.1244 | Train PPL: 3.13 | LR: 1.97e-04 | Speed: 8913 tok/s
+Epoch 10/20 | Batch 550/2659 | Loss: 1.1341 | Train PPL: 3.13 | LR: 1.96e-04 | Speed: 8913 tok/s
+Epoch 10/20 | Batch 600/2659 | Loss: 1.1699 | Train PPL: 3.13 | LR: 1.96e-04 | Speed: 8913 tok/s
+Epoch 10/20 | Batch 650/2659 | Loss: 1.1454 | Train PPL: 3.13 | LR: 1.95e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 700/2659 | Loss: 1.1261 | Train PPL: 3.13 | LR: 1.95e-04 | Speed: 8913 tok/s
+Epoch 10/20 | Batch 750/2659 | Loss: 1.1713 | Train PPL: 3.13 | LR: 1.94e-04 | Speed: 8913 tok/s
+Epoch 10/20 | Batch 800/2659 | Loss: 1.1523 | Train PPL: 3.13 | LR: 1.94e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 850/2659 | Loss: 1.1241 | Train PPL: 3.13 | LR: 1.93e-04 | Speed: 8913 tok/s
+Epoch 10/20 | Batch 900/2659 | Loss: 1.1843 | Train PPL: 3.13 | LR: 1.93e-04 | Speed: 8913 tok/s
+Epoch 10/20 | Batch 950/2659 | Loss: 1.1268 | Train PPL: 3.13 | LR: 1.92e-04 | Speed: 8913 tok/s
+Epoch 10/20 | Batch 1000/2659 | Loss: 1.0929 | Train PPL: 3.13 | LR: 1.92e-04 | Speed: 8913 tok/s
+Epoch 10/20 | Batch 1050/2659 | Loss: 1.1306 | Train PPL: 3.13 | LR: 1.91e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 1100/2659 | Loss: 1.1059 | Train PPL: 3.13 | LR: 1.91e-04 | Speed: 8913 tok/s
+Epoch 10/20 | Batch 1150/2659 | Loss: 1.2041 | Train PPL: 3.13 | LR: 1.90e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 1200/2659 | Loss: 1.1125 | Train PPL: 3.13 | LR: 1.90e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 1250/2659 | Loss: 1.1723 | Train PPL: 3.13 | LR: 1.89e-04 | Speed: 8913 tok/s
+Epoch 10/20 | Batch 1300/2659 | Loss: 1.0951 | Train PPL: 3.13 | LR: 1.89e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 1350/2659 | Loss: 1.1151 | Train PPL: 3.13 | LR: 1.89e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 1400/2659 | Loss: 1.1504 | Train PPL: 3.13 | LR: 1.88e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 1450/2659 | Loss: 1.1446 | Train PPL: 3.13 | LR: 1.88e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 1500/2659 | Loss: 1.1170 | Train PPL: 3.13 | LR: 1.87e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 1550/2659 | Loss: 1.0985 | Train PPL: 3.13 | LR: 1.87e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 1600/2659 | Loss: 1.0967 | Train PPL: 3.13 | LR: 1.86e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 1650/2659 | Loss: 1.1503 | Train PPL: 3.12 | LR: 1.86e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 1700/2659 | Loss: 1.1417 | Train PPL: 3.12 | LR: 1.85e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 1750/2659 | Loss: 1.1451 | Train PPL: 3.12 | LR: 1.85e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 1800/2659 | Loss: 1.0785 | Train PPL: 3.12 | LR: 1.84e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 1850/2659 | Loss: 1.0460 | Train PPL: 3.12 | LR: 1.84e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 1900/2659 | Loss: 1.0487 | Train PPL: 3.12 | LR: 1.83e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 1950/2659 | Loss: 1.0921 | Train PPL: 3.11 | LR: 1.83e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 2000/2659 | Loss: 1.1018 | Train PPL: 3.11 | LR: 1.82e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 2050/2659 | Loss: 1.0622 | Train PPL: 3.11 | LR: 1.82e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 2100/2659 | Loss: 1.1766 | Train PPL: 3.11 | LR: 1.81e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 2150/2659 | Loss: 1.1632 | Train PPL: 3.11 | LR: 1.81e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 2200/2659 | Loss: 1.1217 | Train PPL: 3.11 | LR: 1.80e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 2250/2659 | Loss: 1.1438 | Train PPL: 3.11 | LR: 1.80e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 2300/2659 | Loss: 1.1029 | Train PPL: 3.11 | LR: 1.79e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 2350/2659 | Loss: 1.1050 | Train PPL: 3.11 | LR: 1.79e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 2400/2659 | Loss: 1.0829 | Train PPL: 3.10 | LR: 1.78e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 2450/2659 | Loss: 1.1438 | Train PPL: 3.10 | LR: 1.78e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 2500/2659 | Loss: 1.2078 | Train PPL: 3.10 | LR: 1.77e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 2550/2659 | Loss: 1.1160 | Train PPL: 3.10 | LR: 1.77e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 2600/2659 | Loss: 1.1294 | Train PPL: 3.10 | LR: 1.77e-04 | Speed: 8914 tok/s
+Epoch 10/20 | Batch 2650/2659 | Loss: 1.1695 | Train PPL: 3.11 | LR: 1.76e-04 | Speed: 8914 tok/s
+
+============================================================
+Epoch 10 Complete | Time: 1253.8s
+Train PPL: 3.11 | Valid PPL: 3.75
+============================================================
+
+🔥 New best! Valid PPL: 3.75
+
+Epoch 11/20 | Batch 50/2659 | Loss: 1.1319 | Train PPL: 3.13 | LR: 1.75e-04 | Speed: 8915 tok/s
+Epoch 11/20 | Batch 100/2659 | Loss: 1.1198 | Train PPL: 3.10 | LR: 1.75e-04 | Speed: 8915 tok/s
+Epoch 11/20 | Batch 150/2659 | Loss: 1.0873 | Train PPL: 3.09 | LR: 1.74e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 200/2659 | Loss: 1.0989 | Train PPL: 3.08 | LR: 1.74e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 250/2659 | Loss: 1.1275 | Train PPL: 3.09 | LR: 1.74e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 300/2659 | Loss: 1.1668 | Train PPL: 3.09 | LR: 1.73e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 350/2659 | Loss: 1.1833 | Train PPL: 3.09 | LR: 1.73e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 400/2659 | Loss: 1.1091 | Train PPL: 3.09 | LR: 1.72e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 450/2659 | Loss: 1.1371 | Train PPL: 3.09 | LR: 1.72e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 500/2659 | Loss: 1.1099 | Train PPL: 3.10 | LR: 1.71e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 550/2659 | Loss: 1.1268 | Train PPL: 3.10 | LR: 1.71e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 600/2659 | Loss: 1.1520 | Train PPL: 3.10 | LR: 1.70e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 650/2659 | Loss: 1.1303 | Train PPL: 3.10 | LR: 1.70e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 700/2659 | Loss: 1.1152 | Train PPL: 3.10 | LR: 1.69e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 750/2659 | Loss: 1.1605 | Train PPL: 3.10 | LR: 1.69e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 800/2659 | Loss: 1.1435 | Train PPL: 3.10 | LR: 1.68e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 850/2659 | Loss: 1.1202 | Train PPL: 3.09 | LR: 1.68e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 900/2659 | Loss: 1.1724 | Train PPL: 3.09 | LR: 1.67e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 950/2659 | Loss: 1.1223 | Train PPL: 3.09 | LR: 1.67e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 1000/2659 | Loss: 1.0915 | Train PPL: 3.09 | LR: 1.66e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 1050/2659 | Loss: 1.1198 | Train PPL: 3.10 | LR: 1.66e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 1100/2659 | Loss: 1.0985 | Train PPL: 3.10 | LR: 1.65e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 1150/2659 | Loss: 1.1883 | Train PPL: 3.10 | LR: 1.65e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 1200/2659 | Loss: 1.0991 | Train PPL: 3.09 | LR: 1.64e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 1250/2659 | Loss: 1.1589 | Train PPL: 3.09 | LR: 1.64e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 1300/2659 | Loss: 1.0829 | Train PPL: 3.09 | LR: 1.63e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 1350/2659 | Loss: 1.1076 | Train PPL: 3.09 | LR: 1.63e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 1400/2659 | Loss: 1.1363 | Train PPL: 3.09 | LR: 1.62e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 1450/2659 | Loss: 1.1314 | Train PPL: 3.09 | LR: 1.62e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 1500/2659 | Loss: 1.1058 | Train PPL: 3.09 | LR: 1.61e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 1550/2659 | Loss: 1.0955 | Train PPL: 3.09 | LR: 1.61e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 1600/2659 | Loss: 1.0955 | Train PPL: 3.09 | LR: 1.60e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 1650/2659 | Loss: 1.1373 | Train PPL: 3.09 | LR: 1.60e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 1700/2659 | Loss: 1.1350 | Train PPL: 3.09 | LR: 1.59e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 1750/2659 | Loss: 1.1292 | Train PPL: 3.09 | LR: 1.59e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 1800/2659 | Loss: 1.0754 | Train PPL: 3.09 | LR: 1.58e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 1850/2659 | Loss: 1.0405 | Train PPL: 3.09 | LR: 1.58e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 1900/2659 | Loss: 1.0448 | Train PPL: 3.08 | LR: 1.57e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 1950/2659 | Loss: 1.0763 | Train PPL: 3.08 | LR: 1.57e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 2000/2659 | Loss: 1.0976 | Train PPL: 3.08 | LR: 1.56e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 2050/2659 | Loss: 1.0500 | Train PPL: 3.08 | LR: 1.56e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 2100/2659 | Loss: 1.1571 | Train PPL: 3.08 | LR: 1.55e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 2150/2659 | Loss: 1.1569 | Train PPL: 3.08 | LR: 1.55e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 2200/2659 | Loss: 1.1106 | Train PPL: 3.08 | LR: 1.54e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 2250/2659 | Loss: 1.1338 | Train PPL: 3.08 | LR: 1.54e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 2300/2659 | Loss: 1.0886 | Train PPL: 3.08 | LR: 1.53e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 2350/2659 | Loss: 1.0983 | Train PPL: 3.07 | LR: 1.53e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 2400/2659 | Loss: 1.0690 | Train PPL: 3.07 | LR: 1.52e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 2450/2659 | Loss: 1.1350 | Train PPL: 3.07 | LR: 1.52e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 2500/2659 | Loss: 1.1966 | Train PPL: 3.07 | LR: 1.51e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 2550/2659 | Loss: 1.1084 | Train PPL: 3.07 | LR: 1.51e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 2600/2659 | Loss: 1.1152 | Train PPL: 3.07 | LR: 1.50e-04 | Speed: 8914 tok/s
+Epoch 11/20 | Batch 2650/2659 | Loss: 1.1534 | Train PPL: 3.07 | LR: 1.50e-04 | Speed: 8913 tok/s
+
+============================================================
+Epoch 11 Complete | Time: 1253.8s
+Train PPL: 3.07 | Valid PPL: 3.73
+============================================================
+
+🔥 New best! Valid PPL: 3.73
+
+Epoch 12/20 | Batch 50/2659 | Loss: 1.1198 | Train PPL: 3.10 | LR: 1.49e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 100/2659 | Loss: 1.1091 | Train PPL: 3.07 | LR: 1.49e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 150/2659 | Loss: 1.0779 | Train PPL: 3.07 | LR: 1.48e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 200/2659 | Loss: 1.0957 | Train PPL: 3.05 | LR: 1.48e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 250/2659 | Loss: 1.1187 | Train PPL: 3.06 | LR: 1.47e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 300/2659 | Loss: 1.1557 | Train PPL: 3.06 | LR: 1.47e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 350/2659 | Loss: 1.1739 | Train PPL: 3.06 | LR: 1.46e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 400/2659 | Loss: 1.0972 | Train PPL: 3.06 | LR: 1.46e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 450/2659 | Loss: 1.1366 | Train PPL: 3.06 | LR: 1.45e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 500/2659 | Loss: 1.0991 | Train PPL: 3.07 | LR: 1.45e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 550/2659 | Loss: 1.1120 | Train PPL: 3.07 | LR: 1.44e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 600/2659 | Loss: 1.1457 | Train PPL: 3.07 | LR: 1.44e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 650/2659 | Loss: 1.1265 | Train PPL: 3.07 | LR: 1.43e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 700/2659 | Loss: 1.0990 | Train PPL: 3.07 | LR: 1.43e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 750/2659 | Loss: 1.1479 | Train PPL: 3.07 | LR: 1.43e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 800/2659 | Loss: 1.1319 | Train PPL: 3.07 | LR: 1.42e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 850/2659 | Loss: 1.1000 | Train PPL: 3.06 | LR: 1.42e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 900/2659 | Loss: 1.1621 | Train PPL: 3.06 | LR: 1.41e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 950/2659 | Loss: 1.1136 | Train PPL: 3.06 | LR: 1.41e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 1000/2659 | Loss: 1.0746 | Train PPL: 3.06 | LR: 1.40e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 1050/2659 | Loss: 1.1138 | Train PPL: 3.07 | LR: 1.40e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 1100/2659 | Loss: 1.0866 | Train PPL: 3.07 | LR: 1.39e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 1150/2659 | Loss: 1.1790 | Train PPL: 3.07 | LR: 1.39e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 1200/2659 | Loss: 1.1014 | Train PPL: 3.07 | LR: 1.38e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 1250/2659 | Loss: 1.1452 | Train PPL: 3.07 | LR: 1.38e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 1300/2659 | Loss: 1.0805 | Train PPL: 3.06 | LR: 1.37e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 1350/2659 | Loss: 1.0935 | Train PPL: 3.06 | LR: 1.37e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 1400/2659 | Loss: 1.1243 | Train PPL: 3.06 | LR: 1.36e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 1450/2659 | Loss: 1.1244 | Train PPL: 3.06 | LR: 1.36e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 1500/2659 | Loss: 1.1044 | Train PPL: 3.06 | LR: 1.35e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 1550/2659 | Loss: 1.0819 | Train PPL: 3.06 | LR: 1.35e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 1600/2659 | Loss: 1.0809 | Train PPL: 3.06 | LR: 1.34e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 1650/2659 | Loss: 1.1246 | Train PPL: 3.06 | LR: 1.34e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 1700/2659 | Loss: 1.1212 | Train PPL: 3.06 | LR: 1.33e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 1750/2659 | Loss: 1.1240 | Train PPL: 3.06 | LR: 1.33e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 1800/2659 | Loss: 1.0611 | Train PPL: 3.06 | LR: 1.32e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 1850/2659 | Loss: 1.0299 | Train PPL: 3.06 | LR: 1.32e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 1900/2659 | Loss: 1.0316 | Train PPL: 3.06 | LR: 1.31e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 1950/2659 | Loss: 1.0690 | Train PPL: 3.05 | LR: 1.31e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 2000/2659 | Loss: 1.0889 | Train PPL: 3.05 | LR: 1.30e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 2050/2659 | Loss: 1.0460 | Train PPL: 3.05 | LR: 1.30e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 2100/2659 | Loss: 1.1530 | Train PPL: 3.05 | LR: 1.29e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 2150/2659 | Loss: 1.1334 | Train PPL: 3.05 | LR: 1.29e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 2200/2659 | Loss: 1.0966 | Train PPL: 3.05 | LR: 1.28e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 2250/2659 | Loss: 1.1219 | Train PPL: 3.05 | LR: 1.28e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 2300/2659 | Loss: 1.0846 | Train PPL: 3.05 | LR: 1.27e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 2350/2659 | Loss: 1.0954 | Train PPL: 3.04 | LR: 1.27e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 2400/2659 | Loss: 1.0636 | Train PPL: 3.04 | LR: 1.26e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 2450/2659 | Loss: 1.1140 | Train PPL: 3.04 | LR: 1.26e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 2500/2659 | Loss: 1.1870 | Train PPL: 3.04 | LR: 1.25e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 2550/2659 | Loss: 1.0969 | Train PPL: 3.04 | LR: 1.25e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 2600/2659 | Loss: 1.1037 | Train PPL: 3.04 | LR: 1.24e-04 | Speed: 8914 tok/s
+Epoch 12/20 | Batch 2650/2659 | Loss: 1.1415 | Train PPL: 3.04 | LR: 1.24e-04 | Speed: 8914 tok/s
+
+============================================================
+Epoch 12 Complete | Time: 1253.7s
+Train PPL: 3.04 | Valid PPL: 3.71
+============================================================
+
+🔥 New best! Valid PPL: 3.71
+
+Epoch 13/20 | Batch 50/2659 | Loss: 1.1151 | Train PPL: 3.07 | LR: 1.23e-04 | Speed: 8914 tok/s
+Epoch 13/20 | Batch 100/2659 | Loss: 1.1022 | Train PPL: 3.04 | LR: 1.23e-04 | Speed: 8914 tok/s
+Epoch 13/20 | Batch 150/2659 | Loss: 1.0723 | Train PPL: 3.04 | LR: 1.22e-04 | Speed: 8914 tok/s
+Epoch 13/20 | Batch 200/2659 | Loss: 1.0837 | Train PPL: 3.03 | LR: 1.22e-04 | Speed: 8914 tok/s
+Epoch 13/20 | Batch 250/2659 | Loss: 1.1118 | Train PPL: 3.03 | LR: 1.21e-04 | Speed: 8914 tok/s
+Epoch 13/20 | Batch 300/2659 | Loss: 1.1527 | Train PPL: 3.03 | LR: 1.21e-04 | Speed: 8914 tok/s
+Epoch 13/20 | Batch 350/2659 | Loss: 1.1655 | Train PPL: 3.03 | LR: 1.20e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 400/2659 | Loss: 1.0870 | Train PPL: 3.03 | LR: 1.20e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 450/2659 | Loss: 1.1221 | Train PPL: 3.03 | LR: 1.19e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 500/2659 | Loss: 1.0881 | Train PPL: 3.04 | LR: 1.19e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 550/2659 | Loss: 1.1054 | Train PPL: 3.04 | LR: 1.19e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 600/2659 | Loss: 1.1376 | Train PPL: 3.04 | LR: 1.18e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 650/2659 | Loss: 1.1162 | Train PPL: 3.04 | LR: 1.18e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 700/2659 | Loss: 1.0933 | Train PPL: 3.04 | LR: 1.17e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 750/2659 | Loss: 1.1429 | Train PPL: 3.04 | LR: 1.17e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 800/2659 | Loss: 1.1279 | Train PPL: 3.04 | LR: 1.16e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 850/2659 | Loss: 1.0998 | Train PPL: 3.04 | LR: 1.16e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 900/2659 | Loss: 1.1542 | Train PPL: 3.04 | LR: 1.15e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 950/2659 | Loss: 1.1011 | Train PPL: 3.04 | LR: 1.15e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 1000/2659 | Loss: 1.0690 | Train PPL: 3.04 | LR: 1.14e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 1050/2659 | Loss: 1.1072 | Train PPL: 3.04 | LR: 1.14e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 1100/2659 | Loss: 1.0848 | Train PPL: 3.04 | LR: 1.13e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 1150/2659 | Loss: 1.1725 | Train PPL: 3.04 | LR: 1.13e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 1200/2659 | Loss: 1.0890 | Train PPL: 3.04 | LR: 1.12e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 1250/2659 | Loss: 1.1425 | Train PPL: 3.04 | LR: 1.12e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 1300/2659 | Loss: 1.0708 | Train PPL: 3.04 | LR: 1.11e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 1350/2659 | Loss: 1.0857 | Train PPL: 3.04 | LR: 1.11e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 1400/2659 | Loss: 1.1167 | Train PPL: 3.04 | LR: 1.10e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 1450/2659 | Loss: 1.1205 | Train PPL: 3.04 | LR: 1.10e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 1500/2659 | Loss: 1.0940 | Train PPL: 3.04 | LR: 1.09e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 1550/2659 | Loss: 1.0804 | Train PPL: 3.04 | LR: 1.09e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 1600/2659 | Loss: 1.0775 | Train PPL: 3.04 | LR: 1.08e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 1650/2659 | Loss: 1.1219 | Train PPL: 3.04 | LR: 1.08e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 1700/2659 | Loss: 1.1140 | Train PPL: 3.04 | LR: 1.08e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 1750/2659 | Loss: 1.1169 | Train PPL: 3.04 | LR: 1.07e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 1800/2659 | Loss: 1.0557 | Train PPL: 3.03 | LR: 1.07e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 1850/2659 | Loss: 1.0247 | Train PPL: 3.03 | LR: 1.06e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 1900/2659 | Loss: 1.0158 | Train PPL: 3.03 | LR: 1.06e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 1950/2659 | Loss: 1.0663 | Train PPL: 3.03 | LR: 1.05e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 2000/2659 | Loss: 1.0766 | Train PPL: 3.02 | LR: 1.05e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 2050/2659 | Loss: 1.0309 | Train PPL: 3.02 | LR: 1.04e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 2100/2659 | Loss: 1.1454 | Train PPL: 3.02 | LR: 1.04e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 2150/2659 | Loss: 1.1288 | Train PPL: 3.02 | LR: 1.03e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 2200/2659 | Loss: 1.0966 | Train PPL: 3.02 | LR: 1.03e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 2250/2659 | Loss: 1.1143 | Train PPL: 3.02 | LR: 1.02e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 2300/2659 | Loss: 1.0779 | Train PPL: 3.02 | LR: 1.02e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 2350/2659 | Loss: 1.0851 | Train PPL: 3.02 | LR: 1.01e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 2400/2659 | Loss: 1.0509 | Train PPL: 3.02 | LR: 1.01e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 2450/2659 | Loss: 1.1142 | Train PPL: 3.02 | LR: 1.01e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 2500/2659 | Loss: 1.1755 | Train PPL: 3.02 | LR: 1.00e-04 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 2550/2659 | Loss: 1.0876 | Train PPL: 3.02 | LR: 9.96e-05 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 2600/2659 | Loss: 1.0936 | Train PPL: 3.02 | LR: 9.91e-05 | Speed: 8915 tok/s
+Epoch 13/20 | Batch 2650/2659 | Loss: 1.1319 | Train PPL: 3.02 | LR: 9.87e-05 | Speed: 8915 tok/s
+
+============================================================
+Epoch 13 Complete | Time: 1253.5s
+Train PPL: 3.02 | Valid PPL: 3.70
+============================================================
+
+🔥 New best! Valid PPL: 3.70
+
+Epoch 14/20 | Batch 50/2659 | Loss: 1.1100 | Train PPL: 3.04 | LR: 9.81e-05 | Speed: 8914 tok/s
+Epoch 14/20 | Batch 100/2659 | Loss: 1.0951 | Train PPL: 3.01 | LR: 9.76e-05 | Speed: 8914 tok/s
+Epoch 14/20 | Batch 150/2659 | Loss: 1.0611 | Train PPL: 3.01 | LR: 9.72e-05 | Speed: 8914 tok/s
+Epoch 14/20 | Batch 200/2659 | Loss: 1.0731 | Train PPL: 3.00 | LR: 9.67e-05 | Speed: 8914 tok/s
+Epoch 14/20 | Batch 250/2659 | Loss: 1.1011 | Train PPL: 3.00 | LR: 9.63e-05 | Speed: 8914 tok/s
+Epoch 14/20 | Batch 300/2659 | Loss: 1.1472 | Train PPL: 3.00 | LR: 9.58e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 350/2659 | Loss: 1.1538 | Train PPL: 3.00 | LR: 9.53e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 400/2659 | Loss: 1.0813 | Train PPL: 3.01 | LR: 9.49e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 450/2659 | Loss: 1.1096 | Train PPL: 3.01 | LR: 9.44e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 500/2659 | Loss: 1.0895 | Train PPL: 3.01 | LR: 9.40e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 550/2659 | Loss: 1.0956 | Train PPL: 3.01 | LR: 9.35e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 600/2659 | Loss: 1.1298 | Train PPL: 3.01 | LR: 9.31e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 650/2659 | Loss: 1.1139 | Train PPL: 3.02 | LR: 9.26e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 700/2659 | Loss: 1.0863 | Train PPL: 3.01 | LR: 9.22e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 750/2659 | Loss: 1.1293 | Train PPL: 3.02 | LR: 9.17e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 800/2659 | Loss: 1.1176 | Train PPL: 3.01 | LR: 9.12e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 850/2659 | Loss: 1.0869 | Train PPL: 3.01 | LR: 9.08e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 900/2659 | Loss: 1.1461 | Train PPL: 3.01 | LR: 9.03e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 950/2659 | Loss: 1.0933 | Train PPL: 3.01 | LR: 8.99e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 1000/2659 | Loss: 1.0628 | Train PPL: 3.01 | LR: 8.94e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 1050/2659 | Loss: 1.0998 | Train PPL: 3.01 | LR: 8.90e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 1100/2659 | Loss: 1.0796 | Train PPL: 3.01 | LR: 8.85e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 1150/2659 | Loss: 1.1537 | Train PPL: 3.02 | LR: 8.81e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 1200/2659 | Loss: 1.0860 | Train PPL: 3.01 | LR: 8.76e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 1250/2659 | Loss: 1.1357 | Train PPL: 3.01 | LR: 8.72e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 1300/2659 | Loss: 1.0698 | Train PPL: 3.01 | LR: 8.67e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 1350/2659 | Loss: 1.0764 | Train PPL: 3.01 | LR: 8.63e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 1400/2659 | Loss: 1.1110 | Train PPL: 3.01 | LR: 8.59e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 1450/2659 | Loss: 1.1119 | Train PPL: 3.01 | LR: 8.54e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 1500/2659 | Loss: 1.0877 | Train PPL: 3.01 | LR: 8.50e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 1550/2659 | Loss: 1.0677 | Train PPL: 3.01 | LR: 8.45e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 1600/2659 | Loss: 1.0616 | Train PPL: 3.01 | LR: 8.41e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 1650/2659 | Loss: 1.1171 | Train PPL: 3.01 | LR: 8.36e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 1700/2659 | Loss: 1.1099 | Train PPL: 3.01 | LR: 8.32e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 1750/2659 | Loss: 1.1033 | Train PPL: 3.01 | LR: 8.28e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 1800/2659 | Loss: 1.0525 | Train PPL: 3.01 | LR: 8.23e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 1850/2659 | Loss: 1.0181 | Train PPL: 3.01 | LR: 8.19e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 1900/2659 | Loss: 1.0108 | Train PPL: 3.01 | LR: 8.14e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 1950/2659 | Loss: 1.0519 | Train PPL: 3.00 | LR: 8.10e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 2000/2659 | Loss: 1.0748 | Train PPL: 3.00 | LR: 8.06e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 2050/2659 | Loss: 1.0307 | Train PPL: 3.00 | LR: 8.01e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 2100/2659 | Loss: 1.1384 | Train PPL: 3.00 | LR: 7.97e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 2150/2659 | Loss: 1.1189 | Train PPL: 3.00 | LR: 7.93e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 2200/2659 | Loss: 1.0900 | Train PPL: 3.00 | LR: 7.88e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 2250/2659 | Loss: 1.1089 | Train PPL: 3.00 | LR: 7.84e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 2300/2659 | Loss: 1.0626 | Train PPL: 3.00 | LR: 7.80e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 2350/2659 | Loss: 1.0758 | Train PPL: 3.00 | LR: 7.75e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 2400/2659 | Loss: 1.0443 | Train PPL: 2.99 | LR: 7.71e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 2450/2659 | Loss: 1.1044 | Train PPL: 2.99 | LR: 7.67e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 2500/2659 | Loss: 1.1705 | Train PPL: 2.99 | LR: 7.62e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 2550/2659 | Loss: 1.0790 | Train PPL: 2.99 | LR: 7.58e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 2600/2659 | Loss: 1.0950 | Train PPL: 2.99 | LR: 7.54e-05 | Speed: 8915 tok/s
+Epoch 14/20 | Batch 2650/2659 | Loss: 1.1317 | Train PPL: 3.00 | LR: 7.50e-05 | Speed: 8915 tok/s
+
+============================================================
+Epoch 14 Complete | Time: 1253.6s
+Train PPL: 3.00 | Valid PPL: 3.68
+============================================================
+
+🔥 New best! Valid PPL: 3.68
+
+Epoch 15/20 | Batch 50/2659 | Loss: 1.0976 | Train PPL: 3.02 | LR: 7.44e-05 | Speed: 8912 tok/s
+Epoch 15/20 | Batch 100/2659 | Loss: 1.0855 | Train PPL: 2.99 | LR: 7.40e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 150/2659 | Loss: 1.0568 | Train PPL: 2.99 | LR: 7.36e-05 | Speed: 8914 tok/s
+Epoch 15/20 | Batch 200/2659 | Loss: 1.0720 | Train PPL: 2.98 | LR: 7.32e-05 | Speed: 8914 tok/s
+Epoch 15/20 | Batch 250/2659 | Loss: 1.0939 | Train PPL: 2.98 | LR: 7.28e-05 | Speed: 8914 tok/s
+Epoch 15/20 | Batch 300/2659 | Loss: 1.1422 | Train PPL: 2.98 | LR: 7.23e-05 | Speed: 8914 tok/s
+Epoch 15/20 | Batch 350/2659 | Loss: 1.1460 | Train PPL: 2.98 | LR: 7.19e-05 | Speed: 8914 tok/s
+Epoch 15/20 | Batch 400/2659 | Loss: 1.0692 | Train PPL: 2.99 | LR: 7.15e-05 | Speed: 8914 tok/s
+Epoch 15/20 | Batch 450/2659 | Loss: 1.1096 | Train PPL: 2.99 | LR: 7.11e-05 | Speed: 8914 tok/s
+Epoch 15/20 | Batch 500/2659 | Loss: 1.0803 | Train PPL: 2.99 | LR: 7.07e-05 | Speed: 8914 tok/s
+Epoch 15/20 | Batch 550/2659 | Loss: 1.0925 | Train PPL: 2.99 | LR: 7.02e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 600/2659 | Loss: 1.1197 | Train PPL: 2.99 | LR: 6.98e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 650/2659 | Loss: 1.1103 | Train PPL: 3.00 | LR: 6.94e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 700/2659 | Loss: 1.0724 | Train PPL: 2.99 | LR: 6.90e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 750/2659 | Loss: 1.1244 | Train PPL: 3.00 | LR: 6.86e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 800/2659 | Loss: 1.1129 | Train PPL: 2.99 | LR: 6.82e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 850/2659 | Loss: 1.0829 | Train PPL: 2.99 | LR: 6.78e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 900/2659 | Loss: 1.1433 | Train PPL: 2.99 | LR: 6.73e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 950/2659 | Loss: 1.0872 | Train PPL: 2.99 | LR: 6.69e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 1000/2659 | Loss: 1.0559 | Train PPL: 2.99 | LR: 6.65e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 1050/2659 | Loss: 1.0920 | Train PPL: 2.99 | LR: 6.61e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 1100/2659 | Loss: 1.0723 | Train PPL: 2.99 | LR: 6.57e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 1150/2659 | Loss: 1.1522 | Train PPL: 3.00 | LR: 6.53e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 1200/2659 | Loss: 1.0783 | Train PPL: 2.99 | LR: 6.49e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 1250/2659 | Loss: 1.1241 | Train PPL: 2.99 | LR: 6.45e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 1300/2659 | Loss: 1.0630 | Train PPL: 2.99 | LR: 6.41e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 1350/2659 | Loss: 1.0766 | Train PPL: 2.99 | LR: 6.37e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 1400/2659 | Loss: 1.0940 | Train PPL: 2.99 | LR: 6.33e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 1450/2659 | Loss: 1.1156 | Train PPL: 2.99 | LR: 6.29e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 1500/2659 | Loss: 1.0802 | Train PPL: 2.99 | LR: 6.25e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 1550/2659 | Loss: 1.0608 | Train PPL: 2.99 | LR: 6.21e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 1600/2659 | Loss: 1.0602 | Train PPL: 2.99 | LR: 6.17e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 1650/2659 | Loss: 1.1060 | Train PPL: 2.99 | LR: 6.13e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 1700/2659 | Loss: 1.0942 | Train PPL: 2.99 | LR: 6.09e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 1750/2659 | Loss: 1.0952 | Train PPL: 2.99 | LR: 6.05e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 1800/2659 | Loss: 1.0452 | Train PPL: 2.99 | LR: 6.01e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 1850/2659 | Loss: 1.0047 | Train PPL: 2.99 | LR: 5.97e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 1900/2659 | Loss: 1.0003 | Train PPL: 2.99 | LR: 5.93e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 1950/2659 | Loss: 1.0439 | Train PPL: 2.98 | LR: 5.89e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 2000/2659 | Loss: 1.0676 | Train PPL: 2.98 | LR: 5.85e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 2050/2659 | Loss: 1.0256 | Train PPL: 2.98 | LR: 5.81e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 2100/2659 | Loss: 1.1275 | Train PPL: 2.98 | LR: 5.77e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 2150/2659 | Loss: 1.1137 | Train PPL: 2.98 | LR: 5.74e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 2200/2659 | Loss: 1.0773 | Train PPL: 2.98 | LR: 5.70e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 2250/2659 | Loss: 1.0991 | Train PPL: 2.98 | LR: 5.66e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 2300/2659 | Loss: 1.0575 | Train PPL: 2.98 | LR: 5.62e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 2350/2659 | Loss: 1.0749 | Train PPL: 2.98 | LR: 5.58e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 2400/2659 | Loss: 1.0332 | Train PPL: 2.97 | LR: 5.54e-05 | Speed: 8912 tok/s
+Epoch 15/20 | Batch 2450/2659 | Loss: 1.0946 | Train PPL: 2.97 | LR: 5.51e-05 | Speed: 8912 tok/s
+Epoch 15/20 | Batch 2500/2659 | Loss: 1.1582 | Train PPL: 2.97 | LR: 5.47e-05 | Speed: 8912 tok/s
+Epoch 15/20 | Batch 2550/2659 | Loss: 1.0736 | Train PPL: 2.98 | LR: 5.43e-05 | Speed: 8913 tok/s
+Epoch 15/20 | Batch 2600/2659 | Loss: 1.0860 | Train PPL: 2.98 | LR: 5.39e-05 | Speed: 8912 tok/s
+Epoch 15/20 | Batch 2650/2659 | Loss: 1.1202 | Train PPL: 2.98 | LR: 5.35e-05 | Speed: 8912 tok/s
+
+============================================================
+Epoch 15 Complete | Time: 1253.9s
+Train PPL: 2.98 | Valid PPL: 3.65
+============================================================
+
+🔥 New best! Valid PPL: 3.65
+
+Epoch 16/20 | Batch 50/2659 | Loss: 1.0906 | Train PPL: 3.00 | LR: 5.31e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 100/2659 | Loss: 1.0829 | Train PPL: 2.97 | LR: 5.27e-05 | Speed: 8915 tok/s
+Epoch 16/20 | Batch 150/2659 | Loss: 1.0487 | Train PPL: 2.97 | LR: 5.23e-05 | Speed: 8915 tok/s
+Epoch 16/20 | Batch 200/2659 | Loss: 1.0623 | Train PPL: 2.96 | LR: 5.20e-05 | Speed: 8915 tok/s
+Epoch 16/20 | Batch 250/2659 | Loss: 1.0921 | Train PPL: 2.97 | LR: 5.16e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 300/2659 | Loss: 1.1341 | Train PPL: 2.97 | LR: 5.12e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 350/2659 | Loss: 1.1348 | Train PPL: 2.96 | LR: 5.09e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 400/2659 | Loss: 1.0661 | Train PPL: 2.97 | LR: 5.05e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 450/2659 | Loss: 1.0898 | Train PPL: 2.97 | LR: 5.01e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 500/2659 | Loss: 1.0735 | Train PPL: 2.97 | LR: 4.97e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 550/2659 | Loss: 1.0850 | Train PPL: 2.97 | LR: 4.94e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 600/2659 | Loss: 1.1212 | Train PPL: 2.98 | LR: 4.90e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 650/2659 | Loss: 1.1038 | Train PPL: 2.98 | LR: 4.87e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 700/2659 | Loss: 1.0770 | Train PPL: 2.98 | LR: 4.83e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 750/2659 | Loss: 1.1192 | Train PPL: 2.98 | LR: 4.79e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 800/2659 | Loss: 1.1077 | Train PPL: 2.98 | LR: 4.76e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 850/2659 | Loss: 1.0802 | Train PPL: 2.97 | LR: 4.72e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 900/2659 | Loss: 1.1383 | Train PPL: 2.97 | LR: 4.69e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 950/2659 | Loss: 1.0759 | Train PPL: 2.97 | LR: 4.65e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 1000/2659 | Loss: 1.0427 | Train PPL: 2.97 | LR: 4.61e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 1050/2659 | Loss: 1.0907 | Train PPL: 2.98 | LR: 4.58e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 1100/2659 | Loss: 1.0693 | Train PPL: 2.98 | LR: 4.54e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 1150/2659 | Loss: 1.1487 | Train PPL: 2.98 | LR: 4.51e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 1200/2659 | Loss: 1.0758 | Train PPL: 2.98 | LR: 4.47e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 1250/2659 | Loss: 1.1170 | Train PPL: 2.98 | LR: 4.44e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 1300/2659 | Loss: 1.0607 | Train PPL: 2.97 | LR: 4.40e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 1350/2659 | Loss: 1.0673 | Train PPL: 2.97 | LR: 4.37e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 1400/2659 | Loss: 1.0906 | Train PPL: 2.98 | LR: 4.33e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 1450/2659 | Loss: 1.1061 | Train PPL: 2.98 | LR: 4.30e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 1500/2659 | Loss: 1.0798 | Train PPL: 2.98 | LR: 4.26e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 1550/2659 | Loss: 1.0536 | Train PPL: 2.97 | LR: 4.23e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 1600/2659 | Loss: 1.0567 | Train PPL: 2.97 | LR: 4.20e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 1650/2659 | Loss: 1.1030 | Train PPL: 2.97 | LR: 4.16e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 1700/2659 | Loss: 1.0964 | Train PPL: 2.97 | LR: 4.13e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 1750/2659 | Loss: 1.0873 | Train PPL: 2.97 | LR: 4.09e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 1800/2659 | Loss: 1.0391 | Train PPL: 2.97 | LR: 4.06e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 1850/2659 | Loss: 0.9977 | Train PPL: 2.97 | LR: 4.03e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 1900/2659 | Loss: 0.9935 | Train PPL: 2.97 | LR: 3.99e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 1950/2659 | Loss: 1.0469 | Train PPL: 2.96 | LR: 3.96e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 2000/2659 | Loss: 1.0663 | Train PPL: 2.96 | LR: 3.93e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 2050/2659 | Loss: 1.0158 | Train PPL: 2.96 | LR: 3.89e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 2100/2659 | Loss: 1.1202 | Train PPL: 2.96 | LR: 3.86e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 2150/2659 | Loss: 1.1069 | Train PPL: 2.96 | LR: 3.83e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 2200/2659 | Loss: 1.0716 | Train PPL: 2.96 | LR: 3.79e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 2250/2659 | Loss: 1.0944 | Train PPL: 2.96 | LR: 3.76e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 2300/2659 | Loss: 1.0602 | Train PPL: 2.96 | LR: 3.73e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 2350/2659 | Loss: 1.0668 | Train PPL: 2.96 | LR: 3.70e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 2400/2659 | Loss: 1.0354 | Train PPL: 2.96 | LR: 3.66e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 2450/2659 | Loss: 1.0845 | Train PPL: 2.96 | LR: 3.63e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 2500/2659 | Loss: 1.1577 | Train PPL: 2.96 | LR: 3.60e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 2550/2659 | Loss: 1.0750 | Train PPL: 2.96 | LR: 3.57e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 2600/2659 | Loss: 1.0783 | Train PPL: 2.96 | LR: 3.54e-05 | Speed: 8914 tok/s
+Epoch 16/20 | Batch 2650/2659 | Loss: 1.1132 | Train PPL: 2.96 | LR: 3.51e-05 | Speed: 8914 tok/s
+
+============================================================
+Epoch 16 Complete | Time: 1253.7s
+Train PPL: 2.96 | Valid PPL: 3.64
+============================================================
+
+🔥 New best! Valid PPL: 3.64
+
+Epoch 17/20 | Batch 50/2659 | Loss: 1.0830 | Train PPL: 2.98 | LR: 3.47e-05 | Speed: 8914 tok/s
+Epoch 17/20 | Batch 100/2659 | Loss: 1.0719 | Train PPL: 2.96 | LR: 3.44e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 150/2659 | Loss: 1.0500 | Train PPL: 2.96 | LR: 3.40e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 200/2659 | Loss: 1.0546 | Train PPL: 2.94 | LR: 3.37e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 250/2659 | Loss: 1.0854 | Train PPL: 2.95 | LR: 3.34e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 300/2659 | Loss: 1.1293 | Train PPL: 2.95 | LR: 3.31e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 350/2659 | Loss: 1.1354 | Train PPL: 2.95 | LR: 3.28e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 400/2659 | Loss: 1.0631 | Train PPL: 2.95 | LR: 3.25e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 450/2659 | Loss: 1.0866 | Train PPL: 2.95 | LR: 3.22e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 500/2659 | Loss: 1.0698 | Train PPL: 2.96 | LR: 3.19e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 550/2659 | Loss: 1.0844 | Train PPL: 2.96 | LR: 3.16e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 600/2659 | Loss: 1.1049 | Train PPL: 2.96 | LR: 3.13e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 650/2659 | Loss: 1.1010 | Train PPL: 2.96 | LR: 3.10e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 700/2659 | Loss: 1.0653 | Train PPL: 2.96 | LR: 3.07e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 750/2659 | Loss: 1.1139 | Train PPL: 2.96 | LR: 3.04e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 800/2659 | Loss: 1.1036 | Train PPL: 2.96 | LR: 3.01e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 850/2659 | Loss: 1.0783 | Train PPL: 2.96 | LR: 2.98e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 900/2659 | Loss: 1.1328 | Train PPL: 2.96 | LR: 2.95e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 950/2659 | Loss: 1.0705 | Train PPL: 2.96 | LR: 2.92e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 1000/2659 | Loss: 1.0438 | Train PPL: 2.96 | LR: 2.89e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 1050/2659 | Loss: 1.0850 | Train PPL: 2.96 | LR: 2.86e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 1100/2659 | Loss: 1.0727 | Train PPL: 2.96 | LR: 2.83e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 1150/2659 | Loss: 1.1421 | Train PPL: 2.96 | LR: 2.81e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 1200/2659 | Loss: 1.0745 | Train PPL: 2.96 | LR: 2.78e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 1250/2659 | Loss: 1.1142 | Train PPL: 2.96 | LR: 2.75e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 1300/2659 | Loss: 1.0633 | Train PPL: 2.96 | LR: 2.72e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 1350/2659 | Loss: 1.0686 | Train PPL: 2.96 | LR: 2.69e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 1400/2659 | Loss: 1.0871 | Train PPL: 2.96 | LR: 2.66e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 1450/2659 | Loss: 1.1063 | Train PPL: 2.96 | LR: 2.64e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 1500/2659 | Loss: 1.0784 | Train PPL: 2.96 | LR: 2.61e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 1550/2659 | Loss: 1.0541 | Train PPL: 2.96 | LR: 2.58e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 1600/2659 | Loss: 1.0575 | Train PPL: 2.96 | LR: 2.55e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 1650/2659 | Loss: 1.0960 | Train PPL: 2.96 | LR: 2.53e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 1700/2659 | Loss: 1.0983 | Train PPL: 2.96 | LR: 2.50e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 1750/2659 | Loss: 1.0885 | Train PPL: 2.96 | LR: 2.47e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 1800/2659 | Loss: 1.0417 | Train PPL: 2.96 | LR: 2.44e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 1850/2659 | Loss: 0.9982 | Train PPL: 2.96 | LR: 2.42e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 1900/2659 | Loss: 0.9926 | Train PPL: 2.95 | LR: 2.39e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 1950/2659 | Loss: 1.0404 | Train PPL: 2.95 | LR: 2.36e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 2000/2659 | Loss: 1.0627 | Train PPL: 2.95 | LR: 2.34e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 2050/2659 | Loss: 1.0224 | Train PPL: 2.95 | LR: 2.31e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 2100/2659 | Loss: 1.1184 | Train PPL: 2.95 | LR: 2.28e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 2150/2659 | Loss: 1.0962 | Train PPL: 2.95 | LR: 2.26e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 2200/2659 | Loss: 1.0703 | Train PPL: 2.95 | LR: 2.23e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 2250/2659 | Loss: 1.0885 | Train PPL: 2.95 | LR: 2.21e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 2300/2659 | Loss: 1.0579 | Train PPL: 2.95 | LR: 2.18e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 2350/2659 | Loss: 1.0602 | Train PPL: 2.95 | LR: 2.16e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 2400/2659 | Loss: 1.0275 | Train PPL: 2.94 | LR: 2.13e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 2450/2659 | Loss: 1.0873 | Train PPL: 2.94 | LR: 2.11e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 2500/2659 | Loss: 1.1561 | Train PPL: 2.94 | LR: 2.08e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 2550/2659 | Loss: 1.0664 | Train PPL: 2.95 | LR: 2.06e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 2600/2659 | Loss: 1.0746 | Train PPL: 2.95 | LR: 2.03e-05 | Speed: 8913 tok/s
+Epoch 17/20 | Batch 2650/2659 | Loss: 1.1110 | Train PPL: 2.95 | LR: 2.01e-05 | Speed: 8913 tok/s
+
+============================================================
+Epoch 17 Complete | Time: 1253.8s
+Train PPL: 2.95 | Valid PPL: 3.63
+============================================================
+
+🔥 New best! Valid PPL: 3.63
+
+Epoch 18/20 | Batch 50/2659 | Loss: 1.0837 | Train PPL: 2.98 | LR: 1.98e-05 | Speed: 8915 tok/s
+Epoch 18/20 | Batch 100/2659 | Loss: 1.0711 | Train PPL: 2.95 | LR: 1.95e-05 | Speed: 8915 tok/s
+Epoch 18/20 | Batch 150/2659 | Loss: 1.0399 | Train PPL: 2.95 | LR: 1.93e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 200/2659 | Loss: 1.0561 | Train PPL: 2.93 | LR: 1.90e-05 | Speed: 8915 tok/s
+Epoch 18/20 | Batch 250/2659 | Loss: 1.0822 | Train PPL: 2.94 | LR: 1.88e-05 | Speed: 8915 tok/s
+Epoch 18/20 | Batch 300/2659 | Loss: 1.1209 | Train PPL: 2.94 | LR: 1.86e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 350/2659 | Loss: 1.1257 | Train PPL: 2.94 | LR: 1.83e-05 | Speed: 8915 tok/s
+Epoch 18/20 | Batch 400/2659 | Loss: 1.0531 | Train PPL: 2.94 | LR: 1.81e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 450/2659 | Loss: 1.0855 | Train PPL: 2.94 | LR: 1.79e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 500/2659 | Loss: 1.0680 | Train PPL: 2.95 | LR: 1.76e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 550/2659 | Loss: 1.0783 | Train PPL: 2.95 | LR: 1.74e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 600/2659 | Loss: 1.1064 | Train PPL: 2.95 | LR: 1.72e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 650/2659 | Loss: 1.1093 | Train PPL: 2.95 | LR: 1.69e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 700/2659 | Loss: 1.0630 | Train PPL: 2.95 | LR: 1.67e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 750/2659 | Loss: 1.1122 | Train PPL: 2.95 | LR: 1.65e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 800/2659 | Loss: 1.1038 | Train PPL: 2.95 | LR: 1.63e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 850/2659 | Loss: 1.0681 | Train PPL: 2.95 | LR: 1.60e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 900/2659 | Loss: 1.1230 | Train PPL: 2.95 | LR: 1.58e-05 | Speed: 8915 tok/s
+Epoch 18/20 | Batch 950/2659 | Loss: 1.0691 | Train PPL: 2.95 | LR: 1.56e-05 | Speed: 8915 tok/s
+Epoch 18/20 | Batch 1000/2659 | Loss: 1.0432 | Train PPL: 2.95 | LR: 1.54e-05 | Speed: 8915 tok/s
+Epoch 18/20 | Batch 1050/2659 | Loss: 1.0877 | Train PPL: 2.95 | LR: 1.52e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 1100/2659 | Loss: 1.0651 | Train PPL: 2.95 | LR: 1.49e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 1150/2659 | Loss: 1.1402 | Train PPL: 2.95 | LR: 1.47e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 1200/2659 | Loss: 1.0715 | Train PPL: 2.95 | LR: 1.45e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 1250/2659 | Loss: 1.1117 | Train PPL: 2.95 | LR: 1.43e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 1300/2659 | Loss: 1.0529 | Train PPL: 2.95 | LR: 1.41e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 1350/2659 | Loss: 1.0645 | Train PPL: 2.95 | LR: 1.39e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 1400/2659 | Loss: 1.0769 | Train PPL: 2.95 | LR: 1.37e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 1450/2659 | Loss: 1.0957 | Train PPL: 2.95 | LR: 1.35e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 1500/2659 | Loss: 1.0766 | Train PPL: 2.95 | LR: 1.33e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 1550/2659 | Loss: 1.0544 | Train PPL: 2.95 | LR: 1.31e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 1600/2659 | Loss: 1.0550 | Train PPL: 2.95 | LR: 1.29e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 1650/2659 | Loss: 1.0921 | Train PPL: 2.95 | LR: 1.27e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 1700/2659 | Loss: 1.0980 | Train PPL: 2.95 | LR: 1.25e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 1750/2659 | Loss: 1.0888 | Train PPL: 2.95 | LR: 1.23e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 1800/2659 | Loss: 1.0389 | Train PPL: 2.95 | LR: 1.21e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 1850/2659 | Loss: 0.9896 | Train PPL: 2.95 | LR: 1.19e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 1900/2659 | Loss: 0.9903 | Train PPL: 2.94 | LR: 1.17e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 1950/2659 | Loss: 1.0330 | Train PPL: 2.94 | LR: 1.15e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 2000/2659 | Loss: 1.0618 | Train PPL: 2.94 | LR: 1.13e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 2050/2659 | Loss: 1.0122 | Train PPL: 2.94 | LR: 1.11e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 2100/2659 | Loss: 1.1027 | Train PPL: 2.94 | LR: 1.10e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 2150/2659 | Loss: 1.0978 | Train PPL: 2.94 | LR: 1.08e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 2200/2659 | Loss: 1.0628 | Train PPL: 2.94 | LR: 1.06e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 2250/2659 | Loss: 1.0877 | Train PPL: 2.94 | LR: 1.04e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 2300/2659 | Loss: 1.0549 | Train PPL: 2.94 | LR: 1.02e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 2350/2659 | Loss: 1.0545 | Train PPL: 2.94 | LR: 1.01e-05 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 2400/2659 | Loss: 1.0230 | Train PPL: 2.94 | LR: 9.88e-06 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 2450/2659 | Loss: 1.0894 | Train PPL: 2.94 | LR: 9.70e-06 | Speed: 8914 tok/s
+Epoch 18/20 | Batch 2500/2659 | Loss: 1.1549 | Train PPL: 2.94 | LR: 9.53e-06 | Speed: 8915 tok/s
+Epoch 18/20 | Batch 2550/2659 | Loss: 1.0609 | Train PPL: 2.94 | LR: 9.36e-06 | Speed: 8915 tok/s
+Epoch 18/20 | Batch 2600/2659 | Loss: 1.0720 | Train PPL: 2.94 | LR: 9.19e-06 | Speed: 8915 tok/s
+Epoch 18/20 | Batch 2650/2659 | Loss: 1.1079 | Train PPL: 2.94 | LR: 9.02e-06 | Speed: 8915 tok/s
+
+============================================================
+Epoch 18 Complete | Time: 1253.6s
+Train PPL: 2.94 | Valid PPL: 3.61
+============================================================
+
+🔥 New best! Valid PPL: 3.61
+
+Epoch 19/20 | Batch 50/2659 | Loss: 1.0885 | Train PPL: 2.97 | LR: 8.82e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 100/2659 | Loss: 1.0729 | Train PPL: 2.94 | LR: 8.65e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 150/2659 | Loss: 1.0435 | Train PPL: 2.94 | LR: 8.49e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 200/2659 | Loss: 1.0539 | Train PPL: 2.92 | LR: 8.32e-06 | Speed: 8916 tok/s
+Epoch 19/20 | Batch 250/2659 | Loss: 1.0743 | Train PPL: 2.93 | LR: 8.16e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 300/2659 | Loss: 1.1278 | Train PPL: 2.93 | LR: 8.00e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 350/2659 | Loss: 1.1225 | Train PPL: 2.93 | LR: 7.85e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 400/2659 | Loss: 1.0495 | Train PPL: 2.93 | LR: 7.69e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 450/2659 | Loss: 1.0829 | Train PPL: 2.93 | LR: 7.53e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 500/2659 | Loss: 1.0604 | Train PPL: 2.94 | LR: 7.38e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 550/2659 | Loss: 1.0792 | Train PPL: 2.94 | LR: 7.23e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 600/2659 | Loss: 1.1138 | Train PPL: 2.94 | LR: 7.08e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 650/2659 | Loss: 1.1085 | Train PPL: 2.94 | LR: 6.93e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 700/2659 | Loss: 1.0569 | Train PPL: 2.94 | LR: 6.78e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 750/2659 | Loss: 1.1098 | Train PPL: 2.95 | LR: 6.64e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 800/2659 | Loss: 1.0998 | Train PPL: 2.94 | LR: 6.49e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 850/2659 | Loss: 1.0664 | Train PPL: 2.94 | LR: 6.35e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 900/2659 | Loss: 1.1187 | Train PPL: 2.94 | LR: 6.21e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 950/2659 | Loss: 1.0704 | Train PPL: 2.94 | LR: 6.07e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 1000/2659 | Loss: 1.0379 | Train PPL: 2.94 | LR: 5.93e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 1050/2659 | Loss: 1.0772 | Train PPL: 2.94 | LR: 5.80e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 1100/2659 | Loss: 1.0659 | Train PPL: 2.94 | LR: 5.66e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 1150/2659 | Loss: 1.1332 | Train PPL: 2.95 | LR: 5.53e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 1200/2659 | Loss: 1.0685 | Train PPL: 2.94 | LR: 5.40e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 1250/2659 | Loss: 1.1074 | Train PPL: 2.94 | LR: 5.27e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 1300/2659 | Loss: 1.0608 | Train PPL: 2.94 | LR: 5.14e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 1350/2659 | Loss: 1.0581 | Train PPL: 2.94 | LR: 5.01e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 1400/2659 | Loss: 1.0814 | Train PPL: 2.94 | LR: 4.89e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 1450/2659 | Loss: 1.0933 | Train PPL: 2.94 | LR: 4.76e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 1500/2659 | Loss: 1.0732 | Train PPL: 2.94 | LR: 4.64e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 1550/2659 | Loss: 1.0498 | Train PPL: 2.94 | LR: 4.52e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 1600/2659 | Loss: 1.0514 | Train PPL: 2.94 | LR: 4.40e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 1650/2659 | Loss: 1.0918 | Train PPL: 2.94 | LR: 4.28e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 1700/2659 | Loss: 1.0860 | Train PPL: 2.94 | LR: 4.17e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 1750/2659 | Loss: 1.0882 | Train PPL: 2.94 | LR: 4.05e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 1800/2659 | Loss: 1.0346 | Train PPL: 2.94 | LR: 3.94e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 1850/2659 | Loss: 0.9887 | Train PPL: 2.94 | LR: 3.83e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 1900/2659 | Loss: 0.9909 | Train PPL: 2.94 | LR: 3.72e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 1950/2659 | Loss: 1.0313 | Train PPL: 2.93 | LR: 3.61e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 2000/2659 | Loss: 1.0549 | Train PPL: 2.93 | LR: 3.50e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 2050/2659 | Loss: 1.0090 | Train PPL: 2.93 | LR: 3.40e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 2100/2659 | Loss: 1.1064 | Train PPL: 2.93 | LR: 3.30e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 2150/2659 | Loss: 1.0940 | Train PPL: 2.93 | LR: 3.19e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 2200/2659 | Loss: 1.0653 | Train PPL: 2.93 | LR: 3.09e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 2250/2659 | Loss: 1.0834 | Train PPL: 2.93 | LR: 3.00e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 2300/2659 | Loss: 1.0562 | Train PPL: 2.93 | LR: 2.90e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 2350/2659 | Loss: 1.0567 | Train PPL: 2.93 | LR: 2.80e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 2400/2659 | Loss: 1.0164 | Train PPL: 2.93 | LR: 2.71e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 2450/2659 | Loss: 1.0790 | Train PPL: 2.93 | LR: 2.62e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 2500/2659 | Loss: 1.1484 | Train PPL: 2.93 | LR: 2.53e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 2550/2659 | Loss: 1.0615 | Train PPL: 2.93 | LR: 2.44e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 2600/2659 | Loss: 1.0799 | Train PPL: 2.93 | LR: 2.35e-06 | Speed: 8915 tok/s
+Epoch 19/20 | Batch 2650/2659 | Loss: 1.1052 | Train PPL: 2.93 | LR: 2.26e-06 | Speed: 8915 tok/s
+
+============================================================
+Epoch 19 Complete | Time: 1253.6s
+Train PPL: 2.93 | Valid PPL: 3.61
+============================================================
+
+🔥 New best! Valid PPL: 3.61
+
+Epoch 20/20 | Batch 50/2659 | Loss: 1.0826 | Train PPL: 2.96 | LR: 2.16e-06 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 100/2659 | Loss: 1.0728 | Train PPL: 2.93 | LR: 2.08e-06 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 150/2659 | Loss: 1.0358 | Train PPL: 2.93 | LR: 2.00e-06 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 200/2659 | Loss: 1.0471 | Train PPL: 2.92 | LR: 1.92e-06 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 250/2659 | Loss: 1.0803 | Train PPL: 2.92 | LR: 1.84e-06 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 300/2659 | Loss: 1.1239 | Train PPL: 2.93 | LR: 1.77e-06 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 350/2659 | Loss: 1.1264 | Train PPL: 2.92 | LR: 1.69e-06 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 400/2659 | Loss: 1.0537 | Train PPL: 2.93 | LR: 1.62e-06 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 450/2659 | Loss: 1.0808 | Train PPL: 2.93 | LR: 1.55e-06 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 500/2659 | Loss: 1.0652 | Train PPL: 2.93 | LR: 1.48e-06 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 550/2659 | Loss: 1.0756 | Train PPL: 2.93 | LR: 1.41e-06 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 600/2659 | Loss: 1.1113 | Train PPL: 2.94 | LR: 1.34e-06 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 650/2659 | Loss: 1.1017 | Train PPL: 2.94 | LR: 1.28e-06 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 700/2659 | Loss: 1.0627 | Train PPL: 2.94 | LR: 1.21e-06 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 750/2659 | Loss: 1.1053 | Train PPL: 2.94 | LR: 1.15e-06 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 800/2659 | Loss: 1.0934 | Train PPL: 2.94 | LR: 1.09e-06 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 850/2659 | Loss: 1.0657 | Train PPL: 2.93 | LR: 1.03e-06 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 900/2659 | Loss: 1.1136 | Train PPL: 2.93 | LR: 9.77e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 950/2659 | Loss: 1.0664 | Train PPL: 2.94 | LR: 9.22e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 1000/2659 | Loss: 1.0379 | Train PPL: 2.94 | LR: 8.68e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 1050/2659 | Loss: 1.0750 | Train PPL: 2.94 | LR: 8.16e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 1100/2659 | Loss: 1.0619 | Train PPL: 2.94 | LR: 7.66e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 1150/2659 | Loss: 1.1273 | Train PPL: 2.94 | LR: 7.17e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 1200/2659 | Loss: 1.0662 | Train PPL: 2.94 | LR: 6.70e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 1250/2659 | Loss: 1.1053 | Train PPL: 2.94 | LR: 6.24e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 1300/2659 | Loss: 1.0689 | Train PPL: 2.94 | LR: 5.80e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 1350/2659 | Loss: 1.0576 | Train PPL: 2.94 | LR: 5.38e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 1400/2659 | Loss: 1.0819 | Train PPL: 2.94 | LR: 4.97e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 1450/2659 | Loss: 1.0917 | Train PPL: 2.94 | LR: 4.58e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 1500/2659 | Loss: 1.0701 | Train PPL: 2.94 | LR: 4.20e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 1550/2659 | Loss: 1.0542 | Train PPL: 2.94 | LR: 3.84e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 1600/2659 | Loss: 1.0510 | Train PPL: 2.94 | LR: 3.50e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 1650/2659 | Loss: 1.0925 | Train PPL: 2.94 | LR: 3.17e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 1700/2659 | Loss: 1.0917 | Train PPL: 2.94 | LR: 2.86e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 1750/2659 | Loss: 1.0874 | Train PPL: 2.94 | LR: 2.57e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 1800/2659 | Loss: 1.0362 | Train PPL: 2.94 | LR: 2.29e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 1850/2659 | Loss: 0.9913 | Train PPL: 2.93 | LR: 2.02e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 1900/2659 | Loss: 0.9800 | Train PPL: 2.93 | LR: 1.78e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 1950/2659 | Loss: 1.0285 | Train PPL: 2.93 | LR: 1.55e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 2000/2659 | Loss: 1.0585 | Train PPL: 2.93 | LR: 1.33e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 2050/2659 | Loss: 1.0091 | Train PPL: 2.92 | LR: 1.13e-07 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 2100/2659 | Loss: 1.1053 | Train PPL: 2.92 | LR: 9.51e-08 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 2150/2659 | Loss: 1.0918 | Train PPL: 2.93 | LR: 7.85e-08 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 2200/2659 | Loss: 1.0610 | Train PPL: 2.93 | LR: 6.35e-08 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 2250/2659 | Loss: 1.0828 | Train PPL: 2.93 | LR: 5.01e-08 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 2300/2659 | Loss: 1.0525 | Train PPL: 2.92 | LR: 3.83e-08 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 2350/2659 | Loss: 1.0539 | Train PPL: 2.92 | LR: 2.82e-08 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 2400/2659 | Loss: 1.0231 | Train PPL: 2.92 | LR: 1.97e-08 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 2450/2659 | Loss: 1.0783 | Train PPL: 2.92 | LR: 1.27e-08 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 2500/2659 | Loss: 1.1521 | Train PPL: 2.92 | LR: 7.44e-09 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 2550/2659 | Loss: 1.0601 | Train PPL: 2.92 | LR: 3.76e-09 | Speed: 8913 tok/s
+Epoch 20/20 | Batch 2600/2659 | Loss: 1.0708 | Train PPL: 2.92 | LR: 1.69e-09 | Speed: 8913 tok/s
+---------------------------------------------------------------------------
+ValueError                                Traceback (most recent call last)
+/tmp/ipython-input-2452066290.py in <cell line: 0>()
+    275                 torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG['grad_clip'])
+    276                 optimizer.step()
+--> 277                 scheduler.step()
+    278 
+    279                 # Stats
+
+2 frames
+/usr/local/lib/python3.12/dist-packages/torch/optim/lr_scheduler.py in get_lr(self)
+   2141 
+   2142         if step_num > self.total_steps:
+-> 2143             raise ValueError(
+   2144                 f"Tried to step {step_num} times. The specified number of total steps is {self.total_steps}"
+   2145             )
+
+ValueError: Tried to step 53181 times. The specified number of total steps is 53180

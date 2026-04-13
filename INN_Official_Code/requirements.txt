@@ -1,0 +1,10 @@
+torch>=2.0.0
+mamba-ssm>=1.0.1
+causal-conv1d>=1.1.0
+datasets
+matplotlib
+seaborn
+scipy
+tqdm
+requests
+

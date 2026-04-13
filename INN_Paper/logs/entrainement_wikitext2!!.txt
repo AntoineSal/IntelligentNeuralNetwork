@@ -1,0 +1,338 @@
+# @title 🧠 INN V5: THE SOTA KILLER (Stabilized)
+# @markdown **Changements majeurs :**
+# @markdown 1. Gradient Accumulation (Batch Virtuel = 64) -> Stabilité extrême.
+# @markdown 2. OneCycleLR Scheduler -> Convergence optimale (Warmup + Decay).
+# @markdown 3. Sandwich Norm -> Flux de signal propre.
+# @markdown 4. Neuron Identity + Weighted Readout.
+
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import math
+import time
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, Dataset
+from collections import Counter
+
+# --- 1. SETUP ---
+print("🔧 Installation des dépendances...")
+os.system("pip install datasets causal-conv1d>=1.2.0 mamba-ssm")
+try:
+    from mamba_ssm import Mamba
+    from datasets import load_dataset
+    print("✅ Deps OK.")
+except ImportError:
+    pass
+
+# CONFIGURATION "ULTIMATE"
+CONFIG = {
+    'dataset': 'wikitext-2',
+    'vocab_size': 33278,
+    'd_model': 512,        # GROS CERVEAU
+    'n_neurons': 64,       # 64 Experts
+    'n_layers': 4,
+    'n_heads': 8,          # Plus de têtes pour l'attention fine
+    'dropout': 0.1,
+    'max_lr': 5e-4,        # Pic du OneCycle
+    'batch_size': 8,       # Petit batch physique (VRAM safe)
+    'accum_steps': 8,      # Batch Virtuel = 8 * 8 = 64 (STABILITÉ)
+    'seq_len': 128,
+    'epochs': 10,          # On prend le temps
+    'grad_clip': 1.0
+}
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"🚀 Running on {device} with Effective Batch Size = {CONFIG['batch_size'] * CONFIG['accum_steps']}")
+
+# --- 2. DATA ---
+def get_wikitext2():
+    dataset = load_dataset("wikitext", "wikitext-2-v1")
+    train_text = "\n".join(dataset['train']['text'])
+    valid_text = "\n".join(dataset['validation']['text'])
+    return train_text, valid_text
+
+class WordLevelDataset(Dataset):
+    def __init__(self, text, seq_len, vocab=None):
+        tokens = text.replace('\n', ' <eos> ').split()
+        tokens = [t for t in tokens if t.strip()]
+        if vocab is None:
+            counts = Counter(tokens)
+            self.vocab = sorted(list(counts.keys()))
+            self.word2idx = {w: i for i, w in enumerate(self.vocab)}
+        else:
+            self.vocab = vocab
+            self.word2idx = {w: i for i, w in enumerate(self.vocab)}
+        self.data = torch.tensor([self.word2idx.get(t, 0) for t in tokens], dtype=torch.long)
+        self.seq_len = seq_len
+
+    def __len__(self): return len(self.data) // self.seq_len
+    def __getitem__(self, idx):
+        start = idx * self.seq_len
+        chunk = self.data[start:start+self.seq_len+1]
+        if len(chunk) < self.seq_len+1:
+            chunk = torch.cat([chunk, torch.zeros(self.seq_len+1-len(chunk), dtype=torch.long)])
+        return chunk[:-1], chunk[1:]
+
+# --- 3. MODEL: STABILIZED INN ---
+
+class StabilizedCommunication(nn.Module):
+    def __init__(self, d_model, n_heads, dropout=0.1):
+        super().__init__()
+        self.norm_pre = nn.LayerNorm(d_model) # Sandwich Norm 1
+        self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.norm_post = nn.LayerNorm(d_model) # Sandwich Norm 2
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, L, N, D = x.shape
+        x_flat = x.view(B * L, N, D)
+        
+        # Pre-Norm
+        x_norm = self.norm_pre(x_flat)
+        
+        # Attention
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
+        
+        # Residual + Post-Norm
+        x_out = self.norm_post(x_flat + self.dropout(attn_out))
+        
+        return x_out.view(B, L, N, D)
+
+class WeightedReadout(nn.Module):
+    """ Smart Pooling: Chaque neurone prédit sa propre confiance """
+    def __init__(self, d_model):
+        super().__init__()
+        self.confidence_proj = nn.Linear(d_model, 1)
+        
+    def forward(self, x):
+        # x: (B, L, N, D)
+        
+        # Calcul de la confiance (B, L, N, 1)
+        confidence_scores = self.confidence_proj(x)
+        weights = F.softmax(confidence_scores, dim=2) # Somme à 1 sur l'axe des neurones
+        
+        # Somme pondérée : Somme(Poids * Neurone)
+        weighted_out = (x * weights).sum(dim=2) # (B, L, D)
+        return weighted_out
+
+class INN_Ultimate(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.embedding = nn.Embedding(config['vocab_size'], config['d_model'])
+        
+        # Neuron Identity
+        self.neuron_id = nn.Parameter(torch.randn(1, 1, config['n_neurons'], config['d_model']))
+        
+        self.layers = nn.ModuleList([])
+        for _ in range(config['n_layers']):
+            self.layers.append(nn.ModuleDict({
+                'norm_in': nn.LayerNorm(config['d_model']), # Pre-Norm Mamba
+                'mamba': Mamba(d_model=config['d_model'], d_state=16, d_conv=4, expand=2),
+                'comm': StabilizedCommunication(config['d_model'], config['n_heads'], config['dropout'])
+            }))
+        
+        self.readout = WeightedReadout(config['d_model'])
+        self.norm_final = nn.LayerNorm(config['d_model'])
+        self.output_head = nn.Linear(config['d_model'], config['vocab_size'])
+
+    def forward(self, x):
+        B, L = x.shape
+        N = self.config['n_neurons']
+        
+        h = self.embedding(x)
+        h = h.unsqueeze(2).expand(-1, -1, N, -1)
+        h = h + self.neuron_id
+        
+        for layer in self.layers:
+            # Mamba Block (with Pre-Norm)
+            h_flat = h.view(B * N, L, -1)
+            h_norm = layer['norm_in'](h_flat)
+            h_mamba = layer['mamba'](h_norm)
+            h = h + h_mamba.view(B, L, N, -1) # Residual manually managed here if needed, but Mamba usually handles internals. Let's do clean residual.
+            
+            # Communication Block (Self-contained residual)
+            h = layer['comm'](h)
+            
+        h_final = self.readout(h)
+        h_final = self.norm_final(h_final)
+        
+        return self.output_head(h_final)
+
+# --- 4. RUN ---
+def run():
+    train_txt, valid_txt = get_wikitext2()
+    train_ds = WordLevelDataset(train_txt, CONFIG['seq_len'])
+    valid_ds = WordLevelDataset(valid_txt, CONFIG['seq_len'], vocab=train_ds.vocab)
+    train_dl = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True)
+    valid_dl = DataLoader(valid_ds, batch_size=CONFIG['batch_size'])
+    
+    CONFIG['vocab_size'] = len(train_ds.vocab)
+    model = INN_Ultimate(CONFIG).to(device)
+    criterion = nn.CrossEntropyLoss()
+    
+    # Optimizer & Scheduler setup
+    optimizer = optim.AdamW(model.parameters(), lr=CONFIG['max_lr'], weight_decay=0.01)
+    
+    total_steps = len(train_dl) * CONFIG['epochs'] // CONFIG['accum_steps']
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, 
+        max_lr=CONFIG['max_lr'], 
+        total_steps=total_steps,
+        pct_start=0.1, # 10% Warmup
+        anneal_strategy='cos'
+    )
+    
+    print(f"🚀 INN V5 (ULTIMATE) | Params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+    print(f"📅 Training for {CONFIG['epochs']} epochs with OneCycleLR.")
+    
+    model.train()
+    start_time = time.time()
+    
+    optimizer.zero_grad()
+    
+    for epoch in range(CONFIG['epochs']):
+        epoch_loss = 0
+        
+        for i, (x, y) in enumerate(train_dl):
+            x, y = x.to(device), y.to(device)
+            
+            # Forward
+            output = model(x)
+            loss = criterion(output.view(-1, CONFIG['vocab_size']), y.view(-1))
+            
+            # Normalize loss for accumulation
+            loss = loss / CONFIG['accum_steps']
+            loss.backward()
+            
+            epoch_loss += loss.item() * CONFIG['accum_steps']
+            
+            # Step only every N batches
+            if (i + 1) % CONFIG['accum_steps'] == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG['grad_clip'])
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                
+                # Logging (on actual steps)
+                actual_step = (i + 1) // CONFIG['accum_steps']
+                if actual_step % 20 == 0:
+                    elapsed = max(time.time() - start_time, 1e-5)
+                    current_lr = scheduler.get_last_lr()[0]
+                    # Estimate raw PPL from current batch loss (approx)
+                    ppl = math.exp(loss.item() * CONFIG['accum_steps'])
+                    print(f"Ep {epoch+1} | Step {actual_step} | LR: {current_lr:.2e} | PPL: {ppl:.2f}")
+
+        # Validation Full
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for x, y in valid_dl:
+                x, y = x.to(device), y.to(device)
+                val_loss += criterion(model(x).view(-1, CONFIG['vocab_size']), y.view(-1)).item()
+        valid_ppl = math.exp(val_loss/len(valid_dl))
+        print(f"🏆 END EPOCH {epoch+1} | VALID PPL: {valid_ppl:.2f} 🏆")
+        model.train()
+
+if __name__ == "__main__":
+    run()
+
+
+🔧 Installation des dépendances...
+✅ Deps OK.
+🚀 Running on cuda with Effective Batch Size = 64
+🚀 INN V5 (ULTIMATE) | Params: 45.14M
+📅 Training for 10 epochs with OneCycleLR.
+Ep 1 | Step 20 | LR: 2.71e-05 | PPL: 25926.48
+Ep 1 | Step 40 | LR: 4.82e-05 | PPL: 11943.83
+Ep 1 | Step 60 | LR: 8.18e-05 | PPL: 4299.48
+Ep 1 | Step 80 | LR: 1.26e-04 | PPL: 1986.68
+Ep 1 | Step 100 | LR: 1.78e-04 | PPL: 759.99
+Ep 1 | Step 120 | LR: 2.35e-04 | PPL: 649.82
+Ep 1 | Step 140 | LR: 2.94e-04 | PPL: 626.17
+Ep 1 | Step 160 | LR: 3.50e-04 | PPL: 547.04
+Ep 1 | Step 180 | LR: 4.02e-04 | PPL: 559.25
+Ep 1 | Step 200 | LR: 4.44e-04 | PPL: 543.97
+Ep 1 | Step 220 | LR: 4.76e-04 | PPL: 439.49
+Ep 1 | Step 240 | LR: 4.95e-04 | PPL: 369.41
+🏆 END EPOCH 1 | VALID PPL: 326.72 🏆
+Ep 2 | Step 20 | LR: 5.00e-04 | PPL: 337.71
+Ep 2 | Step 40 | LR: 5.00e-04 | PPL: 275.58
+Ep 2 | Step 60 | LR: 4.99e-04 | PPL: 240.01
+Ep 2 | Step 80 | LR: 4.99e-04 | PPL: 339.95
+Ep 2 | Step 100 | LR: 4.98e-04 | PPL: 333.44
+Ep 2 | Step 120 | LR: 4.97e-04 | PPL: 272.61
+Ep 2 | Step 140 | LR: 4.96e-04 | PPL: 245.38
+Ep 2 | Step 160 | LR: 4.94e-04 | PPL: 400.36
+Ep 2 | Step 180 | LR: 4.93e-04 | PPL: 285.46
+Ep 2 | Step 200 | LR: 4.91e-04 | PPL: 265.60
+Ep 2 | Step 220 | LR: 4.89e-04 | PPL: 248.34
+Ep 2 | Step 240 | LR: 4.87e-04 | PPL: 382.49
+🏆 END EPOCH 2 | VALID PPL: 246.43 🏆
+Ep 3 | Step 20 | LR: 4.83e-04 | PPL: 191.40
+Ep 3 | Step 40 | LR: 4.80e-04 | PPL: 201.49
+Ep 3 | Step 60 | LR: 4.77e-04 | PPL: 182.13
+Ep 3 | Step 80 | LR: 4.74e-04 | PPL: 184.84
+Ep 3 | Step 100 | LR: 4.71e-04 | PPL: 166.10
+Ep 3 | Step 120 | LR: 4.68e-04 | PPL: 216.55
+Ep 3 | Step 140 | LR: 4.65e-04 | PPL: 171.80
+Ep 3 | Step 160 | LR: 4.61e-04 | PPL: 169.36
+Ep 3 | Step 180 | LR: 4.57e-04 | PPL: 258.79
+Ep 3 | Step 200 | LR: 4.54e-04 | PPL: 203.97
+Ep 3 | Step 220 | LR: 4.50e-04 | PPL: 188.88
+Ep 3 | Step 240 | LR: 4.45e-04 | PPL: 168.75
+🏆 END EPOCH 3 | VALID PPL: 226.14 🏆
+Ep 4 | Step 20 | LR: 4.37e-04 | PPL: 128.42
+Ep 4 | Step 40 | LR: 4.33e-04 | PPL: 136.69
+Ep 4 | Step 60 | LR: 4.28e-04 | PPL: 166.17
+Ep 4 | Step 80 | LR: 4.23e-04 | PPL: 201.28
+Ep 4 | Step 100 | LR: 4.18e-04 | PPL: 175.00
+Ep 4 | Step 120 | LR: 4.13e-04 | PPL: 159.72
+Ep 4 | Step 140 | LR: 4.08e-04 | PPL: 155.60
+Ep 4 | Step 160 | LR: 4.03e-04 | PPL: 187.78
+Ep 4 | Step 180 | LR: 3.97e-04 | PPL: 128.71
+Ep 4 | Step 200 | LR: 3.92e-04 | PPL: 136.56
+Ep 4 | Step 220 | LR: 3.86e-04 | PPL: 151.68
+Ep 4 | Step 240 | LR: 3.81e-04 | PPL: 131.38
+🏆 END EPOCH 4 | VALID PPL: 222.25 🏆
+Ep 5 | Step 20 | LR: 3.70e-04 | PPL: 145.46
+Ep 5 | Step 40 | LR: 3.64e-04 | PPL: 126.08
+Ep 5 | Step 60 | LR: 3.58e-04 | PPL: 114.63
+Ep 5 | Step 80 | LR: 3.52e-04 | PPL: 121.23
+Ep 5 | Step 100 | LR: 3.45e-04 | PPL: 153.96
+Ep 5 | Step 120 | LR: 3.39e-04 | PPL: 124.39
+Ep 5 | Step 140 | LR: 3.33e-04 | PPL: 131.04
+Ep 5 | Step 160 | LR: 3.26e-04 | PPL: 120.99
+Ep 5 | Step 180 | LR: 3.20e-04 | PPL: 98.66
+Ep 5 | Step 200 | LR: 3.13e-04 | PPL: 118.22
+Ep 5 | Step 220 | LR: 3.07e-04 | PPL: 145.10
+Ep 5 | Step 240 | LR: 3.00e-04 | PPL: 123.64
+🏆 END EPOCH 5 | VALID PPL: 225.77 🏆
+Ep 6 | Step 20 | LR: 2.88e-04 | PPL: 94.57
+Ep 6 | Step 40 | LR: 2.81e-04 | PPL: 72.85
+Ep 6 | Step 60 | LR: 2.74e-04 | PPL: 93.38
+Ep 6 | Step 80 | LR: 2.68e-04 | PPL: 99.25
+Ep 6 | Step 100 | LR: 2.61e-04 | PPL: 92.36
+Ep 6 | Step 120 | LR: 2.54e-04 | PPL: 87.52
+Ep 6 | Step 140 | LR: 2.47e-04 | PPL: 116.35
+Ep 6 | Step 160 | LR: 2.40e-04 | PPL: 125.09
+Ep 6 | Step 180 | LR: 2.34e-04 | PPL: 131.77
+Ep 6 | Step 200 | LR: 2.27e-04 | PPL: 102.00
+Ep 6 | Step 220 | LR: 2.20e-04 | PPL: 116.84
+Ep 6 | Step 240 | LR: 2.14e-04 | PPL: 86.43
+🏆 END EPOCH 6 | VALID PPL: 232.90 🏆
+Ep 7 | Step 20 | LR: 2.01e-04 | PPL: 76.04
+Ep 7 | Step 40 | LR: 1.95e-04 | PPL: 98.80
+Ep 7 | Step 60 | LR: 1.88e-04 | PPL: 87.07
+Ep 7 | Step 80 | LR: 1.81e-04 | PPL: 86.27
+Ep 7 | Step 100 | LR: 1.75e-04 | PPL: 76.28
+Ep 7 | Step 120 | LR: 1.69e-04 | PPL: 74.36
+Ep 7 | Step 140 | LR: 1.62e-04 | PPL: 71.37
+Ep 7 | Step 160 | LR: 1.56e-04 | PPL: 82.69
+Ep 7 | Step 180 | LR: 1.50e-04 | PPL: 67.96
+Ep 7 | Step 200 | LR: 1.43e-04 | PPL: 81.24
+Ep 7 | Step 220 | LR: 1.37e-04 | PPL: 75.19
+Ep 7 | Step 240 | LR: 1.31e-04 | PPL: 62.96
+🏆 END EPOCH 7 | VALID PPL: 243.16 🏆
+Ep 8 | Step 20 | LR: 1.21e-04 | PPL: 63.08

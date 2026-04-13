@@ -1,0 +1,562 @@
+# @title ⚔️ BENCHMARK COMPARISON: INN vs LSTM vs Transformer
+# @markdown Teste les 3 modèles sur les 2 expériences qui ont marché :
+# @markdown 1. Calcul Temporel (V5) : Stockage Key-Value
+# @markdown 2. Locked Vault (V10.1) : Calcul Récursif A+B
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import math
+import random
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"🚀 BENCHMARK COMPARISON on {DEVICE}")
+
+# --- CONFIG SHARED (Identique V5/V10.1) ---
+D_MODEL = 128
+D_STATE = 256
+VOCAB_SIZE = 100
+LR = 1e-3  # V5 utilisait 1e-3, V10.1 utilisait 2e-3, on prend 1e-3 pour stabilité
+
+# ==========================================
+# EXPERIMENT 1: CALCUL TEMPOREL (V5)
+# ==========================================
+# Tâche : Stocker [KEY, VAL], attendre, restituer VAL sur query [QUERY, KEY]
+
+class OrthoNeuron(nn.Module):
+    def __init__(self, d_model, d_state):
+        super().__init__()
+        self.gru = nn.GRU(d_model, d_state, batch_first=True)
+        self.out_proj = nn.Linear(d_state, d_model)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.orthogonal_(m.weight)
+        elif isinstance(m, nn.GRU):
+            for name, param in m.named_parameters():
+                if 'weight_hh' in name:
+                    nn.init.orthogonal_(param)
+                if 'weight_ih' in name:
+                    nn.init.xavier_uniform_(param)
+
+    def forward(self, x, h_prev):
+        if h_prev is None:
+            batch_size = x.size(0)
+            h_prev = torch.zeros(1, batch_size, self.gru.hidden_size, device=x.device)
+        out_gru, h_new = self.gru(x, h_prev)
+        return self.out_proj(out_gru), h_new
+
+class GlobalWorkspace(nn.Module):
+    def __init__(self, d_model, n_neurons):
+        super().__init__()
+        self.query = nn.Linear(d_model, d_model)
+        self.key = nn.Linear(d_model, d_model)
+        self.value = nn.Linear(d_model, d_model)
+        self.output = nn.Linear(d_model, d_model)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, neuron_states):
+        B, S, N, D = neuron_states.shape
+        flat = neuron_states.view(B * S, N, D)
+        q = self.query(flat)
+        k = self.key(flat)
+        v = self.value(flat)
+        attn = F.softmax(torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(D), dim=-1)
+        out = self.output(torch.matmul(attn, v))
+        return self.norm(out + flat).view(B, S, N, D)
+
+class INN_V5(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embedding = nn.Embedding(VOCAB_SIZE, D_MODEL)
+        self.neurons = nn.ModuleList([OrthoNeuron(D_MODEL, D_STATE) for _ in range(4)])
+        self.workspace = GlobalWorkspace(D_MODEL, 4)
+        self.readout = nn.Linear(D_MODEL * 4, VOCAB_SIZE)
+
+    def forward(self, x, hidden_states=None):
+        B, S = x.shape
+        x_emb = self.embedding(x)
+        if hidden_states is None: hidden_states = [None] * 4
+        outs, new_h = [], []
+        for i, n in enumerate(self.neurons):
+            o, h = n(x_emb, hidden_states[i])
+            outs.append(o)
+            new_h.append(h)
+        stack = torch.stack(outs, dim=2)
+        integrated = self.workspace(stack)
+        return self.readout(integrated.view(B, S, -1)), new_h
+
+# ==========================================
+# BASELINES (LSTM & Transformer)
+# ==========================================
+
+class LSTM_Baseline(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embedding = nn.Embedding(VOCAB_SIZE, D_MODEL)
+        # Taille équivalente : 4 neurones * 256 = 1024, on met 512 pour être fair
+        self.lstm = nn.LSTM(D_MODEL, 512, batch_first=True)
+        self.head = nn.Linear(512, VOCAB_SIZE)
+
+    def forward(self, x, h=None):
+        x = self.embedding(x)
+        out, h = self.lstm(x, h)
+        return self.head(out), h
+
+class Transformer_Baseline(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embedding = nn.Embedding(VOCAB_SIZE, D_MODEL)
+        self.pos_encoder = nn.Embedding(512, D_MODEL)  # Fenêtre de 512
+        layer = nn.TransformerEncoderLayer(d_model=D_MODEL, nhead=4, dim_feedforward=D_MODEL*4, batch_first=True)
+        self.transformer = nn.TransformerEncoder(layer, num_layers=2)
+        self.head = nn.Linear(D_MODEL, VOCAB_SIZE)
+
+    def forward(self, x, h=None):
+        B, S = x.shape
+        # Truncation si > 512
+        if S > 512:
+            x = x[:, -512:]
+            S = 512
+        x = self.embedding(x)
+        positions = torch.arange(0, S, device=x.device).unsqueeze(0)
+        x = x + self.pos_encoder(positions)
+        mask = nn.Transformer.generate_square_subsequent_mask(S).to(x.device)
+        out = self.transformer(x, mask=mask, is_causal=True)
+        return self.head(out), None
+
+# ==========================================
+# EXPERIMENT 1: CALCUL TEMPOREL (Key-Value Storage)
+# ==========================================
+
+class HighDensityStream:
+    def generate_chunk(self, batch_size, seq_len):
+        x = torch.randint(20, VOCAB_SIZE, (batch_size, seq_len))
+        y = x.clone()
+        mask = torch.zeros_like(x).float()
+        for b in range(batch_size):
+            k, v = random.randint(10, 19), random.randint(1, 9)
+            x[b, 5], x[b, 6] = k, v  # Store early
+            qp = random.randint(20, seq_len - 2)
+            x[b, qp], x[b, qp+1] = 99, k  # Query
+            y[b, qp+1] = v
+            mask[b, qp+1] = 1.0
+        return x.to(DEVICE), y.to(DEVICE), mask.to(DEVICE)
+
+def train_exp1(model, name, steps=1501):
+    print(f"🏋️ Training {name} on Exp1 (Key-Value Storage)...")
+    model.to(DEVICE)
+    opt = optim.Adam(model.parameters(), lr=LR)
+    stream = HighDensityStream()
+    
+    for step in range(steps):
+        x, y, mask = stream.generate_chunk(32, 64)  # Exactement comme V5
+        if name == "INN":
+            logits, _ = model(x, None)
+        else:
+            logits, _ = model(x)
+        
+        loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), y.view(-1), reduction='none')
+        loss = (loss * mask.view(-1)).sum() / (mask.sum() + 1e-6)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        
+        if step % 100 == 0:
+            print(f"  Step {step} | Loss: {loss.item():.4f}")
+            if loss.item() < 0.01:
+                print("  ✅ Converged.")
+                break
+    return model
+
+def test_exp1(model, name, horizons=[2000, 5000, 10000]):
+    print(f"\n🧐 Testing {name} on Exp1...")
+    model.eval()
+    results = {}
+    
+    for H in horizons:
+        key, val = 12, 7
+        h = None
+        
+        # Store
+        if name == "INN":
+            _, h = model(torch.tensor([[key, val]]).to(DEVICE), h)
+        else:
+            _, h = model(torch.tensor([[key, val]]).to(DEVICE), h)
+        
+        # Wait (chunks of 100)
+        for _ in range(H // 100):
+            noise = torch.randint(20, 99, (1, 100)).to(DEVICE)
+            if name == "INN":
+                _, h = model(noise, h)
+            else:
+                _, h = model(noise, h)
+        
+        # Query
+        if name == "INN":
+            logits, _ = model(torch.tensor([[99, key]]).to(DEVICE), h)
+        else:
+            logits, _ = model(torch.tensor([[99, key]]).to(DEVICE), h)
+        
+        pred = logits[0, -1].argmax().item()
+        conf = F.softmax(logits[0, -1], dim=0)[pred].item()
+        success = (pred == val)
+        res = "✅" if success else f"❌ ({pred})"
+        print(f"  H={H} | {res} | Conf: {conf:.1%}")
+        results[H] = success
+    
+    return results
+
+# ==========================================
+# EXPERIMENT 2: LOCKED VAULT (A+B Calculation)
+# ==========================================
+# Architecture V10.1 : Locked Memory + Compute Neurons
+
+class LockedMemoryNeuron(nn.Module):
+    def __init__(self, d_model, d_state):
+        super().__init__()
+        self.d_state = d_state  # FIX: Ajouter l'attribut
+        self.gru = nn.GRU(d_model, d_state, batch_first=True)
+        self.out_proj = nn.Linear(d_state, d_model)
+        with torch.no_grad():
+            self.gru.weight_hh_l0.zero_()
+            i_start, i_end = 2 * d_state, 3 * d_state
+            self.gru.weight_hh_l0[i_start:i_end].copy_(torch.eye(d_state))
+            self.gru.bias_hh_l0.zero_()
+            self.gru.bias_hh_l0[d_state:2*d_state].fill_(5.0)  # +5.0 comme V10.1
+            self.gru.bias_ih_l0.zero_()
+        self.gru.weight_hh_l0.requires_grad = False
+        self.gru.bias_hh_l0.requires_grad = False
+        
+    def forward(self, x, h):
+        if h is None: h = torch.zeros(1, x.size(0), self.d_state, device=x.device)
+        o, h_new = self.gru(x, h)
+        return self.out_proj(o), h_new
+
+class ComputeNeuron(nn.Module):
+    def __init__(self, d_model, d_state):
+        super().__init__()
+        self.gru = nn.GRU(d_model, d_state, batch_first=True)
+        self.out_proj = nn.Linear(d_state, d_model)
+    def forward(self, x, h):
+        if h is None: h = torch.zeros(1, x.size(0), self.gru.hidden_size, device=x.device)
+        o, h_new = self.gru(x, h)
+        return self.out_proj(o), h_new
+
+class INN_V10_1(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embedding = nn.Embedding(VOCAB_SIZE, D_MODEL)
+        self.neurons = nn.ModuleList([
+            LockedMemoryNeuron(D_MODEL, D_STATE), LockedMemoryNeuron(D_MODEL, D_STATE),
+            ComputeNeuron(D_MODEL, D_STATE), ComputeNeuron(D_MODEL, D_STATE)
+        ])
+        self.fusion_net = nn.Sequential(nn.Linear(D_MODEL, D_MODEL), nn.GELU(), nn.Linear(D_MODEL, D_MODEL))
+        self.q = nn.Linear(D_MODEL, D_MODEL)
+        self.k = nn.Linear(D_MODEL, D_MODEL)
+        self.v = nn.Linear(D_MODEL, D_MODEL)
+        self.w_out = nn.Linear(D_MODEL, D_MODEL)
+        self.norm = nn.LayerNorm(D_MODEL)
+        self.readout = nn.Linear(D_MODEL * 4, VOCAB_SIZE)
+
+    def run_workspace(self, stack):
+        B, S, N, D = stack.shape
+        flat = stack.view(B*S, N, D)
+        q = self.q(flat)
+        k = self.k(flat)
+        v = self.v(flat)
+        attn = F.softmax(torch.matmul(q, k.transpose(-2,-1)) / math.sqrt(D), dim=-1)
+        mixed = torch.matmul(attn, v)
+        processed = self.fusion_net(mixed)
+        out = self.norm(flat + self.w_out(processed))
+        return out.view(B, S, N, D)
+
+    def forward(self, x, h=None):
+        if h is None: h = [None] * 4
+        x_emb = self.embedding(x)
+        outs, new_h = [], []
+        for i, n in enumerate(self.neurons):
+            o, hh = n(x_emb, h[i])
+            outs.append(o); new_h.append(hh)
+        stack = torch.stack(outs, dim=2)
+        integ = self.run_workspace(stack)
+        return self.readout(integ.view(x.size(0), x.size(1), -1)), new_h
+
+# ==========================================
+# EXPERIMENT 2: LOCKED VAULT (A+B Calculation)
+# ==========================================
+
+def get_batch_exp2(bs, seq):
+    """Exactement comme V10.1"""
+    x = torch.randint(30, 100, (bs, seq))
+    y = x.clone()
+    m = torch.zeros_like(x).float()
+    for b in range(bs):
+        va, vb = random.randint(0, 9), random.randint(0, 9)
+        x[b, random.randint(0, seq//4)], x[b, random.randint(0, seq//4)+1] = 20, va
+        x[b, random.randint(seq//3, 2*seq//3)], x[b, random.randint(seq//3, 2*seq//3)+1] = 21, vb
+        q = random.randint(3*seq//4, seq-2)
+        x[b, q], x[b, q+1] = 99, 98
+        y[b, q+1] = va + vb
+        m[b, q+1] = 1.0
+    return x.to(DEVICE), y.to(DEVICE), m.to(DEVICE)
+
+def train_exp2(model, name, steps=1001):
+    print(f"🏋️ Training {name} on Exp2 (A+B Calculation)...")
+    model.to(DEVICE)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    opt = optim.Adam(trainable_params, lr=2e-3)  # V10.1 utilisait 2e-3
+    
+    for step in range(steps):
+        x, y, mask = get_batch_exp2(32, 64)  # Exactement comme V10.1
+        if name == "INN":
+            logits, _ = model(x, None)
+        else:
+            logits, _ = model(x)
+        
+        loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), y.view(-1), reduction='none')
+        loss = (loss * mask.view(-1)).sum() / (mask.sum() + 1e-6)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        
+        if step % 200 == 0:
+            print(f"  Step {step} | Loss: {loss.item():.4f}")
+            if loss.item() < 0.05:
+                print("  ✅ Converged.")
+                break
+    return model
+
+def test_exp2(model, name, horizons=[2000, 5000, 10000]):
+    print(f"\n🧐 Testing {name} on Exp2...")
+    model.eval()
+    results = {}
+    
+    for H in horizons:
+        va, vb, tgt = 4, 3, 7
+        h = None
+        
+        # Store A
+        if name == "INN":
+            _, h = model(torch.tensor([[20, va]]).to(DEVICE), h)
+        else:
+            _, h = model(torch.tensor([[20, va]]).to(DEVICE), h)
+        
+        # Wait
+        for _ in range(H // 200):
+            noise = torch.randint(30, 99, (1, 100)).to(DEVICE)
+            if name == "INN":
+                _, h = model(noise, h)
+            else:
+                _, h = model(noise, h)
+        
+        # Store B
+        if name == "INN":
+            _, h = model(torch.tensor([[21, vb]]).to(DEVICE), h)
+        else:
+            _, h = model(torch.tensor([[21, vb]]).to(DEVICE), h)
+        
+        # Wait
+        for _ in range(H // 200):
+            noise = torch.randint(30, 99, (1, 100)).to(DEVICE)
+            if name == "INN":
+                _, h = model(noise, h)
+            else:
+                _, h = model(noise, h)
+        
+        # Query
+        if name == "INN":
+            logits, _ = model(torch.tensor([[99, 98]]).to(DEVICE), h)
+        else:
+            logits, _ = model(torch.tensor([[99, 98]]).to(DEVICE), h)
+        
+        pred = logits[0, -1].argmax().item()
+        conf = F.softmax(logits[0, -1], dim=0)[pred].item()
+        success = (pred == tgt)
+        res = "✅" if success else f"❌ ({pred})"
+        print(f"  H={H} | {res} | Conf: {conf:.1%}")
+        results[H] = success
+    
+    return results
+
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("EXPERIMENT 1: KEY-VALUE STORAGE (V5 Protocol)")
+    print("=" * 60)
+    
+    # Train all models
+    inn1 = INN_V5()
+    lstm1 = LSTM_Baseline()
+    trans1 = Transformer_Baseline()
+    
+    train_exp1(inn1, "INN")
+    train_exp1(lstm1, "LSTM")
+    train_exp1(trans1, "Transformer")
+    
+    # Test all models
+    print("\n" + "=" * 60)
+    print("RESULTS EXPERIMENT 1")
+    print("=" * 60)
+    r_inn1 = test_exp1(inn1, "INN")
+    r_lstm1 = test_exp1(lstm1, "LSTM")
+    r_trans1 = test_exp1(trans1, "Transformer")
+    
+    print("\n" + "=" * 60)
+    print("EXPERIMENT 2: RECURSIVE CALCULATION (V10.1 Protocol)")
+    print("=" * 60)
+    
+    # Train all models (new instances)
+    inn2 = INN_V10_1()  # Architecture V10.1 (Locked + Compute) pour le calcul récursif
+    lstm2 = LSTM_Baseline()
+    trans2 = Transformer_Baseline()
+    
+    train_exp2(inn2, "INN")
+    train_exp2(lstm2, "LSTM")
+    train_exp2(trans2, "Transformer")
+    
+    # Test all models
+    print("\n" + "=" * 60)
+    print("RESULTS EXPERIMENT 2")
+    print("=" * 60)
+    r_inn2 = test_exp2(inn2, "INN")
+    r_lstm2 = test_exp2(lstm2, "LSTM")
+    r_trans2 = test_exp2(trans2, "Transformer")
+    
+    # Summary
+    print("\n" + "=" * 60)
+    print("SUMMARY TABLE")
+    print("=" * 60)
+    print("\nExp1 (Key-Value Storage):")
+    print("  Horizon | INN | LSTM | Transformer")
+    for H in [2000, 5000, 10000]:
+        print(f"  {H:6d}  | {'✅' if r_inn1.get(H) else '❌':3s} | {'✅' if r_lstm1.get(H) else '❌':4s} | {'✅' if r_trans1.get(H) else '❌':10s}")
+    
+    print("\nExp2 (A+B Calculation):")
+    print("  Horizon | INN | LSTM | Transformer")
+    for H in [2000, 5000, 10000]:
+        print(f"  {H:6d}  | {'✅' if r_inn2.get(H) else '❌':3s} | {'✅' if r_lstm2.get(H) else '❌':4s} | {'✅' if r_trans2.get(H) else '❌':10s}")
+
+
+🚀 BENCHMARK COMPARISON on cuda
+============================================================
+EXPERIMENT 1: KEY-VALUE STORAGE (V5 Protocol)
+============================================================
+🏋️ Training INN on Exp1 (Key-Value Storage)...
+  Step 0 | Loss: 4.8214
+  Step 100 | Loss: 2.2839
+  Step 200 | Loss: 2.2033
+  Step 300 | Loss: 2.2479
+  Step 400 | Loss: 2.2004
+  Step 500 | Loss: 2.2325
+  Step 600 | Loss: 2.0391
+  Step 700 | Loss: 1.5477
+  Step 800 | Loss: 0.7599
+  Step 900 | Loss: 0.0805
+  Step 1000 | Loss: 0.0018
+  ✅ Converged.
+🏋️ Training LSTM on Exp1 (Key-Value Storage)...
+  Step 0 | Loss: 4.5810
+  Step 100 | Loss: 2.2116
+  Step 200 | Loss: 2.2130
+  Step 300 | Loss: 2.2983
+  Step 400 | Loss: 2.2792
+  Step 500 | Loss: 2.2670
+  Step 600 | Loss: 2.2103
+  Step 700 | Loss: 2.1719
+  Step 800 | Loss: 2.2553
+  Step 900 | Loss: 2.1934
+  Step 1000 | Loss: 2.2297
+  Step 1100 | Loss: 2.1104
+  Step 1200 | Loss: 2.2058
+  Step 1300 | Loss: 2.2464
+  Step 1400 | Loss: 2.2101
+  Step 1500 | Loss: 2.2400
+🏋️ Training Transformer on Exp1 (Key-Value Storage)...
+  Step 0 | Loss: 4.6235
+  Step 100 | Loss: 0.0482
+  Step 200 | Loss: 0.0068
+  ✅ Converged.
+
+============================================================
+RESULTS EXPERIMENT 1
+============================================================
+
+🧐 Testing INN on Exp1...
+  H=2000 | ✅ | Conf: 99.6%
+  H=5000 | ✅ | Conf: 96.1%
+  H=10000 | ✅ | Conf: 62.9%
+
+🧐 Testing LSTM on Exp1...
+  H=2000 | ❌ (8) | Conf: 15.0%
+  H=5000 | ❌ (8) | Conf: 15.0%
+  H=10000 | ❌ (8) | Conf: 15.0%
+
+🧐 Testing Transformer on Exp1...
+  H=2000 | ❌ (8) | Conf: 64.4%
+  H=5000 | ❌ (8) | Conf: 64.4%
+  H=10000 | ❌ (8) | Conf: 64.4%
+
+============================================================
+EXPERIMENT 2: RECURSIVE CALCULATION (V10.1 Protocol)
+============================================================
+🏋️ Training INN on Exp2 (A+B Calculation)...
+  Step 0 | Loss: 5.1296
+  Step 200 | Loss: 0.5668
+  Step 400 | Loss: 0.3337
+  Step 600 | Loss: 0.0116
+  ✅ Converged.
+🏋️ Training LSTM on Exp2 (A+B Calculation)...
+  Step 0 | Loss: 4.5826
+  Step 200 | Loss: 2.7925
+  Step 400 | Loss: 2.8282
+  Step 600 | Loss: 2.7389
+  Step 800 | Loss: 2.7502
+  Step 1000 | Loss: 2.7453
+🏋️ Training Transformer on Exp2 (A+B Calculation)...
+  Step 0 | Loss: 4.7957
+  Step 200 | Loss: 2.9068
+  Step 400 | Loss: 2.6901
+  Step 600 | Loss: 2.7342
+  Step 800 | Loss: 2.4253
+  Step 1000 | Loss: 2.5140
+
+============================================================
+RESULTS EXPERIMENT 2
+============================================================
+
+🧐 Testing INN on Exp2...
+  H=2000 | ✅ | Conf: 99.3%
+  H=5000 | ❌ (8) | Conf: 72.1%
+  H=10000 | ❌ (6) | Conf: 77.8%
+
+🧐 Testing LSTM on Exp2...
+  H=2000 | ❌ (9) | Conf: 11.0%
+  H=5000 | ❌ (9) | Conf: 11.0%
+  H=10000 | ❌ (9) | Conf: 11.0%
+
+🧐 Testing Transformer on Exp2...
+  H=2000 | ❌ (8) | Conf: 14.4%
+  H=5000 | ❌ (8) | Conf: 14.4%
+  H=10000 | ❌ (8) | Conf: 14.4%
+
+============================================================
+SUMMARY TABLE
+============================================================
+
+Exp1 (Key-Value Storage):
+  Horizon | INN | LSTM | Transformer
+    2000  | ✅   | ❌    | ❌         
+    5000  | ✅   | ❌    | ❌         
+   10000  | ✅   | ❌    | ❌         
+
+Exp2 (A+B Calculation):
+  Horizon | INN | LSTM | Transformer
+    2000  | ✅   | ❌    | ❌         
+    5000  | ❌   | ❌    | ❌         
+   10000  | ❌   | ❌    | ❌         

@@ -1,0 +1,1052 @@
+# @title ⛏️ CRAFTER BENCHMARK: INN (Vision Only) + Recurrent PPO
+# @markdown Architecture : 6 Neurones LSTM indépendants + Attention Tous-vers-Tous.
+# @markdown Mode : Vision Only (Apprend à lire l'UI directement sur l'image pour robustesse).
+
+import os
+import random
+import math
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import Categorical
+
+# Auto-install dependencies
+try:
+    import crafter
+except ImportError:
+    print("Installing Crafter...")
+    os.system("pip install -q crafter gymnasium")
+    import crafter
+
+import gymnasium as gym
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"🚀 Running on {DEVICE}")
+
+# Reproducibility
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+# Hyperparameters (Tuned for Crafter SOTA - Turbo Mode)
+NUM_ENVS = 16                # Parallel environments
+TOTAL_STEPS = 2_000_000      # Total frames
+ROLLOUT_STEPS = 256          # Increased: 16*256 = 4096 steps per update (Better Gradient)
+MINIBATCH_SEQ_LEN = 32       # TBPTT Sequence length
+NUM_MINIBATCHES = 8          # Increased minibatches for 4096 steps
+PPO_EPOCHS = 4               # Optimization epochs
+LR = 7e-5                    # Increased for faster policy learning
+LR_CRITIC = 5e-5             # Stable critic LR
+RND_SCALE = 0.005            # Boosted Curiosity (x5) to force exploration
+GAMMA = 0.97                 # Reduced Gamma: Focus on immediate survival/crafting stability
+GAE_LAMBDA = 0.92            # Reduced Lambda for less variance
+CLIP_EPS = 0.25              # Increased Clipping: Allow bolder updates
+ENT_COEF = 0.01              # Entropy bonus
+MAX_GRAD_NORM = 0.5
+SAVE_DIR = "./inn_crafter_checkpoints"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# INN Specs
+N_NEURONS = 6
+D_MODEL = 128                # Dimension per neuron
+
+# ==========================================
+# ENVIRONMENT WRAPPER (VISION ONLY)
+# ==========================================
+
+class CrafterVisionWrapper(gym.Env):
+    """
+    Wrapper ultra-robuste qui ne dépend QUE de l'image.
+    Évite toutes les erreurs d'attributs internes de Crafter.
+    """
+    def __init__(self, seed):
+        self._env = crafter.Env(seed=seed)
+        
+        # Image: (64, 64, 3)
+        self.observation_space = gym.spaces.Dict({
+            'image': gym.spaces.Box(0, 255, (64, 64, 3), dtype=np.uint8),
+        })
+        self.action_space = gym.spaces.Discrete(17)
+        
+    def reset(self, seed=None, options=None):
+        obs = self._env.reset()
+        return {'image': obs}, {}
+
+    def step(self, action):
+        obs, reward, done, info = self._env.step(action)
+        return {'image': obs}, reward, done, False, info
+
+def make_env(idx):
+    def _thunk():
+        env = CrafterVisionWrapper(seed=SEED + idx)
+        return env
+    return _thunk
+
+# ==========================================
+# ARCHITECTURE: INN (All-to-All)
+# ==========================================
+
+class DualVisionEncoder(nn.Module):
+    """
+    Encodes image into two streams:
+    1. Inventory Head: Finer details (icons, text)
+    2. Environment Head: Larger receptive field (objects, terrain)
+    """
+    def __init__(self, d_model):
+        super().__init__()
+        
+        # Inventory Head (High Res, Small Kernels)
+        self.inv_head = nn.Sequential(
+            nn.Conv2d(3, 32, 3, stride=1, padding=1), nn.ReLU(),
+            nn.Conv2d(32, 64, 3, stride=1, padding=1), nn.ReLU(),
+            nn.AdaptiveAvgPool2d((4, 4)), 
+            nn.Flatten(),
+            nn.Linear(64 * 4 * 4, d_model), nn.ReLU()
+        )
+        
+        # Environment Head (Low Res, Large Kernels)
+        self.env_head = nn.Sequential(
+            nn.Conv2d(3, 32, 4, stride=2), nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2), nn.ReLU(),
+            nn.Conv2d(64, 128, 4, stride=2), nn.ReLU(),
+            nn.AdaptiveAvgPool2d((2, 2)),
+            nn.Flatten(),
+            nn.Linear(128 * 2 * 2, d_model), nn.ReLU()
+        )
+
+    def forward(self, x):
+        # x: [B, 3, H, W] already permuted and normalized
+        inv_feat = self.inv_head(x)
+        env_feat = self.env_head(x)
+        return inv_feat, env_feat
+
+class INN_Neuron(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.ln_in = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=2, batch_first=True)
+        self.lstm = nn.LSTMCell(d_model * 2, d_model) 
+        self.ln_out = nn.LayerNorm(d_model)
+
+    def forward(self, h, c, all_states, external_input=None):
+        # 1. Communication (Query = h, Key/Value = all_states)
+        query = h.unsqueeze(1)
+        context, _ = self.attn(query, all_states, all_states) 
+        context = context.squeeze(1)
+
+        # 2. Input Fusion
+        if external_input is None:
+            external_input = torch.zeros_like(h)
+        
+        rnn_input = torch.cat([context, external_input], dim=-1)
+        
+        # 3. Recurrence
+        new_h, new_c = self.lstm(rnn_input, (h, c))
+        return self.ln_out(new_h), new_c
+
+class INN_Brain(nn.Module):
+    def __init__(self, num_actions=17):
+        super().__init__()
+        self.n_neurons = N_NEURONS
+        self.d_model = D_MODEL
+        
+        # Dual Vision Encoder
+        self.dual_encoder = DualVisionEncoder(D_MODEL)
+        
+        # Learnable Gating per Neuron (Initialized to NEUTRAL)
+        # Value 0.0 means sigmoid(0.0) = 0.5 (equal attention to env and inv)
+        self.gate_logits = nn.Parameter(torch.zeros(self.n_neurons))
+        
+        # Per-Neuron Projections
+        self.inv_projs = nn.ModuleList([nn.Linear(D_MODEL, D_MODEL) for _ in range(self.n_neurons)])
+        self.env_projs = nn.ModuleList([nn.Linear(D_MODEL, D_MODEL) for _ in range(self.n_neurons)])
+        
+        self.neurons = nn.ModuleList([INN_Neuron(D_MODEL) for _ in range(N_NEURONS)])
+        self.actor = nn.Linear(D_MODEL, num_actions)
+        self.critic = nn.Linear(D_MODEL, 1)
+        
+        for name, param in self.named_parameters():
+            if "weight" in name and param.dim() > 1:
+                nn.init.orthogonal_(param, gain=np.sqrt(2))
+
+    def get_initial_state(self, batch_size):
+        return [
+            (torch.zeros(batch_size, self.d_model).to(DEVICE),
+             torch.zeros(batch_size, self.d_model).to(DEVICE))
+            for _ in range(self.n_neurons)
+        ]
+
+    def forward(self, obs, state, done=None):
+        B = obs['image'].shape[0]
+        
+        # 1. Perception (Dual Stream)
+        img = obs['image'].permute(0, 3, 1, 2).float() / 255.0 - 0.5
+        inv_feat, env_feat = self.dual_encoder(img)
+        
+        # Modality Dropout (Training only - Per Sample)
+        if self.training:
+            # Create masks [B, 1]
+            inv_mask = (torch.rand(inv_feat.size(0), 1, device=inv_feat.device) >= 0.1).float()
+            env_mask = (torch.rand(env_feat.size(0), 1, device=env_feat.device) >= 0.1).float()
+            
+            inv_feat = inv_feat * inv_mask
+            env_feat = env_feat * env_mask
+
+        # 2. Context
+        prev_h_stacked = torch.stack([s[0] for s in state], dim=1) 
+        
+        # 3. Reset Masking
+        if done is not None:
+            mask = 1.0 - done.float().unsqueeze(-1)
+            state = [(h * mask, c * mask) for (h, c) in state]
+            prev_h_stacked = prev_h_stacked * mask.unsqueeze(1)
+
+        # 4. Update Neurons with Gated Input
+        g = torch.sigmoid(self.gate_logits).view(1, self.n_neurons, 1) # [1, N, 1]
+        
+        new_state = []
+        for i in range(self.n_neurons):
+            # Compute specific input for this neuron
+            # ext = g[i] * inv + (1-g[i]) * env
+            proj_inv = self.inv_projs[i](inv_feat)
+            proj_env = self.env_projs[i](env_feat)
+            
+            gate_val = g[:, i, :]
+            ext_input = gate_val * proj_inv + (1.0 - gate_val) * proj_env
+            
+            h, c = state[i]
+            new_h, new_c = self.neurons[i](h, c, prev_h_stacked, ext_input)
+            new_state.append((new_h, new_c))
+            
+        # 5. Readout
+        final_h_stacked = torch.stack([s[0] for s in new_state], dim=1)
+        global_representation = torch.mean(final_h_stacked, dim=1)
+        
+        logits = self.actor(global_representation)
+        value = self.critic(global_representation)
+        
+        return logits, value, new_state
+
+# ==========================================
+# STORAGE BUFFER
+# ==========================================
+
+class RecurrentBuffer:
+    def __init__(self, num_steps, num_envs, obs_shape, n_neurons, d_model, device):
+        self.obs_img = torch.zeros((num_steps, num_envs) + obs_shape, dtype=torch.uint8, device=device)
+        self.actions = torch.zeros((num_steps, num_envs), dtype=torch.long).to(device) # Corrected to long
+        self.logprobs = torch.zeros((num_steps, num_envs)).to(device)
+        self.rewards = torch.zeros((num_steps, num_envs)).to(device)
+        self.ext_rewards = torch.zeros((num_steps, num_envs)).to(device)
+        self.dones = torch.zeros((num_steps, num_envs)).to(device)
+        self.values = torch.zeros((num_steps, num_envs)).to(device)
+        
+        # Store RNN States: [Steps, Envs, N_Neurons, D_Model]
+        self.h_states = torch.zeros((num_steps, num_envs, n_neurons, d_model)).to(device)
+        self.c_states = torch.zeros((num_steps, num_envs, n_neurons, d_model)).to(device)
+
+    def store(self, step, obs, action, logprob, reward, ext_reward, done, value, state):
+        # Secure storage
+        img = torch.from_numpy(obs['image']).to(dtype=torch.uint8, device=DEVICE)
+        self.obs_img[step].copy_(img)
+        self.actions[step].copy_(action.to(DEVICE)) # No float cast for actions
+        self.logprobs[step].copy_(logprob.detach().to(DEVICE))
+        self.rewards[step].copy_(reward.detach().to(DEVICE))
+        self.ext_rewards[step].copy_(ext_reward.detach().to(DEVICE))
+        self.dones[step].copy_(torch.tensor(done, dtype=torch.float32, device=DEVICE))
+        self.values[step].copy_(value.detach().to(DEVICE))
+        
+        # Store Hidden States
+        # state is a list of (h, c) tuples for each neuron
+        # h shape: [Envs, D_Model]
+        for i, (h, c) in enumerate(state):
+            self.h_states[step, :, i].copy_(h.detach())
+            self.c_states[step, :, i].copy_(c.detach())
+
+# ==========================================
+# RND MODULE (Intrinsic Curiosity)
+# ==========================================
+
+class RNDModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Target Network (Fixe)
+        self.target = nn.Sequential(
+            nn.Conv2d(3, 32, 4, stride=2), nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2), nn.ReLU(),
+            nn.Conv2d(64, 128, 4, stride=2), nn.ReLU(),
+            nn.AdaptiveAvgPool2d((2, 2)), # Force output spatial dim to 2x2
+            nn.Flatten(),
+            nn.Linear(128 * 2 * 2, 512)
+        )
+        # Predictor Network (Trainable)
+        self.predictor = nn.Sequential(
+            nn.Conv2d(3, 32, 4, stride=2), nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2), nn.ReLU(),
+            nn.Conv2d(64, 128, 4, stride=2), nn.ReLU(),
+            nn.AdaptiveAvgPool2d((2, 2)), # Force output spatial dim to 2x2
+            nn.Flatten(),
+            nn.Linear(128 * 2 * 2, 512),
+            nn.ReLU(),
+            nn.Linear(512, 512)
+        )
+        # Freeze target
+        for p in self.target.parameters():
+            p.requires_grad = False
+
+    def forward(self, obs):
+        # obs: [B, 64, 64, 3] -> permute inside
+        x = obs.permute(0, 3, 1, 2).float() / 255.0 - 0.5
+        with torch.no_grad():
+            target_feat = self.target(x)
+        pred_feat = self.predictor(x)
+        return target_feat, pred_feat
+
+# ==========================================
+# TRAINING LOOP
+# ==========================================
+
+if __name__ == "__main__":
+    envs = gym.vector.AsyncVectorEnv([make_env(i) for i in range(NUM_ENVS)])
+    
+    # Agent & RND
+    agent = INN_Brain().to(DEVICE)
+    rnd = RNDModule().to(DEVICE)
+    
+    print(f"🧠 Model Parameters: {sum(p.numel() for p in agent.parameters())}")
+    
+    # Separate Optimizers (Stability & Gate Boost)
+    # Group parameters
+    gate_params = [p for n,p in agent.named_parameters() if "gate_logits" in n]
+    critic_params = [p for n,p in agent.named_parameters() if "critic" in n]
+    actor_params = [p for n,p in agent.named_parameters() if "critic" not in n and "gate_logits" not in n]
+    
+    # Optimizer with parameter groups
+    opt_actor = torch.optim.Adam([
+        {'params': actor_params, 'lr': LR},
+        {'params': gate_params, 'lr': LR * 10.0} # Boost Gate LR to unfreeze it
+    ], eps=1e-5)
+    
+    opt_critic = torch.optim.Adam(critic_params, lr=LR_CRITIC, eps=1e-5)
+    rnd_optimizer = torch.optim.Adam(rnd.predictor.parameters(), lr=LR, eps=1e-5)
+    
+    buffer = RecurrentBuffer(ROLLOUT_STEPS, NUM_ENVS, (64,64,3), N_NEURONS, D_MODEL, DEVICE)
+
+    global_step = 0
+    next_obs, _ = envs.reset()
+    next_done = torch.zeros(NUM_ENVS).to(DEVICE)
+    next_state = agent.get_initial_state(NUM_ENVS)
+    
+    # RND Running Stats
+    int_reward_mean = 0.0
+    int_reward_std = 1.0
+    
+    # 10M Steps SOTA Run
+    TOTAL_STEPS = 10_000_000
+    num_updates = TOTAL_STEPS // (NUM_ENVS * ROLLOUT_STEPS)
+    print("🏁 STARTING TRAINING (INN Vision-Only Dual-Stream + RND Stabilized)...")
+
+    try:
+        for update in range(1, num_updates + 1):
+            initial_rollout_state = [(h.detach(), c.detach()) for (h, c) in next_state]
+            
+            for step in range(ROLLOUT_STEPS):
+                global_step += NUM_ENVS
+                
+                # 1. Save state BEFORE forward (Critical for PPO-RNN alignment)
+                current_state_to_store = [(h.detach(), c.detach()) for (h, c) in next_state]
+                
+                obs_tensor = {'image': torch.tensor(next_obs['image']).to(DEVICE)}
+                
+                # 2. Agent Action
+                with torch.no_grad():
+                    logits, value, next_state_out = agent(obs_tensor, next_state, next_done)
+                    dist = Categorical(logits=logits)
+                    action = dist.sample()
+                    logprob = dist.log_prob(action)
+                
+                # 3. Environment Step
+                real_next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
+                done = np.logical_or(terminated, truncated)
+                
+                # 4. Intrinsic Reward (RND) & Online Normalization
+                with torch.no_grad():
+                    next_img = torch.from_numpy(real_next_obs['image']).to(DEVICE)
+                    t_feat, p_feat = rnd(next_img)
+                    r_int = (t_feat - p_feat).pow(2).sum(dim=1) / 2.0
+                    
+                    # Update Running Stats (Online)
+                    batch_mean = r_int.mean().item()
+                    batch_std = r_int.std().item()
+                    int_reward_mean = 0.999 * int_reward_mean + 0.001 * batch_mean
+                    int_reward_std = 0.999 * int_reward_std + 0.001 * batch_std
+                    
+                    # Normalize immediately (Scale by STD only to keep positivity)
+                    r_int_norm = r_int / (int_reward_std + 1e-8)
+                
+                # 5. Combine Rewards
+                r_ext = torch.tensor(reward).to(DEVICE)
+                
+                # Clip intrinsic reward contribution to avoid destabilizing PPO
+                # Cap bonus at 0.5 (practical limit)
+                r_bonus = torch.clamp(RND_SCALE * r_int_norm, 0.0, 0.5)
+                r_total = r_ext + r_bonus
+                
+                # 6. Store (Aligned: state used for action -> action -> reward resulting)
+                buffer.store(step, next_obs, action, logprob, r_total, r_ext, done, value.flatten(), current_state_to_store)
+                
+                # 7. Update Pointers
+                next_obs = real_next_obs
+                next_done = torch.tensor(done).to(DEVICE)
+                next_state = next_state_out # This becomes the input state for next step
+
+            # Update RND Predictor on FULL SHUFFLED BUFFER (Corrected)
+            b_obs_rnd = buffer.obs_img.view(-1, 64, 64, 3)
+            idx = torch.randperm(b_obs_rnd.size(0))[:min(4096, b_obs_rnd.size(0))]
+            t_feat, p_feat = rnd(b_obs_rnd[idx])
+            rnd_loss = (t_feat - p_feat).pow(2).mean()
+            
+            rnd_optimizer.zero_grad()
+            rnd_loss.backward()
+            rnd_optimizer.step()
+
+            with torch.no_grad():
+                 obs_tensor = {'image': torch.tensor(next_obs['image']).to(DEVICE)}
+                 _, next_value, _ = agent(obs_tensor, next_state, next_done)
+                 advantages = torch.zeros_like(buffer.rewards).to(DEVICE)
+                 lastgaelam = 0
+                 for t in reversed(range(ROLLOUT_STEPS)):
+                     if t == ROLLOUT_STEPS - 1:
+                         nextnonterminal = 1.0 - next_done.float()
+                         nextvalues = next_value.flatten()
+                     else:
+                         nextnonterminal = 1.0 - buffer.dones[t + 1]
+                         nextvalues = buffer.values[t + 1]
+                     
+                     delta = buffer.rewards[t] + GAMMA * nextvalues * nextnonterminal - buffer.values[t]
+                     advantages[t] = lastgaelam = delta + GAMMA * GAE_LAMBDA * nextnonterminal * lastgaelam
+                 
+                 returns = advantages + buffer.values
+
+            # Normalize Advantages
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+            # Recurrent PPO Update
+            b_obs_img = buffer.obs_img
+            b_actions = buffer.actions
+            b_logprobs = buffer.logprobs
+            b_advantages = advantages
+            b_returns = returns
+            b_dones = buffer.dones
+            b_values = buffer.values # Needed for proper clipping
+            
+            # Retrieve stored states
+            b_h_states = buffer.h_states
+            b_c_states = buffer.c_states
+            
+            total_v_loss = 0
+            total_p_loss = 0
+            
+            for _ in range(PPO_EPOCHS):
+                for t in range(0, ROLLOUT_STEPS, MINIBATCH_SEQ_LEN):
+                    end_t = min(t + MINIBATCH_SEQ_LEN, ROLLOUT_STEPS)
+                    c_obs_img = b_obs_img[t:end_t]
+                    c_actions = b_actions[t:end_t]
+                    c_logprobs = b_logprobs[t:end_t]
+                    c_returns = b_returns[t:end_t]
+                    c_advs = b_advantages[t:end_t]
+                    c_dones = b_dones[t:end_t]
+                    c_old_values = b_values[t:end_t] # Old values for clipping
+                    
+                    # Reconstruct Initial State for this Chunk from Buffer
+                    current_h = b_h_states[t]
+                    current_c = b_c_states[t]
+                    
+                    current_chunk_state = []
+                    for n_idx in range(N_NEURONS):
+                        current_chunk_state.append((current_h[:, n_idx], current_c[:, n_idx]))
+                    
+                    new_logprobs, new_values, new_entropies = [], [], []
+                    
+                    for k in range(end_t - t):
+                        step_obs = {'image': c_obs_img[k]}
+                        step_done = c_dones[k]
+                        logits, val, current_chunk_state = agent(step_obs, current_chunk_state, step_done)
+                        dist = Categorical(logits=logits)
+                        new_logprobs.append(dist.log_prob(c_actions[k]))
+                        new_values.append(val.flatten())
+                        new_entropies.append(dist.entropy())
+                    
+                    new_logprobs = torch.stack(new_logprobs)
+                    new_values = torch.stack(new_values)
+                    new_entropies = torch.stack(new_entropies)
+                    
+                    # Loss
+                    logratio = new_logprobs - c_logprobs
+                    ratio = logratio.exp()
+                    pg_loss1 = -c_advs * ratio
+                    pg_loss2 = -c_advs * torch.clamp(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS)
+                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                    
+                    # Value Clipping (Correct Implementation)
+                    # new_values and c_old_values must match shape
+                    v_loss_unclipped = (new_values - c_returns) ** 2
+                    v_clipped = c_old_values + torch.clamp(new_values - c_old_values, -CLIP_EPS, CLIP_EPS)
+                    v_loss_clipped = (v_clipped - c_returns) ** 2
+                    v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                    
+                    entropy_loss = new_entropies.mean()
+                    
+                    loss_actor = pg_loss - entropy_loss * ENT_COEF
+                    loss_critic = v_loss
+                    
+                    # Combined Loss for Single Backward Pass (More Efficient, No Graph Leak)
+                    loss_total = loss_actor + 0.5 * loss_critic
+
+                    opt_actor.zero_grad()
+                    opt_critic.zero_grad()
+                    
+                    loss_total.backward()
+                    
+                    nn.utils.clip_grad_norm_(agent.parameters(), MAX_GRAD_NORM)
+                    
+                    opt_actor.step()
+                    opt_critic.step()
+                    
+                    total_v_loss += v_loss.item()
+
+            mean_total_reward = buffer.rewards.sum(dim=0).mean().item()
+            mean_game_reward = buffer.ext_rewards.sum(dim=0).mean().item()
+            mean_bonus = mean_total_reward - mean_game_reward
+            gate_mean = torch.sigmoid(agent.gate_logits).mean().item()
+            
+            print(f"Step {global_step} | Avg Total: {mean_total_reward:.2f} | Avg Game: {mean_game_reward:.2f} | RND Bonus: {mean_bonus:.2f} | Gate: {gate_mean:.2f} | Value Loss: {total_v_loss / (PPO_EPOCHS * NUM_MINIBATCHES):.3f}")
+            
+            # Robust Checkpointing
+            if update % 50 == 0: # Every ~200k steps
+                save_path = f"{SAVE_DIR}/inn_crafter_{global_step}.pt"
+                torch.save({
+                    'agent_state_dict': agent.state_dict(),
+                    'optimizer_actor_state_dict': opt_actor.state_dict(),
+                    'optimizer_critic_state_dict': opt_critic.state_dict(),
+                    'global_step': global_step,
+                }, save_path)
+                print(f"💾 Checkpoint saved: {save_path}")
+
+    except KeyboardInterrupt:
+        print("\n🛑 Training interrupted by user. Saving emergency checkpoint...")
+    except Exception as e:
+        print(f"\n❌ Error occurred: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        final_save_path = f"{SAVE_DIR}/inn_crafter_final.pt"
+        torch.save({
+            'agent_state_dict': agent.state_dict(),
+            'optimizer_actor_state_dict': opt_actor.state_dict(),
+            'optimizer_critic_state_dict': opt_critic.state_dict(),
+            'global_step': global_step,
+        }, final_save_path)
+        print(f"✅ Final/Emergency Checkpoint saved: {final_save_path}")
+        envs.close()
+
+
+🚀 Running on cuda
+🏁 STARTING TRAINING (INN Vision-Only + RND Stabilized)...
+Step 4096 | Avg Total: 3.71 | Avg Game: 3.02 | Value Loss: 0.116
+Step 8192 | Avg Total: 2.97 | Avg Game: 2.09 | Value Loss: 0.082
+Step 12288 | Avg Total: 3.78 | Avg Game: 2.67 | Value Loss: 0.110
+Step 16384 | Avg Total: 4.62 | Avg Game: 3.22 | Value Loss: 0.069
+Step 20480 | Avg Total: 4.58 | Avg Game: 2.81 | Value Loss: 0.072
+Step 24576 | Avg Total: 4.74 | Avg Game: 2.50 | Value Loss: 0.057
+Step 28672 | Avg Total: 6.15 | Avg Game: 3.34 | Value Loss: 0.063
+Step 32768 | Avg Total: 6.41 | Avg Game: 2.87 | Value Loss: 0.064
+Step 36864 | Avg Total: 8.08 | Avg Game: 3.62 | Value Loss: 0.054
+Step 40960 | Avg Total: 9.17 | Avg Game: 3.59 | Value Loss: 0.075
+Step 45056 | Avg Total: 10.06 | Avg Game: 3.09 | Value Loss: 0.054
+Step 49152 | Avg Total: 13.08 | Avg Game: 4.45 | Value Loss: 0.064
+Step 53248 | Avg Total: 14.20 | Avg Game: 3.63 | Value Loss: 0.064
+Step 57344 | Avg Total: 16.46 | Avg Game: 3.60 | Value Loss: 0.066
+Step 61440 | Avg Total: 19.77 | Avg Game: 4.23 | Value Loss: 0.049
+Step 65536 | Avg Total: 22.40 | Avg Game: 3.72 | Value Loss: 0.105
+Step 69632 | Avg Total: 25.87 | Avg Game: 3.73 | Value Loss: 0.075
+Step 73728 | Avg Total: 30.39 | Avg Game: 4.26 | Value Loss: 0.087
+Step 77824 | Avg Total: 34.44 | Avg Game: 3.97 | Value Loss: 0.181
+Step 81920 | Avg Total: 38.88 | Avg Game: 4.08 | Value Loss: 0.165
+Step 86016 | Avg Total: 42.66 | Avg Game: 3.74 | Value Loss: 0.117
+Step 90112 | Avg Total: 47.06 | Avg Game: 3.90 | Value Loss: 0.297
+Step 94208 | Avg Total: 51.27 | Avg Game: 3.97 | Value Loss: 0.313
+Step 98304 | Avg Total: 54.08 | Avg Game: 4.02 | Value Loss: 0.285
+Step 102400 | Avg Total: 57.65 | Avg Game: 3.46 | Value Loss: 0.250
+Step 106496 | Avg Total: 62.11 | Avg Game: 4.11 | Value Loss: 0.404
+Step 110592 | Avg Total: 63.42 | Avg Game: 3.64 | Value Loss: 0.419
+Step 114688 | Avg Total: 67.40 | Avg Game: 4.16 | Value Loss: 0.281
+Step 118784 | Avg Total: 67.45 | Avg Game: 3.88 | Value Loss: 0.427
+Step 122880 | Avg Total: 67.93 | Avg Game: 4.23 | Value Loss: 0.431
+Step 126976 | Avg Total: 70.17 | Avg Game: 4.27 | Value Loss: 0.246
+Step 131072 | Avg Total: 72.21 | Avg Game: 4.71 | Value Loss: 0.518
+Step 135168 | Avg Total: 72.48 | Avg Game: 4.71 | Value Loss: 0.242
+Step 139264 | Avg Total: 71.54 | Avg Game: 4.11 | Value Loss: 0.477
+Step 143360 | Avg Total: 71.87 | Avg Game: 4.72 | Value Loss: 0.272
+Step 147456 | Avg Total: 70.20 | Avg Game: 3.78 | Value Loss: 0.634
+Step 151552 | Avg Total: 69.37 | Avg Game: 4.78 | Value Loss: 0.426
+Step 155648 | Avg Total: 68.27 | Avg Game: 4.12 | Value Loss: 0.330
+Step 159744 | Avg Total: 68.90 | Avg Game: 4.61 | Value Loss: 0.252
+Step 163840 | Avg Total: 67.53 | Avg Game: 4.55 | Value Loss: 0.655
+Step 167936 | Avg Total: 66.94 | Avg Game: 4.69 | Value Loss: 0.616
+Step 172032 | Avg Total: 66.04 | Avg Game: 4.38 | Value Loss: 0.058
+Step 176128 | Avg Total: 65.95 | Avg Game: 4.67 | Value Loss: 0.762
+Step 180224 | Avg Total: 65.86 | Avg Game: 5.45 | Value Loss: 0.237
+Step 184320 | Avg Total: 62.10 | Avg Game: 3.76 | Value Loss: 0.424
+Step 188416 | Avg Total: 59.91 | Avg Game: 4.25 | Value Loss: 0.351
+Step 192512 | Avg Total: 59.09 | Avg Game: 4.29 | Value Loss: 0.635
+Step 196608 | Avg Total: 58.85 | Avg Game: 4.41 | Value Loss: 0.236
+Step 200704 | Avg Total: 57.76 | Avg Game: 4.44 | Value Loss: 0.140
+Step 204800 | Avg Total: 56.48 | Avg Game: 4.68 | Value Loss: 0.399
+Step 208896 | Avg Total: 55.14 | Avg Game: 4.16 | Value Loss: 0.147
+Step 212992 | Avg Total: 54.07 | Avg Game: 4.36 | Value Loss: 0.420
+Step 217088 | Avg Total: 52.40 | Avg Game: 4.30 | Value Loss: 0.224
+Step 221184 | Avg Total: 51.50 | Avg Game: 4.66 | Value Loss: 0.154
+Step 225280 | Avg Total: 50.72 | Avg Game: 4.37 | Value Loss: 0.300
+Step 229376 | Avg Total: 50.51 | Avg Game: 4.76 | Value Loss: 0.156
+Step 233472 | Avg Total: 48.42 | Avg Game: 4.55 | Value Loss: 0.336
+Step 237568 | Avg Total: 47.42 | Avg Game: 4.78 | Value Loss: 0.237
+Step 241664 | Avg Total: 45.53 | Avg Game: 4.28 | Value Loss: 0.255
+Step 245760 | Avg Total: 45.17 | Avg Game: 5.10 | Value Loss: 0.142
+Step 249856 | Avg Total: 44.59 | Avg Game: 5.06 | Value Loss: 0.081
+Step 253952 | Avg Total: 42.86 | Avg Game: 4.10 | Value Loss: 0.316
+Step 258048 | Avg Total: 41.96 | Avg Game: 4.24 | Value Loss: 0.143
+Step 262144 | Avg Total: 41.34 | Avg Game: 4.12 | Value Loss: 0.395
+Step 266240 | Avg Total: 41.03 | Avg Game: 4.52 | Value Loss: 0.040
+Step 270336 | Avg Total: 40.36 | Avg Game: 5.16 | Value Loss: 0.251
+Step 274432 | Avg Total: 38.85 | Avg Game: 4.35 | Value Loss: 0.170
+Step 278528 | Avg Total: 37.64 | Avg Game: 4.43 | Value Loss: 0.130
+Step 282624 | Avg Total: 36.71 | Avg Game: 4.41 | Value Loss: 0.192
+Step 286720 | Avg Total: 35.62 | Avg Game: 4.49 | Value Loss: 0.198
+Step 290816 | Avg Total: 34.40 | Avg Game: 4.93 | Value Loss: 0.065
+Step 294912 | Avg Total: 31.87 | Avg Game: 3.90 | Value Loss: 0.271
+Step 299008 | Avg Total: 30.65 | Avg Game: 4.64 | Value Loss: 0.108
+Step 303104 | Avg Total: 29.56 | Avg Game: 4.59 | Value Loss: 0.118
+Step 307200 | Avg Total: 28.68 | Avg Game: 4.48 | Value Loss: 0.099
+Step 311296 | Avg Total: 28.50 | Avg Game: 4.97 | Value Loss: 0.051
+Step 315392 | Avg Total: 27.71 | Avg Game: 5.03 | Value Loss: 0.139
+Step 319488 | Avg Total: 26.72 | Avg Game: 4.64 | Value Loss: 0.128
+Step 323584 | Avg Total: 25.80 | Avg Game: 4.39 | Value Loss: 0.054
+Step 327680 | Avg Total: 25.79 | Avg Game: 5.39 | Value Loss: 0.077
+Step 331776 | Avg Total: 23.55 | Avg Game: 4.96 | Value Loss: 0.090
+Step 335872 | Avg Total: 20.09 | Avg Game: 3.33 | Value Loss: 0.035
+Step 339968 | Avg Total: 21.53 | Avg Game: 5.18 | Value Loss: 0.082
+Step 344064 | Avg Total: 20.07 | Avg Game: 4.83 | Value Loss: 0.061
+Step 348160 | Avg Total: 20.26 | Avg Game: 5.26 | Value Loss: 0.060
+Step 352256 | Avg Total: 19.30 | Avg Game: 5.07 | Value Loss: 0.079
+Step 356352 | Avg Total: 18.30 | Avg Game: 4.26 | Value Loss: 0.042
+Step 360448 | Avg Total: 18.30 | Avg Game: 5.02 | Value Loss: 0.058
+Step 364544 | Avg Total: 18.48 | Avg Game: 5.73 | Value Loss: 0.048
+Step 368640 | Avg Total: 16.68 | Avg Game: 4.46 | Value Loss: 0.054
+Step 372736 | Avg Total: 15.24 | Avg Game: 4.74 | Value Loss: 0.102
+Step 376832 | Avg Total: 15.91 | Avg Game: 5.46 | Value Loss: 0.055
+Step 380928 | Avg Total: 13.21 | Avg Game: 4.32 | Value Loss: 0.081
+Step 385024 | Avg Total: 13.36 | Avg Game: 5.16 | Value Loss: 0.059
+Step 389120 | Avg Total: 11.99 | Avg Game: 4.44 | Value Loss: 0.079
+Step 393216 | Avg Total: 13.05 | Avg Game: 5.14 | Value Loss: 0.033
+Step 397312 | Avg Total: 11.92 | Avg Game: 4.20 | Value Loss: 0.019
+Step 401408 | Avg Total: 11.26 | Avg Game: 4.03 | Value Loss: 0.026
+Step 405504 | Avg Total: 11.77 | Avg Game: 5.11 | Value Loss: 0.073
+Step 409600 | Avg Total: 11.88 | Avg Game: 5.54 | Value Loss: 0.053
+Step 413696 | Avg Total: 11.48 | Avg Game: 5.58 | Value Loss: 0.051
+Step 417792 | Avg Total: 10.55 | Avg Game: 4.42 | Value Loss: 0.082
+Step 421888 | Avg Total: 10.78 | Avg Game: 5.29 | Value Loss: 0.064
+Step 425984 | Avg Total: 9.66 | Avg Game: 4.65 | Value Loss: 0.072
+Step 430080 | Avg Total: 10.63 | Avg Game: 5.94 | Value Loss: 0.041
+Step 434176 | Avg Total: 8.41 | Avg Game: 3.76 | Value Loss: 0.034
+Step 438272 | Avg Total: 9.56 | Avg Game: 5.59 | Value Loss: 0.033
+Step 442368 | Avg Total: 8.92 | Avg Game: 4.76 | Value Loss: 0.038
+Step 446464 | Avg Total: 8.49 | Avg Game: 4.54 | Value Loss: 0.063
+Step 450560 | Avg Total: 8.66 | Avg Game: 5.07 | Value Loss: 0.051
+Step 454656 | Avg Total: 8.48 | Avg Game: 4.72 | Value Loss: 0.049
+Step 458752 | Avg Total: 8.46 | Avg Game: 4.99 | Value Loss: 0.042
+Step 462848 | Avg Total: 7.46 | Avg Game: 3.89 | Value Loss: 0.046
+Step 466944 | Avg Total: 7.80 | Avg Game: 4.36 | Value Loss: 0.037
+Step 471040 | Avg Total: 7.90 | Avg Game: 4.66 | Value Loss: 0.027
+Step 475136 | Avg Total: 7.51 | Avg Game: 4.32 | Value Loss: 0.035
+Step 479232 | Avg Total: 8.12 | Avg Game: 5.09 | Value Loss: 0.039
+Step 483328 | Avg Total: 8.11 | Avg Game: 4.74 | Value Loss: 0.030
+Step 487424 | Avg Total: 7.94 | Avg Game: 4.81 | Value Loss: 0.028
+Step 491520 | Avg Total: 6.74 | Avg Game: 3.52 | Value Loss: 0.031
+Step 495616 | Avg Total: 8.16 | Avg Game: 5.28 | Value Loss: 0.033
+Step 499712 | Avg Total: 7.81 | Avg Game: 4.84 | Value Loss: 0.023
+Step 503808 | Avg Total: 8.10 | Avg Game: 5.26 | Value Loss: 0.025
+Step 507904 | Avg Total: 8.19 | Avg Game: 5.57 | Value Loss: 0.068
+Step 512000 | Avg Total: 6.84 | Avg Game: 4.27 | Value Loss: 0.033
+Step 516096 | Avg Total: 8.55 | Avg Game: 6.31 | Value Loss: 0.046
+Step 520192 | Avg Total: 7.69 | Avg Game: 5.18 | Value Loss: 0.033
+Step 524288 | Avg Total: 6.52 | Avg Game: 3.81 | Value Loss: 0.061
+Step 528384 | Avg Total: 7.63 | Avg Game: 5.18 | Value Loss: 0.031
+Step 532480 | Avg Total: 7.34 | Avg Game: 5.00 | Value Loss: 0.058
+Step 536576 | Avg Total: 7.26 | Avg Game: 5.05 | Value Loss: 0.055
+Step 540672 | Avg Total: 7.09 | Avg Game: 4.75 | Value Loss: 0.034
+Step 544768 | Avg Total: 7.32 | Avg Game: 5.49 | Value Loss: 0.051
+Step 548864 | Avg Total: 6.70 | Avg Game: 4.79 | Value Loss: 0.045
+Step 552960 | Avg Total: 6.70 | Avg Game: 4.58 | Value Loss: 0.044
+Step 557056 | Avg Total: 7.35 | Avg Game: 5.16 | Value Loss: 0.043
+Step 561152 | Avg Total: 6.69 | Avg Game: 4.75 | Value Loss: 0.050
+Step 565248 | Avg Total: 7.35 | Avg Game: 5.26 | Value Loss: 0.045
+Step 569344 | Avg Total: 6.37 | Avg Game: 4.50 | Value Loss: 0.037
+Step 573440 | Avg Total: 6.62 | Avg Game: 4.72 | Value Loss: 0.055
+Step 577536 | Avg Total: 7.26 | Avg Game: 5.25 | Value Loss: 0.049
+Step 581632 | Avg Total: 7.25 | Avg Game: 5.21 | Value Loss: 0.054
+Step 585728 | Avg Total: 7.29 | Avg Game: 5.22 | Value Loss: 0.059
+Step 589824 | Avg Total: 6.34 | Avg Game: 4.47 | Value Loss: 0.046
+Step 593920 | Avg Total: 7.56 | Avg Game: 5.64 | Value Loss: 0.027
+Step 598016 | Avg Total: 7.19 | Avg Game: 5.41 | Value Loss: 0.058
+Step 602112 | Avg Total: 6.78 | Avg Game: 5.10 | Value Loss: 0.038
+Step 606208 | Avg Total: 7.00 | Avg Game: 5.16 | Value Loss: 0.021
+Step 610304 | Avg Total: 6.15 | Avg Game: 4.27 | Value Loss: 0.033
+Step 614400 | Avg Total: 6.76 | Avg Game: 4.78 | Value Loss: 0.045
+Step 618496 | Avg Total: 6.13 | Avg Game: 4.23 | Value Loss: 0.031
+Step 622592 | Avg Total: 6.30 | Avg Game: 4.51 | Value Loss: 0.024
+Step 626688 | Avg Total: 6.69 | Avg Game: 4.99 | Value Loss: 0.061
+Step 630784 | Avg Total: 7.16 | Avg Game: 5.19 | Value Loss: 0.029
+Step 634880 | Avg Total: 7.39 | Avg Game: 5.85 | Value Loss: 0.053
+Step 638976 | Avg Total: 7.18 | Avg Game: 5.56 | Value Loss: 0.057
+Step 643072 | Avg Total: 6.29 | Avg Game: 4.53 | Value Loss: 0.033
+Step 647168 | Avg Total: 6.99 | Avg Game: 5.30 | Value Loss: 0.064
+Step 651264 | Avg Total: 7.09 | Avg Game: 5.49 | Value Loss: 0.048
+Step 655360 | Avg Total: 6.59 | Avg Game: 4.68 | Value Loss: 0.040
+Step 659456 | Avg Total: 6.93 | Avg Game: 5.00 | Value Loss: 0.023
+Step 663552 | Avg Total: 5.64 | Avg Game: 3.82 | Value Loss: 0.033
+Step 667648 | Avg Total: 6.73 | Avg Game: 4.58 | Value Loss: 0.016
+Step 671744 | Avg Total: 7.38 | Avg Game: 5.56 | Value Loss: 0.050
+Step 675840 | Avg Total: 6.50 | Avg Game: 4.84 | Value Loss: 0.039
+Step 679936 | Avg Total: 7.24 | Avg Game: 5.45 | Value Loss: 0.053
+Step 684032 | Avg Total: 7.25 | Avg Game: 5.58 | Value Loss: 0.043
+Step 688128 | Avg Total: 6.95 | Avg Game: 4.96 | Value Loss: 0.040
+Step 692224 | Avg Total: 6.47 | Avg Game: 4.97 | Value Loss: 0.036
+Step 696320 | Avg Total: 8.02 | Avg Game: 6.21 | Value Loss: 0.029
+Step 700416 | Avg Total: 6.53 | Avg Game: 4.91 | Value Loss: 0.058
+Step 704512 | Avg Total: 7.21 | Avg Game: 5.31 | Value Loss: 0.044
+Step 708608 | Avg Total: 7.78 | Avg Game: 5.99 | Value Loss: 0.031
+Step 712704 | Avg Total: 6.05 | Avg Game: 4.15 | Value Loss: 0.047
+Step 716800 | Avg Total: 8.02 | Avg Game: 5.82 | Value Loss: 0.044
+Step 720896 | Avg Total: 7.51 | Avg Game: 5.69 | Value Loss: 0.062
+Step 724992 | Avg Total: 6.38 | Avg Game: 4.59 | Value Loss: 0.051
+Step 729088 | Avg Total: 8.20 | Avg Game: 6.44 | Value Loss: 0.040
+Step 733184 | Avg Total: 6.05 | Avg Game: 4.32 | Value Loss: 0.048
+Step 737280 | Avg Total: 8.10 | Avg Game: 6.38 | Value Loss: 0.033
+Step 741376 | Avg Total: 6.43 | Avg Game: 4.79 | Value Loss: 0.051
+Step 745472 | Avg Total: 7.87 | Avg Game: 6.18 | Value Loss: 0.055
+Step 749568 | Avg Total: 6.86 | Avg Game: 4.89 | Value Loss: 0.045
+Step 753664 | Avg Total: 6.87 | Avg Game: 5.11 | Value Loss: 0.042
+Step 757760 | Avg Total: 6.59 | Avg Game: 4.61 | Value Loss: 0.060
+Step 761856 | Avg Total: 6.97 | Avg Game: 5.18 | Value Loss: 0.030
+Step 765952 | Avg Total: 6.87 | Avg Game: 5.28 | Value Loss: 0.040
+Step 770048 | Avg Total: 7.25 | Avg Game: 5.43 | Value Loss: 0.035
+Step 774144 | Avg Total: 6.71 | Avg Game: 4.83 | Value Loss: 0.027
+Step 778240 | Avg Total: 7.19 | Avg Game: 5.18 | Value Loss: 0.055
+Step 782336 | Avg Total: 6.74 | Avg Game: 5.21 | Value Loss: 0.051
+Step 786432 | Avg Total: 6.64 | Avg Game: 4.61 | Value Loss: 0.036
+Step 790528 | Avg Total: 6.28 | Avg Game: 4.45 | Value Loss: 0.030
+Step 794624 | Avg Total: 6.86 | Avg Game: 5.03 | Value Loss: 0.040
+Step 798720 | Avg Total: 7.45 | Avg Game: 5.67 | Value Loss: 0.031
+Step 802816 | Avg Total: 7.07 | Avg Game: 5.14 | Value Loss: 0.044
+Step 806912 | Avg Total: 6.77 | Avg Game: 4.91 | Value Loss: 0.041
+Step 811008 | Avg Total: 6.52 | Avg Game: 4.70 | Value Loss: 0.028
+Step 815104 | Avg Total: 7.04 | Avg Game: 5.19 | Value Loss: 0.036
+Step 819200 | Avg Total: 6.75 | Avg Game: 4.96 | Value Loss: 0.023
+Step 823296 | Avg Total: 6.59 | Avg Game: 4.73 | Value Loss: 0.041
+Step 827392 | Avg Total: 8.03 | Avg Game: 6.18 | Value Loss: 0.042
+Step 831488 | Avg Total: 6.24 | Avg Game: 4.51 | Value Loss: 0.030
+Step 835584 | Avg Total: 7.10 | Avg Game: 4.96 | Value Loss: 0.028
+Step 839680 | Avg Total: 7.03 | Avg Game: 4.79 | Value Loss: 0.016
+Step 843776 | Avg Total: 7.12 | Avg Game: 5.18 | Value Loss: 0.039
+Step 847872 | Avg Total: 6.67 | Avg Game: 4.93 | Value Loss: 0.025
+Step 851968 | Avg Total: 6.46 | Avg Game: 4.67 | Value Loss: 0.045
+Step 856064 | Avg Total: 7.15 | Avg Game: 5.12 | Value Loss: 0.022
+Step 860160 | Avg Total: 6.60 | Avg Game: 4.94 | Value Loss: 0.029
+Step 864256 | Avg Total: 6.73 | Avg Game: 4.77 | Value Loss: 0.042
+Step 868352 | Avg Total: 6.61 | Avg Game: 4.84 | Value Loss: 0.039
+Step 872448 | Avg Total: 6.68 | Avg Game: 5.12 | Value Loss: 0.065
+Step 876544 | Avg Total: 7.51 | Avg Game: 5.67 | Value Loss: 0.040
+Step 880640 | Avg Total: 6.37 | Avg Game: 4.70 | Value Loss: 0.040
+Step 884736 | Avg Total: 6.78 | Avg Game: 5.06 | Value Loss: 0.039
+Step 888832 | Avg Total: 7.37 | Avg Game: 5.70 | Value Loss: 0.025
+Step 892928 | Avg Total: 7.01 | Avg Game: 5.08 | Value Loss: 0.048
+Step 897024 | Avg Total: 6.58 | Avg Game: 4.76 | Value Loss: 0.053
+Step 901120 | Avg Total: 7.28 | Avg Game: 5.47 | Value Loss: 0.042
+Step 905216 | Avg Total: 6.56 | Avg Game: 4.78 | Value Loss: 0.033
+Step 909312 | Avg Total: 6.98 | Avg Game: 5.28 | Value Loss: 0.044
+Step 913408 | Avg Total: 7.03 | Avg Game: 5.24 | Value Loss: 0.019
+Step 917504 | Avg Total: 6.32 | Avg Game: 4.60 | Value Loss: 0.060
+Step 921600 | Avg Total: 7.28 | Avg Game: 5.51 | Value Loss: 0.041
+Step 925696 | Avg Total: 6.32 | Avg Game: 4.32 | Value Loss: 0.050
+Step 929792 | Avg Total: 7.16 | Avg Game: 5.22 | Value Loss: 0.023
+Step 933888 | Avg Total: 6.52 | Avg Game: 4.58 | Value Loss: 0.032
+Step 937984 | Avg Total: 5.85 | Avg Game: 4.27 | Value Loss: 0.036
+Step 942080 | Avg Total: 6.89 | Avg Game: 5.20 | Value Loss: 0.034
+Step 946176 | Avg Total: 6.60 | Avg Game: 4.72 | Value Loss: 0.028
+Step 950272 | Avg Total: 6.80 | Avg Game: 4.94 | Value Loss: 0.039
+Step 954368 | Avg Total: 7.46 | Avg Game: 5.55 | Value Loss: 0.068
+Step 958464 | Avg Total: 7.77 | Avg Game: 5.79 | Value Loss: 0.035
+Step 962560 | Avg Total: 7.25 | Avg Game: 5.20 | Value Loss: 0.025
+Step 966656 | Avg Total: 6.61 | Avg Game: 4.68 | Value Loss: 0.028
+Step 970752 | Avg Total: 6.84 | Avg Game: 4.94 | Value Loss: 0.040
+Step 974848 | Avg Total: 7.15 | Avg Game: 5.26 | Value Loss: 0.049
+Step 978944 | Avg Total: 6.59 | Avg Game: 4.49 | Value Loss: 0.040
+Step 983040 | Avg Total: 7.65 | Avg Game: 5.71 | Value Loss: 0.044
+Step 987136 | Avg Total: 6.79 | Avg Game: 4.89 | Value Loss: 0.035
+Step 991232 | Avg Total: 6.30 | Avg Game: 4.32 | Value Loss: 0.020
+Step 995328 | Avg Total: 6.71 | Avg Game: 4.80 | Value Loss: 0.051
+Step 999424 | Avg Total: 6.84 | Avg Game: 4.90 | Value Loss: 0.032
+Step 1003520 | Avg Total: 7.34 | Avg Game: 5.35 | Value Loss: 0.040
+Step 1007616 | Avg Total: 6.88 | Avg Game: 4.58 | Value Loss: 0.033
+Step 1011712 | Avg Total: 7.73 | Avg Game: 5.81 | Value Loss: 0.046
+Step 1015808 | Avg Total: 7.42 | Avg Game: 5.48 | Value Loss: 0.035
+Step 1019904 | Avg Total: 6.26 | Avg Game: 4.38 | Value Loss: 0.047
+Step 1024000 | Avg Total: 6.44 | Avg Game: 4.37 | Value Loss: 0.043
+Step 1028096 | Avg Total: 6.74 | Avg Game: 4.84 | Value Loss: 0.039
+Step 1032192 | Avg Total: 7.57 | Avg Game: 5.45 | Value Loss: 0.037
+Step 1036288 | Avg Total: 8.29 | Avg Game: 6.06 | Value Loss: 0.026
+Step 1040384 | Avg Total: 7.13 | Avg Game: 4.94 | Value Loss: 0.043
+Step 1044480 | Avg Total: 7.63 | Avg Game: 5.68 | Value Loss: 0.034
+Step 1048576 | Avg Total: 6.68 | Avg Game: 4.62 | Value Loss: 0.052
+Step 1052672 | Avg Total: 7.94 | Avg Game: 5.84 | Value Loss: 0.064
+Step 1056768 | Avg Total: 6.23 | Avg Game: 4.01 | Value Loss: 0.034
+Step 1060864 | Avg Total: 8.00 | Avg Game: 5.99 | Value Loss: 0.037
+Step 1064960 | Avg Total: 7.59 | Avg Game: 5.49 | Value Loss: 0.032
+Step 1069056 | Avg Total: 7.10 | Avg Game: 4.92 | Value Loss: 0.030
+Step 1073152 | Avg Total: 7.66 | Avg Game: 5.25 | Value Loss: 0.033
+Step 1077248 | Avg Total: 7.30 | Avg Game: 5.31 | Value Loss: 0.032
+Step 1081344 | Avg Total: 7.81 | Avg Game: 5.72 | Value Loss: 0.030
+Step 1085440 | Avg Total: 8.21 | Avg Game: 6.17 | Value Loss: 0.041
+Step 1089536 | Avg Total: 7.48 | Avg Game: 5.32 | Value Loss: 0.036
+Step 1093632 | Avg Total: 7.08 | Avg Game: 4.80 | Value Loss: 0.028
+Step 1097728 | Avg Total: 7.78 | Avg Game: 5.49 | Value Loss: 0.021
+Step 1101824 | Avg Total: 7.06 | Avg Game: 4.67 | Value Loss: 0.040
+Step 1105920 | Avg Total: 6.44 | Avg Game: 4.43 | Value Loss: 0.046
+Step 1110016 | Avg Total: 7.61 | Avg Game: 5.62 | Value Loss: 0.032
+Step 1114112 | Avg Total: 6.95 | Avg Game: 4.96 | Value Loss: 0.043
+Step 1118208 | Avg Total: 8.86 | Avg Game: 6.94 | Value Loss: 0.033
+Step 1122304 | Avg Total: 7.30 | Avg Game: 5.01 | Value Loss: 0.024
+Step 1126400 | Avg Total: 6.98 | Avg Game: 5.21 | Value Loss: 0.042
+Step 1130496 | Avg Total: 7.79 | Avg Game: 5.65 | Value Loss: 0.021
+Step 1134592 | Avg Total: 7.75 | Avg Game: 5.80 | Value Loss: 0.030
+Step 1138688 | Avg Total: 6.96 | Avg Game: 4.99 | Value Loss: 0.033
+Step 1142784 | Avg Total: 8.42 | Avg Game: 6.31 | Value Loss: 0.027
+Step 1146880 | Avg Total: 7.54 | Avg Game: 5.57 | Value Loss: 0.050
+Step 1150976 | Avg Total: 6.81 | Avg Game: 4.57 | Value Loss: 0.039
+Step 1155072 | Avg Total: 7.14 | Avg Game: 5.05 | Value Loss: 0.016
+Step 1159168 | Avg Total: 8.19 | Avg Game: 6.03 | Value Loss: 0.031
+Step 1163264 | Avg Total: 7.22 | Avg Game: 5.05 | Value Loss: 0.047
+Step 1167360 | Avg Total: 7.11 | Avg Game: 5.22 | Value Loss: 0.066
+Step 1171456 | Avg Total: 7.66 | Avg Game: 5.59 | Value Loss: 0.076
+Step 1175552 | Avg Total: 7.89 | Avg Game: 5.86 | Value Loss: 0.056
+Step 1179648 | Avg Total: 7.31 | Avg Game: 5.48 | Value Loss: 0.030
+Step 1183744 | Avg Total: 6.58 | Avg Game: 4.41 | Value Loss: 0.021
+Step 1187840 | Avg Total: 7.31 | Avg Game: 5.31 | Value Loss: 0.041
+Step 1191936 | Avg Total: 7.19 | Avg Game: 5.19 | Value Loss: 0.025
+Step 1196032 | Avg Total: 7.51 | Avg Game: 5.49 | Value Loss: 0.059
+Step 1200128 | Avg Total: 7.62 | Avg Game: 5.65 | Value Loss: 0.040
+Step 1204224 | Avg Total: 7.18 | Avg Game: 5.16 | Value Loss: 0.037
+Step 1208320 | Avg Total: 7.50 | Avg Game: 5.43 | Value Loss: 0.040
+Step 1212416 | Avg Total: 7.47 | Avg Game: 5.22 | Value Loss: 0.034
+Step 1216512 | Avg Total: 7.93 | Avg Game: 5.82 | Value Loss: 0.046
+Step 1220608 | Avg Total: 8.42 | Avg Game: 6.29 | Value Loss: 0.043
+Step 1224704 | Avg Total: 7.59 | Avg Game: 5.56 | Value Loss: 0.041
+Step 1228800 | Avg Total: 7.98 | Avg Game: 5.90 | Value Loss: 0.048
+Step 1232896 | Avg Total: 8.20 | Avg Game: 5.96 | Value Loss: 0.047
+Step 1236992 | Avg Total: 7.80 | Avg Game: 5.62 | Value Loss: 0.039
+Step 1241088 | Avg Total: 6.94 | Avg Game: 4.75 | Value Loss: 0.035
+Step 1245184 | Avg Total: 7.31 | Avg Game: 5.24 | Value Loss: 0.053
+Step 1249280 | Avg Total: 7.22 | Avg Game: 5.27 | Value Loss: 0.048
+Step 1253376 | Avg Total: 7.32 | Avg Game: 5.36 | Value Loss: 0.038
+Step 1257472 | Avg Total: 8.32 | Avg Game: 6.29 | Value Loss: 0.038
+Step 1261568 | Avg Total: 7.33 | Avg Game: 5.24 | Value Loss: 0.038
+Step 1265664 | Avg Total: 6.98 | Avg Game: 4.90 | Value Loss: 0.039
+Step 1269760 | Avg Total: 7.51 | Avg Game: 5.41 | Value Loss: 0.035
+Step 1273856 | Avg Total: 7.63 | Avg Game: 5.54 | Value Loss: 0.050
+Step 1277952 | Avg Total: 8.01 | Avg Game: 5.86 | Value Loss: 0.045
+Step 1282048 | Avg Total: 8.27 | Avg Game: 6.08 | Value Loss: 0.043
+Step 1286144 | Avg Total: 8.14 | Avg Game: 5.80 | Value Loss: 0.046
+Step 1290240 | Avg Total: 7.93 | Avg Game: 5.86 | Value Loss: 0.023
+Step 1294336 | Avg Total: 7.62 | Avg Game: 5.46 | Value Loss: 0.045
+Step 1298432 | Avg Total: 7.86 | Avg Game: 5.76 | Value Loss: 0.055
+Step 1302528 | Avg Total: 8.10 | Avg Game: 6.13 | Value Loss: 0.067
+Step 1306624 | Avg Total: 7.21 | Avg Game: 5.14 | Value Loss: 0.058
+Step 1310720 | Avg Total: 7.38 | Avg Game: 5.22 | Value Loss: 0.041
+Step 1314816 | Avg Total: 7.90 | Avg Game: 5.97 | Value Loss: 0.049
+Step 1318912 | Avg Total: 7.21 | Avg Game: 4.97 | Value Loss: 0.069
+Step 1323008 | Avg Total: 6.77 | Avg Game: 4.66 | Value Loss: 0.044
+Step 1327104 | Avg Total: 7.42 | Avg Game: 5.51 | Value Loss: 0.040
+Step 1331200 | Avg Total: 6.66 | Avg Game: 4.36 | Value Loss: 0.038
+Step 1335296 | Avg Total: 7.82 | Avg Game: 5.74 | Value Loss: 0.060
+Step 1339392 | Avg Total: 7.08 | Avg Game: 4.85 | Value Loss: 0.028
+Step 1343488 | Avg Total: 6.60 | Avg Game: 4.39 | Value Loss: 0.046
+Step 1347584 | Avg Total: 6.81 | Avg Game: 4.68 | Value Loss: 0.032
+Step 1351680 | Avg Total: 6.93 | Avg Game: 4.99 | Value Loss: 0.045
+Step 1355776 | Avg Total: 7.49 | Avg Game: 5.54 | Value Loss: 0.049
+Step 1359872 | Avg Total: 7.18 | Avg Game: 4.94 | Value Loss: 0.044
+Step 1363968 | Avg Total: 7.28 | Avg Game: 5.06 | Value Loss: 0.050
+Step 1368064 | Avg Total: 8.19 | Avg Game: 5.88 | Value Loss: 0.052
+Step 1372160 | Avg Total: 7.45 | Avg Game: 5.41 | Value Loss: 0.050
+Step 1376256 | Avg Total: 7.12 | Avg Game: 5.01 | Value Loss: 0.031
+Step 1380352 | Avg Total: 7.75 | Avg Game: 5.68 | Value Loss: 0.063
+Step 1384448 | Avg Total: 7.28 | Avg Game: 5.11 | Value Loss: 0.030
+Step 1388544 | Avg Total: 7.00 | Avg Game: 4.86 | Value Loss: 0.022
+Step 1392640 | Avg Total: 7.65 | Avg Game: 5.72 | Value Loss: 0.061
+Step 1396736 | Avg Total: 7.51 | Avg Game: 5.44 | Value Loss: 0.033
+Step 1400832 | Avg Total: 7.32 | Avg Game: 5.20 | Value Loss: 0.039
+Step 1404928 | Avg Total: 6.23 | Avg Game: 4.31 | Value Loss: 0.036
+Step 1409024 | Avg Total: 8.01 | Avg Game: 6.05 | Value Loss: 0.054
+Step 1413120 | Avg Total: 7.34 | Avg Game: 5.33 | Value Loss: 0.040
+Step 1417216 | Avg Total: 8.23 | Avg Game: 6.19 | Value Loss: 0.040
+Step 1421312 | Avg Total: 8.14 | Avg Game: 5.95 | Value Loss: 0.040
+Step 1425408 | Avg Total: 7.50 | Avg Game: 5.36 | Value Loss: 0.049
+Step 1429504 | Avg Total: 7.76 | Avg Game: 5.68 | Value Loss: 0.052
+Step 1433600 | Avg Total: 8.29 | Avg Game: 6.26 | Value Loss: 0.036
+Step 1437696 | Avg Total: 7.87 | Avg Game: 5.71 | Value Loss: 0.035
+Step 1441792 | Avg Total: 7.99 | Avg Game: 5.59 | Value Loss: 0.034
+Step 1445888 | Avg Total: 7.56 | Avg Game: 5.22 | Value Loss: 0.055
+Step 1449984 | Avg Total: 8.22 | Avg Game: 6.09 | Value Loss: 0.050
+Step 1454080 | Avg Total: 7.39 | Avg Game: 4.99 | Value Loss: 0.032
+Step 1458176 | Avg Total: 8.18 | Avg Game: 5.58 | Value Loss: 0.044
+Step 1462272 | Avg Total: 6.55 | Avg Game: 4.16 | Value Loss: 0.056
+Step 1466368 | Avg Total: 7.04 | Avg Game: 4.95 | Value Loss: 0.039
+Step 1470464 | Avg Total: 7.56 | Avg Game: 5.34 | Value Loss: 0.030
+Step 1474560 | Avg Total: 7.75 | Avg Game: 5.23 | Value Loss: 0.031
+Step 1478656 | Avg Total: 8.18 | Avg Game: 5.71 | Value Loss: 0.034
+Step 1482752 | Avg Total: 7.85 | Avg Game: 5.59 | Value Loss: 0.043
+Step 1486848 | Avg Total: 7.55 | Avg Game: 5.29 | Value Loss: 0.041
+Step 1490944 | Avg Total: 7.50 | Avg Game: 5.16 | Value Loss: 0.017
+Step 1495040 | Avg Total: 7.79 | Avg Game: 5.36 | Value Loss: 0.033
+Step 1499136 | Avg Total: 7.26 | Avg Game: 5.19 | Value Loss: 0.053
+Step 1503232 | Avg Total: 8.27 | Avg Game: 6.04 | Value Loss: 0.043
+Step 1507328 | Avg Total: 7.87 | Avg Game: 5.51 | Value Loss: 0.057
+Step 1511424 | Avg Total: 8.24 | Avg Game: 5.77 | Value Loss: 0.039
+Step 1515520 | Avg Total: 8.39 | Avg Game: 5.90 | Value Loss: 0.045
+Step 1519616 | Avg Total: 8.63 | Avg Game: 5.91 | Value Loss: 0.032
+Step 1523712 | Avg Total: 7.63 | Avg Game: 5.15 | Value Loss: 0.055
+Step 1527808 | Avg Total: 8.14 | Avg Game: 5.79 | Value Loss: 0.063
+Step 1531904 | Avg Total: 8.18 | Avg Game: 5.53 | Value Loss: 0.036
+Step 1536000 | Avg Total: 7.30 | Avg Game: 4.44 | Value Loss: 0.041
+Step 1540096 | Avg Total: 8.18 | Avg Game: 5.59 | Value Loss: 0.043
+Step 1544192 | Avg Total: 7.96 | Avg Game: 5.32 | Value Loss: 0.046
+Step 1548288 | Avg Total: 8.31 | Avg Game: 6.04 | Value Loss: 0.049
+Step 1552384 | Avg Total: 8.05 | Avg Game: 5.50 | Value Loss: 0.054
+Step 1556480 | Avg Total: 8.00 | Avg Game: 5.68 | Value Loss: 0.039
+Step 1560576 | Avg Total: 7.99 | Avg Game: 5.70 | Value Loss: 0.032
+Step 1564672 | Avg Total: 7.59 | Avg Game: 5.32 | Value Loss: 0.055
+Step 1568768 | Avg Total: 7.87 | Avg Game: 5.47 | Value Loss: 0.050
+Step 1572864 | Avg Total: 7.68 | Avg Game: 5.27 | Value Loss: 0.040
+Step 1576960 | Avg Total: 8.10 | Avg Game: 5.58 | Value Loss: 0.062
+Step 1581056 | Avg Total: 7.80 | Avg Game: 5.46 | Value Loss: 0.047
+Step 1585152 | Avg Total: 8.53 | Avg Game: 5.89 | Value Loss: 0.042
+Step 1589248 | Avg Total: 6.86 | Avg Game: 4.36 | Value Loss: 0.023
+Step 1593344 | Avg Total: 7.50 | Avg Game: 5.04 | Value Loss: 0.053
+Step 1597440 | Avg Total: 7.49 | Avg Game: 5.07 | Value Loss: 0.048
+Step 1601536 | Avg Total: 8.70 | Avg Game: 6.27 | Value Loss: 0.062
+Step 1605632 | Avg Total: 7.41 | Avg Game: 4.76 | Value Loss: 0.027
+Step 1609728 | Avg Total: 7.88 | Avg Game: 5.44 | Value Loss: 0.044
+Step 1613824 | Avg Total: 7.82 | Avg Game: 5.04 | Value Loss: 0.040
+Step 1617920 | Avg Total: 7.67 | Avg Game: 5.07 | Value Loss: 0.034
+Step 1622016 | Avg Total: 7.44 | Avg Game: 4.64 | Value Loss: 0.033
+Step 1626112 | Avg Total: 8.13 | Avg Game: 5.77 | Value Loss: 0.048
+Step 1630208 | Avg Total: 7.34 | Avg Game: 4.81 | Value Loss: 0.023
+Step 1634304 | Avg Total: 8.06 | Avg Game: 5.35 | Value Loss: 0.046
+Step 1638400 | Avg Total: 8.27 | Avg Game: 5.98 | Value Loss: 0.037
+Step 1642496 | Avg Total: 7.75 | Avg Game: 5.09 | Value Loss: 0.042
+Step 1646592 | Avg Total: 8.08 | Avg Game: 5.62 | Value Loss: 0.037
+Step 1650688 | Avg Total: 7.61 | Avg Game: 4.97 | Value Loss: 0.044
+Step 1654784 | Avg Total: 8.38 | Avg Game: 5.93 | Value Loss: 0.039
+Step 1658880 | Avg Total: 7.29 | Avg Game: 4.73 | Value Loss: 0.064
+Step 1662976 | Avg Total: 9.61 | Avg Game: 7.11 | Value Loss: 0.048
+Step 1667072 | Avg Total: 8.69 | Avg Game: 6.00 | Value Loss: 0.050
+Step 1671168 | Avg Total: 8.71 | Avg Game: 5.99 | Value Loss: 0.042
+Step 1675264 | Avg Total: 8.01 | Avg Game: 5.19 | Value Loss: 0.041
+Step 1679360 | Avg Total: 7.91 | Avg Game: 5.23 | Value Loss: 0.039
+Step 1683456 | Avg Total: 7.77 | Avg Game: 5.33 | Value Loss: 0.040
+Step 1687552 | Avg Total: 7.53 | Avg Game: 4.75 | Value Loss: 0.037
+Step 1691648 | Avg Total: 7.90 | Avg Game: 5.29 | Value Loss: 0.042
+Step 1695744 | Avg Total: 7.70 | Avg Game: 5.32 | Value Loss: 0.074
+Step 1699840 | Avg Total: 7.99 | Avg Game: 5.56 | Value Loss: 0.028
+Step 1703936 | Avg Total: 8.15 | Avg Game: 5.51 | Value Loss: 0.034
+Step 1708032 | Avg Total: 8.38 | Avg Game: 5.86 | Value Loss: 0.041
+Step 1712128 | Avg Total: 8.29 | Avg Game: 5.69 | Value Loss: 0.035
+Step 1716224 | Avg Total: 7.36 | Avg Game: 4.82 | Value Loss: 0.045
+Step 1720320 | Avg Total: 8.60 | Avg Game: 5.99 | Value Loss: 0.024
+Step 1724416 | Avg Total: 8.43 | Avg Game: 5.84 | Value Loss: 0.040
+Step 1728512 | Avg Total: 7.21 | Avg Game: 4.51 | Value Loss: 0.041
+Step 1732608 | Avg Total: 7.80 | Avg Game: 5.39 | Value Loss: 0.019
+Step 1736704 | Avg Total: 7.71 | Avg Game: 5.20 | Value Loss: 0.040
+Step 1740800 | Avg Total: 8.70 | Avg Game: 6.11 | Value Loss: 0.032
+Step 1744896 | Avg Total: 6.95 | Avg Game: 4.42 | Value Loss: 0.051
+Step 1748992 | Avg Total: 9.15 | Avg Game: 6.50 | Value Loss: 0.049
+Step 1753088 | Avg Total: 8.32 | Avg Game: 5.74 | Value Loss: 0.023
+Step 1757184 | Avg Total: 7.57 | Avg Game: 4.97 | Value Loss: 0.039
+Step 1761280 | Avg Total: 8.11 | Avg Game: 5.24 | Value Loss: 0.031
+Step 1765376 | Avg Total: 8.17 | Avg Game: 5.45 | Value Loss: 0.057
+Step 1769472 | Avg Total: 7.95 | Avg Game: 5.21 | Value Loss: 0.047
+Step 1773568 | Avg Total: 7.93 | Avg Game: 5.12 | Value Loss: 0.029
+Step 1777664 | Avg Total: 7.36 | Avg Game: 4.70 | Value Loss: 0.071
+Step 1781760 | Avg Total: 7.72 | Avg Game: 5.21 | Value Loss: 0.059
+Step 1785856 | Avg Total: 8.12 | Avg Game: 5.54 | Value Loss: 0.065
+Step 1789952 | Avg Total: 8.26 | Avg Game: 5.66 | Value Loss: 0.034
+Step 1794048 | Avg Total: 7.81 | Avg Game: 5.16 | Value Loss: 0.059
+Step 1798144 | Avg Total: 8.12 | Avg Game: 5.47 | Value Loss: 0.027
+Step 1802240 | Avg Total: 8.35 | Avg Game: 5.67 | Value Loss: 0.044
+Step 1806336 | Avg Total: 8.55 | Avg Game: 5.80 | Value Loss: 0.061
+Step 1810432 | Avg Total: 8.17 | Avg Game: 5.45 | Value Loss: 0.039
+Step 1814528 | Avg Total: 8.52 | Avg Game: 5.95 | Value Loss: 0.052
+Step 1818624 | Avg Total: 8.99 | Avg Game: 6.35 | Value Loss: 0.053
+Step 1822720 | Avg Total: 7.87 | Avg Game: 5.07 | Value Loss: 0.065
+Step 1826816 | Avg Total: 7.26 | Avg Game: 4.53 | Value Loss: 0.040
+Step 1830912 | Avg Total: 8.14 | Avg Game: 5.49 | Value Loss: 0.053
+Step 1835008 | Avg Total: 7.76 | Avg Game: 5.20 | Value Loss: 0.026
+Step 1839104 | Avg Total: 8.01 | Avg Game: 5.34 | Value Loss: 0.039
+Step 1843200 | Avg Total: 7.91 | Avg Game: 5.23 | Value Loss: 0.055
+Step 1847296 | Avg Total: 8.53 | Avg Game: 5.82 | Value Loss: 0.039
+Step 1851392 | Avg Total: 8.65 | Avg Game: 6.07 | Value Loss: 0.046
+Step 1855488 | Avg Total: 7.96 | Avg Game: 5.43 | Value Loss: 0.044
+Step 1859584 | Avg Total: 7.95 | Avg Game: 5.30 | Value Loss: 0.032
+Step 1863680 | Avg Total: 7.25 | Avg Game: 4.63 | Value Loss: 0.040
+Step 1867776 | Avg Total: 8.21 | Avg Game: 5.52 | Value Loss: 0.038
+Step 1871872 | Avg Total: 7.83 | Avg Game: 5.25 | Value Loss: 0.057
+Step 1875968 | Avg Total: 8.37 | Avg Game: 5.84 | Value Loss: 0.074
+Step 1880064 | Avg Total: 8.86 | Avg Game: 6.42 | Value Loss: 0.030
+Step 1884160 | Avg Total: 7.33 | Avg Game: 4.82 | Value Loss: 0.030
+Step 1888256 | Avg Total: 8.06 | Avg Game: 5.55 | Value Loss: 0.029
+Step 1892352 | Avg Total: 9.01 | Avg Game: 6.48 | Value Loss: 0.039
+Step 1896448 | Avg Total: 7.95 | Avg Game: 5.36 | Value Loss: 0.045
+Step 1900544 | Avg Total: 7.59 | Avg Game: 4.85 | Value Loss: 0.035
+Step 1904640 | Avg Total: 8.21 | Avg Game: 5.39 | Value Loss: 0.028
+Step 1908736 | Avg Total: 7.61 | Avg Game: 4.84 | Value Loss: 0.023
+Step 1912832 | Avg Total: 8.68 | Avg Game: 6.11 | Value Loss: 0.032
+Step 1916928 | Avg Total: 8.64 | Avg Game: 6.13 | Value Loss: 0.027
+Step 1921024 | Avg Total: 7.67 | Avg Game: 4.69 | Value Loss: 0.049
+Step 1925120 | Avg Total: 8.91 | Avg Game: 6.14 | Value Loss: 0.046
+Step 1929216 | Avg Total: 7.56 | Avg Game: 5.09 | Value Loss: 0.044
+Step 1933312 | Avg Total: 8.46 | Avg Game: 5.73 | Value Loss: 0.039
+Step 1937408 | Avg Total: 8.57 | Avg Game: 5.98 | Value Loss: 0.062
+Step 1941504 | Avg Total: 7.58 | Avg Game: 4.89 | Value Loss: 0.033
+Step 1945600 | Avg Total: 8.75 | Avg Game: 6.01 | Value Loss: 0.055
+Step 1949696 | Avg Total: 8.00 | Avg Game: 5.36 | Value Loss: 0.035
+Step 1953792 | Avg Total: 8.06 | Avg Game: 5.23 | Value Loss: 0.035
+Step 1957888 | Avg Total: 8.11 | Avg Game: 5.44 | Value Loss: 0.073
+Step 1961984 | Avg Total: 7.81 | Avg Game: 5.29 | Value Loss: 0.051
+Step 1966080 | Avg Total: 8.60 | Avg Game: 5.73 | Value Loss: 0.041
+Step 1970176 | Avg Total: 8.23 | Avg Game: 5.62 | Value Loss: 0.032
+Step 1974272 | Avg Total: 8.16 | Avg Game: 5.54 | Value Loss: 0.051
+Step 1978368 | Avg Total: 8.25 | Avg Game: 5.68 | Value Loss: 0.034
+Step 1982464 | Avg Total: 8.77 | Avg Game: 6.06 | Value Loss: 0.041
+Step 1986560 | Avg Total: 8.88 | Avg Game: 6.29 | Value Loss: 0.032
+Step 1990656 | Avg Total: 7.84 | Avg Game: 5.16 | Value Loss: 0.029
+Step 1994752 | Avg Total: 7.07 | Avg Game: 4.46 | Value Loss: 0.059
+Step 1998848 | Avg Total: 8.44 | Avg Game: 5.76 | Value Loss: 0.068

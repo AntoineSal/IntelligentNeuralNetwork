@@ -1,0 +1,61 @@
+✅ Mamba-SSM CUDA Kernel detected!
+=== LAUNCHING INNv2 CUDA (TEXT8 FULL) ===
+Config: {'dataset': 'text8', 'vocab_size': 27, 'd_model': 256, 'n_neurons': 32, 'n_layers': 6, 'dropout': 0.1, 'lr': 0.0004, 'batch_size': 16, 'seq_len': 256, 'epochs': 1, 'subset_size': 100000000, 'grad_clip': 1.0, 'save_every': 5000}
+GPU Memory: 13.49GB allocated, 14.18GB reserved, 42.47GB total
+Loading text8...
+Data loaded. Length: 100,000,000
+Vocab size found: 27 (expected 27)
+Encoding data...
+Train: 90,000,000 | Valid: 10,000,000
+INNv2 CUDA Params: 4,219,163
+Starting training for 21972 steps...
+Batch 100 | Loss: 53.5956 | BPC: 77.322 | Speed: 9833 tok/s
+Batch 200 | Loss: 9.3986 | BPC: 13.559 | Speed: 9875 tok/s
+Batch 300 | Loss: 3.0450 | BPC: 4.393 | Speed: 9888 tok/s
+Batch 400 | Loss: 2.2387 | BPC: 3.230 | Speed: 9894 tok/s
+Batch 500 | Loss: 2.2549 | BPC: 3.253 | Speed: 9898 tok/s
+Batch 600 | Loss: 2.0773 | BPC: 2.997 | Speed: 9900 tok/s
+Batch 700 | Loss: 1.9162 | BPC: 2.764 | Speed: 9902 tok/s
+Batch 800 | Loss: 2.1062 | BPC: 3.039 | Speed: 9904 tok/s
+Batch 900 | Loss: 1.9256 | BPC: 2.778 | Speed: 9905 tok/s
+Batch 1000 | Loss: 1.7992 | BPC: 2.596 | Speed: 9906 tok/s
+Batch 1100 | Loss: 1.8615 | BPC: 2.686 | Speed: 9906 tok/s
+Batch 1200 | Loss: 1.8357 | BPC: 2.648 | Speed: 9907 tok/s
+Batch 1300 | Loss: 1.9168 | BPC: 2.765 | Speed: 9908 tok/s
+Batch 1400 | Loss: 1.7276 | BPC: 2.492 | Speed: 9908 tok/s
+Batch 1500 | Loss: 1.7767 | BPC: 2.563 | Speed: 9908 tok/s
+Batch 1600 | Loss: 1.6659 | BPC: 2.403 | Speed: 9909 tok/s
+Batch 1700 | Loss: 1.7635 | BPC: 2.544 | Speed: 9909 tok/s
+Batch 1800 | Loss: 1.6669 | BPC: 2.405 | Speed: 9909 tok/s
+Batch 1900 | Loss: 1.6483 | BPC: 2.378 | Speed: 9910 tok/s
+Batch 2000 | Loss: 1.8329 | BPC: 2.644 | Speed: 9910 tok/s
+Batch 2100 | Loss: 1.7791 | BPC: 2.567 | Speed: 9910 tok/s
+Batch 2200 | Loss: 1.6723 | BPC: 2.413 | Speed: 9910 tok/s
+Batch 2300 | Loss: 1.6213 | BPC: 2.339 | Speed: 9910 tok/s
+Batch 2400 | Loss: 1.6706 | BPC: 2.410 | Speed: 9910 tok/s
+Batch 2500 | Loss: 1.5446 | BPC: 2.228 | Speed: 9910 tok/s
+Batch 2600 | Loss: 1.6064 | BPC: 2.318 | Speed: 9911 tok/s
+Batch 2700 | Loss: 1.7389 | BPC: 2.509 | Speed: 9911 tok/s
+Batch 2800 | Loss: 1.5101 | BPC: 2.179 | Speed: 9911 tok/s
+Batch 2900 | Loss: 1.5873 | BPC: 2.290 | Speed: 9911 tok/s
+Batch 3000 | Loss: 1.6047 | BPC: 2.315 | Speed: 9911 tok/s
+Batch 3100 | Loss: 1.4065 | BPC: 2.029 | Speed: 9911 tok/s
+Batch 3200 | Loss: 1.6268 | BPC: 2.347 | Speed: 9911 tok/s
+Batch 3300 | Loss: 1.4499 | BPC: 2.092 | Speed: 9911 tok/s
+Batch 3400 | Loss: 1.4148 | BPC: 2.041 | Speed: 9911 tok/s
+Batch 3500 | Loss: 1.5019 | BPC: 2.167 | Speed: 9911 tok/s
+Batch 3600 | Loss: 1.4256 | BPC: 2.057 | Speed: 9911 tok/s
+Batch 3700 | Loss: 1.5173 | BPC: 2.189 | Speed: 9911 tok/s
+Batch 3800 | Loss: 1.3997 | BPC: 2.019 | Speed: 9911 tok/s
+Batch 3900 | Loss: 1.4237 | BPC: 2.054 | Speed: 9912 tok/s
+Batch 4000 | Loss: 1.4185 | BPC: 2.046 | Speed: 9912 tok/s
+Batch 4100 | Loss: 1.4350 | BPC: 2.070 | Speed: 9912 tok/s
+Batch 4200 | Loss: 1.4350 | BPC: 2.070 | Speed: 9912 tok/s
+Batch 4300 | Loss: 1.3497 | BPC: 1.947 | Speed: 9912 tok/s
+Batch 4400 | Loss: 1.3705 | BPC: 1.977 | Speed: 9912 tok/s
+Batch 4500 | Loss: 1.4868 | BPC: 2.145 | Speed: 9912 tok/s
+Batch 4600 | Loss: 1.3078 | BPC: 1.887 | Speed: 9912 tok/s
+Batch 4700 | Loss: 1.3769 | BPC: 1.986 | Speed: 9912 tok/s
+Batch 4800 | Loss: 1.3895 | BPC: 2.005 | Speed: 9912 tok/s
+Batch 4900 | Loss: 1.3714 | BPC: 1.979 | Speed: 9912 tok/s
+Batch 5000 | Loss: 1.3836 | BPC: 1.996 | Speed: 9912 tok/s

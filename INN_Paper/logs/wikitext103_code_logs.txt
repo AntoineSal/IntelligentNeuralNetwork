@@ -1,0 +1,752 @@
+# @title ⚔️ THE ARENA V2: INN vs Transformer vs Mamba (Stabilized)
+# @markdown **Objectif :** Reproduire la performance de l'INN V5 (Word Level) mais sans les oscillations finales.
+# @markdown - **Modif 1 :** Accumulation = 16 (Batch 128) -> Stabilité.
+# @markdown - **Modif 2 :** Epochs = 3 -> Temps de convergence.
+# @markdown - **Modif 3 :** LR = 3e-4 + Hard Decay.
+
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import math
+import time
+from collections import Counter
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, Dataset
+from torch.cuda.amp import autocast, GradScaler
+
+# --- 1. SETUP & DEPENDENCIES ---
+print("🔧 Preparing The Arena (Stabilized)...")
+os.system("pip install datasets causal-conv1d>=1.2.0 mamba-ssm")
+
+try:
+    from mamba_ssm import Mamba
+    from datasets import load_dataset
+    print("✅ Dependencies Ready.")
+except ImportError:
+    print("⚠️ Critical deps missing.")
+
+# --- 2. CONFIGURATION (STABILITY PATCH) ---
+CONFIG = {
+    'dataset': 'wikitext-103-v1',
+    'vocab_limit': 50000,
+    'seq_len': 256,
+    'd_model': 512,
+    'dropout': 0.1,
+    'grad_clip': 1.0,
+    
+    # --- CHANGEMENTS ICI ---
+    'batch_size': 8,
+    'accum_steps': 16,     # <--- DOUBLÉ (Batch Virtuel = 128) pour lisser la courbe
+    'epochs': 3,           # <--- AUGMENTÉ (Pour laisser le temps au LR de descendre)
+    'lr': 3e-4,            # <--- RÉDUIT (Plus doux que 5e-4)
+    # -----------------------
+}
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"🚀 Arena hosted on {device} | Effective Batch Size: {CONFIG['batch_size']*CONFIG['accum_steps']}")
+
+# --- 3. DATA LOADING ---
+class ArenaDataset(Dataset):
+    def __init__(self, split, vocab=None, limit=None):
+        print(f"📚 Loading WikiText-103 ({split})...")
+        dataset = load_dataset("wikitext", "wikitext-103-v1", split=split)
+        text = "\n".join(dataset['text'])
+        tokens = text.replace('\n', ' <eos> ').split()
+        tokens = [t for t in tokens if t.strip()]
+        
+        if vocab is None:
+            counts = Counter(tokens)
+            most_common = counts.most_common(limit)
+            self.vocab = sorted([w for w, c in most_common])
+            self.word2idx = {w: i for i, w in enumerate(self.vocab)}
+            self.unk_idx = len(self.vocab)
+            self.vocab_size = len(self.vocab) + 1
+        else:
+            self.vocab = vocab
+            self.word2idx = {w: i for i, w in enumerate(self.vocab)}
+            self.vocab_size = len(self.vocab) + 1
+            self.unk_idx = self.vocab_size - 1
+
+        self.data = torch.tensor([self.word2idx.get(t, self.unk_idx) for t in tokens], dtype=torch.long)
+        self.seq_len = CONFIG['seq_len']
+        print(f"✅ {split.upper()} Ready. {len(self.data)} tokens.")
+
+    def __len__(self): return len(self.data) // self.seq_len
+    def __getitem__(self, idx):
+        start = idx * self.seq_len
+        chunk = self.data[start:start+self.seq_len+1]
+        if len(chunk) < self.seq_len+1:
+            chunk = torch.cat([chunk, torch.zeros(self.seq_len+1-len(chunk), dtype=torch.long)])
+        return chunk[:-1], chunk[1:]
+
+# --- 4. THE GLADIATORS ---
+
+# 🔴 INN V5 (Champion)
+class INN_V5(nn.Module):
+    def __init__(self, vocab_size, d_model=512, n_neurons=64, n_layers=4):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.neuron_id = nn.Parameter(torch.randn(1, 1, n_neurons, d_model))
+        self.layers = nn.ModuleList([
+            nn.ModuleDict({
+                'norm_in': nn.LayerNorm(d_model),
+                'mamba': Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2),
+                'comm_norm': nn.LayerNorm(d_model),
+                'comm': nn.MultiheadAttention(d_model, num_heads=8, batch_first=True)
+            }) for _ in range(n_layers)
+        ])
+        self.readout_attn = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
+        self.readout_query = nn.Parameter(torch.randn(1, 1, d_model))
+        self.norm_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size)
+        self.n_neurons = n_neurons
+
+    def forward(self, x):
+        B, L = x.shape
+        h = self.embedding(x).unsqueeze(2).expand(-1, -1, self.n_neurons, -1)
+        h = h + self.neuron_id
+        
+        for layer in self.layers:
+            B, L, N, D = h.shape
+            h_flat = h.view(B*N, L, D)
+            h_mamba = layer['mamba'](layer['norm_in'](h_flat)).view(B, L, N, D)
+            h = h + h_mamba
+            
+            h_flat = h.view(B*L, N, D)
+            h_norm = layer['comm_norm'](h_flat)
+            attn, _ = layer['comm'](h_norm, h_norm, h_norm)
+            h = h + attn.view(B, L, N, D)
+            
+        B, L, N, D = h.shape
+        flat_h = h.view(B*L, N, D)
+        q = self.readout_query.expand(B*L, -1, -1)
+        out, _ = self.readout_attn(q, flat_h, flat_h)
+        out = self.norm_f(out.view(B, L, D))
+        return self.head(out)
+
+# 🔵 Transformer Baseline
+class Transformer_Baseline(nn.Module):
+    def __init__(self, vocab_size, d_model=512, n_layers=6):
+        super().__init__()
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_embedding = nn.Parameter(torch.zeros(1, 1024, d_model))
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=8, dim_feedforward=d_model*4, batch_first=True, norm_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.head = nn.Linear(d_model, vocab_size)
+
+    def forward(self, x):
+        x = self.token_embedding(x) + self.pos_embedding[:, :x.size(1), :]
+        mask = nn.Transformer.generate_square_subsequent_mask(x.size(1)).to(x.device)
+        x = self.transformer(x, mask=mask, is_causal=True)
+        return self.head(x)
+
+# 🟢 Mamba Baseline
+class Mamba_Baseline(nn.Module):
+    def __init__(self, vocab_size, d_model=512, n_layers=6):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.layers = nn.ModuleList([
+            Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2)
+            for _ in range(n_layers)
+        ])
+        self.norm_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size)
+
+    def forward(self, x):
+        x = self.embedding(x)
+        for layer in self.layers:
+            x = x + layer(x)
+        x = self.norm_f(x)
+        return self.head(x)
+
+# --- 5. BATTLE LOOP ---
+def train_model(name, model, train_dl, valid_dl, vocab_size):
+    print(f"\n🥊 FIGHTER: {name}")
+    print(f"   Params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+    
+    model = model.to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=CONFIG['lr'], weight_decay=0.01)
+    
+    # SCHEDULER STABILISÉ
+    total_steps = len(train_dl) * CONFIG['epochs'] // CONFIG['accum_steps']
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, 
+        max_lr=CONFIG['lr'], 
+        total_steps=total_steps,
+        pct_start=0.1, # Warmup 10%
+        div_factor=25,
+        final_div_factor=10000 # <--- FORCE LE LR À ZÉRO À LA FIN
+    )
+    
+    scaler = GradScaler()
+    criterion = nn.CrossEntropyLoss()
+    
+    model.train()
+    start_time = time.time()
+    
+    for epoch in range(CONFIG['epochs']):
+        for i, (x, y) in enumerate(train_dl):
+            x, y = x.to(device), y.to(device)
+            
+            with autocast():
+                output = model(x)
+                loss = criterion(output.view(-1, vocab_size), y.view(-1))
+                loss = loss / CONFIG['accum_steps']
+            
+            scaler.scale(loss).backward()
+            
+            if (i + 1) % CONFIG['accum_steps'] == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG['grad_clip'])
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad()
+                
+                step = (i + 1) // CONFIG['accum_steps']
+                # Log plus fréquent pour surveiller
+                if step % 50 == 0:
+                    ppl = math.exp(loss.item() * CONFIG['accum_steps'])
+                    elapsed = time.time() - start_time
+                    print(f"   Ep {epoch+1} | Step {step} | PPL: {ppl:.2f} | Time: {elapsed:.0f}s")
+        
+        # Validation Rapide à chaque Epoch
+        print(f"   🏁 Validating Epoch {epoch+1}...")
+        model.eval()
+        val_loss = 0
+        steps = 0
+        with torch.no_grad():
+            for x, y in valid_dl:
+                x, y = x.to(device), y.to(device)
+                with autocast():
+                    out = model(x)
+                    val_loss += criterion(out.view(-1, vocab_size), y.view(-1)).item()
+                steps += 1
+                if steps > 200: break
+        
+        valid_ppl = math.exp(val_loss / steps)
+        print(f"   🏆 END EPOCH {epoch+1} | VALID PPL: {valid_ppl:.2f} 🏆")
+        model.train()
+    
+    return valid_ppl
+
+# --- 6. EXECUTION (INN FIRST) ---
+if __name__ == "__main__":
+    train_ds = ArenaDataset('train', limit=CONFIG['vocab_limit'])
+    valid_ds = ArenaDataset('validation', vocab=train_ds.vocab)
+    train_dl = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True)
+    valid_dl = DataLoader(valid_ds, batch_size=CONFIG['batch_size'])
+    
+    V_SIZE = train_ds.vocab_size
+    print(f"🎯 Vocab Size: {V_SIZE}")
+    
+    # Ajustement des neurones pour matcher 70M params si possible, sinon 48 par défaut
+    inn = INN_V5(V_SIZE, d_model=CONFIG['d_model'], n_neurons=48, n_layers=4) 
+    transformer = Transformer_Baseline(V_SIZE, d_model=CONFIG['d_model'], n_layers=6)
+    mamba = Mamba_Baseline(V_SIZE, d_model=CONFIG['d_model'], n_layers=6)
+    
+    results = {}
+    
+    print("\n🚀 LAUNCHING INN V5 (STABILIZED)...")
+    try:
+        results['INN'] = train_model("INN V5", inn, train_dl, valid_dl, V_SIZE)
+    except RuntimeError as e:
+        print(f"💥 CRASH INN: {e}")
+
+    print("\n🔵 LAUNCHING TRANSFORMER...")
+    results['Transformer'] = train_model("Transformer", transformer, train_dl, valid_dl, V_SIZE)
+    
+    print("\n🟢 LAUNCHING MAMBA...")
+    results['Mamba'] = train_model("Mamba", mamba, train_dl, valid_dl, V_SIZE)
+    
+    print("\n================ FINAL RESULTS ================")
+    for k, v in results.items():
+        print(f"{k}: {v:.2f} PPL")
+    print("===============================================")
+
+
+
+    🔧 Preparing The Arena (Stabilized)...
+✅ Dependencies Ready.
+🚀 Arena hosted on cuda | Effective Batch Size: 128
+📚 Loading WikiText-103 (train)...
+/usr/local/lib/python3.12/dist-packages/huggingface_hub/utils/_auth.py:94: UserWarning: 
+The secret `HF_TOKEN` does not exist in your Colab secrets.
+To authenticate with the Hugging Face Hub, create a token in your settings tab (https://huggingface.co/settings/tokens), set it as secret in your Google Colab and restart your session.
+You will be able to reuse this secret in all of your notebooks.
+Please note that authentication is recommended but still optional to access public models or datasets.
+  warnings.warn(
+README.md: 
+ 10.5k/? [00:00<00:00, 1.19MB/s]
+wikitext-103-v1/test-00000-of-00001.parq(…): 100%
+ 722k/722k [00:01<00:00, 512kB/s]
+wikitext-103-v1/train-00000-of-00002.par(…): 100%
+ 156M/156M [00:03<00:00, 57.8MB/s]
+wikitext-103-v1/train-00001-of-00002.par(…): 100%
+ 156M/156M [00:01<00:00, 171MB/s]
+wikitext-103-v1/validation-00000-of-0000(…): 100%
+ 655k/655k [00:00<00:00, 36.5kB/s]
+Generating test split: 100%
+ 4358/4358 [00:00<00:00, 99917.88 examples/s]
+Generating train split: 100%
+ 1801350/1801350 [00:02<00:00, 918326.97 examples/s]
+Generating validation split: 100%
+ 3760/3760 [00:00<00:00, 261431.32 examples/s]
+✅ TRAIN Ready. 104392049 tokens.
+📚 Loading WikiText-103 (validation)...
+✅ VALIDATION Ready. 220106 tokens.
+🎯 Vocab Size: 50001
+/usr/local/lib/python3.12/dist-packages/torch/nn/modules/transformer.py:392: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(
+
+🚀 LAUNCHING INN V5 (STABILIZED)...
+
+🥊 FIGHTER: INN V5
+   Params: 63.32M
+/tmp/ipython-input-2772891583.py:182: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = GradScaler()
+/tmp/ipython-input-2772891583.py:192: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with autocast():
+   Ep 1 | Step 50 | PPL: 25317.76 | Time: 150s
+   Ep 1 | Step 100 | PPL: 7438.63 | Time: 299s
+   Ep 1 | Step 150 | PPL: 3741.69 | Time: 449s
+   Ep 1 | Step 200 | PPL: 1551.35 | Time: 598s
+   Ep 1 | Step 250 | PPL: 900.39 | Time: 747s
+   Ep 1 | Step 300 | PPL: 635.68 | Time: 896s
+   Ep 1 | Step 350 | PPL: 602.77 | Time: 1046s
+   Ep 1 | Step 400 | PPL: 373.97 | Time: 1195s
+   Ep 1 | Step 450 | PPL: 394.57 | Time: 1344s
+   Ep 1 | Step 500 | PPL: 351.31 | Time: 1494s
+   Ep 1 | Step 550 | PPL: 360.47 | Time: 1643s
+   Ep 1 | Step 600 | PPL: 265.99 | Time: 1793s
+   Ep 1 | Step 650 | PPL: 224.53 | Time: 1942s
+   Ep 1 | Step 700 | PPL: 194.41 | Time: 2091s
+   Ep 1 | Step 750 | PPL: 236.69 | Time: 2241s
+   Ep 1 | Step 800 | PPL: 174.59 | Time: 2390s
+   Ep 1 | Step 850 | PPL: 244.45 | Time: 2539s
+   Ep 1 | Step 900 | PPL: 168.72 | Time: 2689s
+   Ep 1 | Step 950 | PPL: 247.42 | Time: 2838s
+   Ep 1 | Step 1000 | PPL: 213.12 | Time: 2986s
+   Ep 1 | Step 1050 | PPL: 151.65 | Time: 3135s
+   Ep 1 | Step 1100 | PPL: 140.98 | Time: 3284s
+   Ep 1 | Step 1150 | PPL: 155.33 | Time: 3433s
+   Ep 1 | Step 1200 | PPL: 131.16 | Time: 3582s
+   Ep 1 | Step 1250 | PPL: 114.92 | Time: 3731s
+   Ep 1 | Step 1300 | PPL: 159.20 | Time: 3880s
+   Ep 1 | Step 1350 | PPL: 148.09 | Time: 4030s
+   Ep 1 | Step 1400 | PPL: 147.59 | Time: 4179s
+   Ep 1 | Step 1450 | PPL: 140.61 | Time: 4328s
+   Ep 1 | Step 1500 | PPL: 140.56 | Time: 4477s
+   Ep 1 | Step 1550 | PPL: 80.99 | Time: 4626s
+   Ep 1 | Step 1600 | PPL: 127.62 | Time: 4775s
+   Ep 1 | Step 1650 | PPL: 114.87 | Time: 4924s
+   Ep 1 | Step 1700 | PPL: 110.41 | Time: 5073s
+   Ep 1 | Step 1750 | PPL: 118.08 | Time: 5221s
+   Ep 1 | Step 1800 | PPL: 117.33 | Time: 5370s
+   Ep 1 | Step 1850 | PPL: 122.00 | Time: 5519s
+   Ep 1 | Step 1900 | PPL: 141.96 | Time: 5668s
+   Ep 1 | Step 1950 | PPL: 120.82 | Time: 5817s
+   Ep 1 | Step 2000 | PPL: 106.72 | Time: 5966s
+   Ep 1 | Step 2050 | PPL: 111.54 | Time: 6115s
+   Ep 1 | Step 2100 | PPL: 115.38 | Time: 6264s
+   Ep 1 | Step 2150 | PPL: 135.89 | Time: 6413s
+   Ep 1 | Step 2200 | PPL: 120.75 | Time: 6562s
+   Ep 1 | Step 2250 | PPL: 145.47 | Time: 6710s
+   Ep 1 | Step 2300 | PPL: 152.95 | Time: 6859s
+   Ep 1 | Step 2350 | PPL: 141.68 | Time: 7008s
+   Ep 1 | Step 2400 | PPL: 114.48 | Time: 7157s
+   Ep 1 | Step 2450 | PPL: 117.03 | Time: 7306s
+   Ep 1 | Step 2500 | PPL: 100.10 | Time: 7455s
+   Ep 1 | Step 2550 | PPL: 90.55 | Time: 7604s
+   Ep 1 | Step 2600 | PPL: 111.47 | Time: 7753s
+   Ep 1 | Step 2650 | PPL: 111.67 | Time: 7902s
+   Ep 1 | Step 2700 | PPL: 77.27 | Time: 8051s
+   Ep 1 | Step 2750 | PPL: 98.48 | Time: 8200s
+   Ep 1 | Step 2800 | PPL: 119.29 | Time: 8349s
+   Ep 1 | Step 2850 | PPL: 107.67 | Time: 8498s
+   Ep 1 | Step 2900 | PPL: 81.90 | Time: 8647s
+   Ep 1 | Step 2950 | PPL: 106.42 | Time: 8796s
+   Ep 1 | Step 3000 | PPL: 113.09 | Time: 8945s
+   Ep 1 | Step 3050 | PPL: 105.37 | Time: 9094s
+   Ep 1 | Step 3100 | PPL: 91.00 | Time: 9243s
+   Ep 1 | Step 3150 | PPL: 109.77 | Time: 9392s
+   🏁 Validating Epoch 1...
+/tmp/ipython-input-2772891583.py:222: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with autocast():
+   🏆 END EPOCH 1 | VALID PPL: 95.42 🏆
+   Ep 2 | Step 50 | PPL: 89.29 | Time: 9653s
+   Ep 2 | Step 100 | PPL: 104.17 | Time: 9802s
+   Ep 2 | Step 150 | PPL: 87.85 | Time: 9951s
+   Ep 2 | Step 200 | PPL: 96.80 | Time: 10100s
+   Ep 2 | Step 250 | PPL: 132.21 | Time: 10249s
+   Ep 2 | Step 300 | PPL: 76.78 | Time: 10398s
+   Ep 2 | Step 350 | PPL: 71.31 | Time: 10547s
+   Ep 2 | Step 400 | PPL: 93.62 | Time: 10696s
+   Ep 2 | Step 450 | PPL: 110.02 | Time: 10845s
+   Ep 2 | Step 500 | PPL: 113.59 | Time: 10994s
+   Ep 2 | Step 550 | PPL: 112.80 | Time: 11144s
+   Ep 2 | Step 600 | PPL: 81.39 | Time: 11293s
+   Ep 2 | Step 650 | PPL: 87.55 | Time: 11442s
+   Ep 2 | Step 700 | PPL: 104.06 | Time: 11591s
+   Ep 2 | Step 750 | PPL: 73.23 | Time: 11740s
+   Ep 2 | Step 800 | PPL: 88.21 | Time: 11889s
+   Ep 2 | Step 850 | PPL: 104.97 | Time: 12038s
+   Ep 2 | Step 900 | PPL: 95.86 | Time: 12187s
+   Ep 2 | Step 950 | PPL: 77.56 | Time: 12336s
+   Ep 2 | Step 1000 | PPL: 95.77 | Time: 12485s
+   Ep 2 | Step 1050 | PPL: 75.57 | Time: 12634s
+   Ep 2 | Step 1100 | PPL: 108.21 | Time: 12784s
+   Ep 2 | Step 1150 | PPL: 68.68 | Time: 12933s
+   Ep 2 | Step 1200 | PPL: 77.90 | Time: 13082s
+   Ep 2 | Step 1250 | PPL: 68.80 | Time: 13231s
+   Ep 2 | Step 1300 | PPL: 92.40 | Time: 13380s
+   Ep 2 | Step 1350 | PPL: 95.45 | Time: 13529s
+   Ep 2 | Step 1400 | PPL: 86.55 | Time: 13678s
+   Ep 2 | Step 1450 | PPL: 96.50 | Time: 13827s
+   Ep 2 | Step 1500 | PPL: 84.97 | Time: 13976s
+   Ep 2 | Step 1550 | PPL: 79.38 | Time: 14126s
+   Ep 2 | Step 1600 | PPL: 72.56 | Time: 14275s
+   Ep 2 | Step 1650 | PPL: 77.23 | Time: 14424s
+   Ep 2 | Step 1700 | PPL: 94.87 | Time: 14573s
+   Ep 2 | Step 1750 | PPL: 83.31 | Time: 14722s
+   Ep 2 | Step 1800 | PPL: 90.69 | Time: 14871s
+   Ep 2 | Step 1850 | PPL: 64.75 | Time: 15020s
+   Ep 2 | Step 1900 | PPL: 82.76 | Time: 15169s
+   Ep 2 | Step 1950 | PPL: 94.93 | Time: 15318s
+   Ep 2 | Step 2000 | PPL: 55.80 | Time: 15468s
+   Ep 2 | Step 2050 | PPL: 84.63 | Time: 15617s
+   Ep 2 | Step 2100 | PPL: 86.28 | Time: 15766s
+   Ep 2 | Step 2150 | PPL: 82.69 | Time: 15915s
+   Ep 2 | Step 2200 | PPL: 55.00 | Time: 16064s
+   Ep 2 | Step 2250 | PPL: 78.43 | Time: 16213s
+   Ep 2 | Step 2300 | PPL: 99.21 | Time: 16362s
+   Ep 2 | Step 2350 | PPL: 78.33 | Time: 16511s
+   Ep 2 | Step 2400 | PPL: 84.02 | Time: 16660s
+   Ep 2 | Step 2450 | PPL: 83.22 | Time: 16810s
+   Ep 2 | Step 2500 | PPL: 104.48 | Time: 16959s
+   Ep 2 | Step 2550 | PPL: 78.31 | Time: 17108s
+   Ep 2 | Step 2600 | PPL: 63.38 | Time: 17257s
+   Ep 2 | Step 2650 | PPL: 104.92 | Time: 17406s
+   Ep 2 | Step 2700 | PPL: 72.42 | Time: 17555s
+   Ep 2 | Step 2750 | PPL: 107.11 | Time: 17704s
+   Ep 2 | Step 2800 | PPL: 65.22 | Time: 17853s
+   Ep 2 | Step 2850 | PPL: 92.35 | Time: 18002s
+   Ep 2 | Step 2900 | PPL: 68.97 | Time: 18152s
+   Ep 2 | Step 2950 | PPL: 89.10 | Time: 18301s
+   Ep 2 | Step 3000 | PPL: 85.34 | Time: 18450s
+   Ep 2 | Step 3050 | PPL: 88.78 | Time: 18599s
+   Ep 2 | Step 3100 | PPL: 114.80 | Time: 18748s
+   Ep 2 | Step 3150 | PPL: 85.25 | Time: 18897s
+   🏁 Validating Epoch 2...
+   🏆 END EPOCH 2 | VALID PPL: 78.34 🏆
+   Ep 3 | Step 50 | PPL: 43.69 | Time: 19158s
+   Ep 3 | Step 100 | PPL: 66.39 | Time: 19307s
+   Ep 3 | Step 150 | PPL: 96.25 | Time: 19456s
+   Ep 3 | Step 200 | PPL: 76.26 | Time: 19605s
+   Ep 3 | Step 250 | PPL: 60.63 | Time: 19755s
+   Ep 3 | Step 300 | PPL: 74.07 | Time: 19904s
+   Ep 3 | Step 350 | PPL: 71.35 | Time: 20053s
+   Ep 3 | Step 400 | PPL: 71.27 | Time: 20202s
+   Ep 3 | Step 450 | PPL: 58.58 | Time: 20351s
+   Ep 3 | Step 500 | PPL: 88.65 | Time: 20500s
+   Ep 3 | Step 550 | PPL: 56.07 | Time: 20649s
+   Ep 3 | Step 600 | PPL: 71.07 | Time: 20798s
+   Ep 3 | Step 650 | PPL: 83.24 | Time: 20947s
+   Ep 3 | Step 700 | PPL: 65.22 | Time: 21097s
+   Ep 3 | Step 750 | PPL: 81.09 | Time: 21246s
+   Ep 3 | Step 800 | PPL: 87.66 | Time: 21395s
+   Ep 3 | Step 850 | PPL: 67.28 | Time: 21544s
+   Ep 3 | Step 900 | PPL: 56.25 | Time: 21693s
+   Ep 3 | Step 950 | PPL: 88.68 | Time: 21842s
+   Ep 3 | Step 1000 | PPL: 72.26 | Time: 21991s
+   Ep 3 | Step 1050 | PPL: 71.25 | Time: 22140s
+   Ep 3 | Step 1100 | PPL: 79.70 | Time: 22290s
+   Ep 3 | Step 1150 | PPL: 62.19 | Time: 22439s
+   Ep 3 | Step 1200 | PPL: 75.29 | Time: 22588s
+   Ep 3 | Step 1250 | PPL: 74.79 | Time: 22737s
+   Ep 3 | Step 1300 | PPL: 80.75 | Time: 22886s
+   Ep 3 | Step 1350 | PPL: 68.99 | Time: 23035s
+   Ep 3 | Step 1400 | PPL: 81.83 | Time: 23184s
+   Ep 3 | Step 1450 | PPL: 69.40 | Time: 23333s
+   Ep 3 | Step 1500 | PPL: 69.95 | Time: 23483s
+   Ep 3 | Step 1550 | PPL: 98.78 | Time: 23632s
+   Ep 3 | Step 1600 | PPL: 59.05 | Time: 23781s
+   Ep 3 | Step 1650 | PPL: 82.89 | Time: 23930s
+   Ep 3 | Step 1700 | PPL: 77.94 | Time: 24079s
+   Ep 3 | Step 1750 | PPL: 66.40 | Time: 24228s
+   Ep 3 | Step 1800 | PPL: 75.66 | Time: 24377s
+   Ep 3 | Step 1850 | PPL: 57.29 | Time: 24526s
+   Ep 3 | Step 1900 | PPL: 66.45 | Time: 24676s
+   Ep 3 | Step 1950 | PPL: 50.16 | Time: 24825s
+   Ep 3 | Step 2000 | PPL: 64.33 | Time: 24974s
+   Ep 3 | Step 2050 | PPL: 65.20 | Time: 25123s
+   Ep 3 | Step 2100 | PPL: 66.13 | Time: 25272s
+   Ep 3 | Step 2150 | PPL: 77.76 | Time: 25421s
+   Ep 3 | Step 2200 | PPL: 87.13 | Time: 25570s
+   Ep 3 | Step 2250 | PPL: 80.36 | Time: 25719s
+   Ep 3 | Step 2300 | PPL: 80.56 | Time: 25869s
+   Ep 3 | Step 2350 | PPL: 74.95 | Time: 26018s
+   Ep 3 | Step 2400 | PPL: 75.34 | Time: 26167s
+   Ep 3 | Step 2450 | PPL: 91.65 | Time: 26316s
+   Ep 3 | Step 2500 | PPL: 58.70 | Time: 26465s
+   Ep 3 | Step 2550 | PPL: 84.64 | Time: 26614s
+   Ep 3 | Step 2600 | PPL: 72.15 | Time: 26763s
+   Ep 3 | Step 2650 | PPL: 62.26 | Time: 26912s
+   Ep 3 | Step 2700 | PPL: 68.21 | Time: 27062s
+   Ep 3 | Step 2750 | PPL: 55.50 | Time: 27211s
+   Ep 3 | Step 2800 | PPL: 63.89 | Time: 27360s
+   Ep 3 | Step 2850 | PPL: 70.44 | Time: 27509s
+   Ep 3 | Step 2900 | PPL: 95.32 | Time: 27658s
+   Ep 3 | Step 2950 | PPL: 78.96 | Time: 27807s
+   Ep 3 | Step 3000 | PPL: 68.77 | Time: 27956s
+   Ep 3 | Step 3050 | PPL: 84.80 | Time: 28105s
+   Ep 3 | Step 3100 | PPL: 75.81 | Time: 28255s
+   Ep 3 | Step 3150 | PPL: 66.40 | Time: 28404s
+   🏁 Validating Epoch 3...
+   🏆 END EPOCH 3 | VALID PPL: 74.72 🏆
+
+🔵 LAUNCHING TRANSFORMER...
+
+🥊 FIGHTER: Transformer
+   Params: 70.69M
+   Ep 1 | Step 50 | PPL: 6924.31 | Time: 15s
+   Ep 1 | Step 100 | PPL: 3249.92 | Time: 29s
+   Ep 1 | Step 150 | PPL: 1105.92 | Time: 44s
+   Ep 1 | Step 200 | PPL: 797.16 | Time: 58s
+   Ep 1 | Step 250 | PPL: 856.53 | Time: 73s
+   Ep 1 | Step 300 | PPL: 632.92 | Time: 87s
+   Ep 1 | Step 350 | PPL: 538.70 | Time: 102s
+   Ep 1 | Step 400 | PPL: 419.74 | Time: 117s
+   Ep 1 | Step 450 | PPL: 455.61 | Time: 131s
+   Ep 1 | Step 500 | PPL: 359.96 | Time: 146s
+   Ep 1 | Step 550 | PPL: 385.12 | Time: 160s
+   Ep 1 | Step 600 | PPL: 358.74 | Time: 174s
+   Ep 1 | Step 650 | PPL: 288.30 | Time: 189s
+   Ep 1 | Step 700 | PPL: 241.93 | Time: 203s
+   Ep 1 | Step 750 | PPL: 260.40 | Time: 218s
+   Ep 1 | Step 800 | PPL: 268.93 | Time: 232s
+   Ep 1 | Step 850 | PPL: 230.79 | Time: 247s
+   Ep 1 | Step 900 | PPL: 263.04 | Time: 261s
+   Ep 1 | Step 950 | PPL: 209.51 | Time: 276s
+   Ep 1 | Step 1000 | PPL: 211.02 | Time: 290s
+   Ep 1 | Step 1050 | PPL: 221.42 | Time: 304s
+   Ep 1 | Step 1100 | PPL: 166.74 | Time: 319s
+   Ep 1 | Step 1150 | PPL: 164.04 | Time: 333s
+   Ep 1 | Step 1200 | PPL: 172.74 | Time: 347s
+   Ep 1 | Step 1250 | PPL: 179.89 | Time: 362s
+   Ep 1 | Step 1300 | PPL: 130.19 | Time: 376s
+   Ep 1 | Step 1350 | PPL: 192.64 | Time: 391s
+   Ep 1 | Step 1400 | PPL: 181.51 | Time: 405s
+   Ep 1 | Step 1450 | PPL: 140.02 | Time: 419s
+   Ep 1 | Step 1500 | PPL: 130.03 | Time: 434s
+   Ep 1 | Step 1550 | PPL: 151.21 | Time: 448s
+   Ep 1 | Step 1600 | PPL: 140.04 | Time: 462s
+   Ep 1 | Step 1650 | PPL: 129.96 | Time: 477s
+   Ep 1 | Step 1700 | PPL: 101.74 | Time: 491s
+   Ep 1 | Step 1750 | PPL: 99.57 | Time: 506s
+   Ep 1 | Step 1800 | PPL: 104.64 | Time: 520s
+   Ep 1 | Step 1850 | PPL: 102.17 | Time: 534s
+   Ep 1 | Step 1900 | PPL: 130.64 | Time: 549s
+   Ep 1 | Step 1950 | PPL: 141.36 | Time: 563s
+   Ep 1 | Step 2000 | PPL: 117.31 | Time: 578s
+   Ep 1 | Step 2050 | PPL: 116.09 | Time: 592s
+   Ep 1 | Step 2100 | PPL: 104.36 | Time: 606s
+   Ep 1 | Step 2150 | PPL: 126.45 | Time: 621s
+   Ep 1 | Step 2200 | PPL: 111.36 | Time: 635s
+   Ep 1 | Step 2250 | PPL: 90.40 | Time: 650s
+   Ep 1 | Step 2300 | PPL: 131.94 | Time: 664s
+   Ep 1 | Step 2350 | PPL: 98.44 | Time: 679s
+   Ep 1 | Step 2400 | PPL: 88.50 | Time: 693s
+   Ep 1 | Step 2450 | PPL: 93.52 | Time: 708s
+   Ep 1 | Step 2500 | PPL: 113.15 | Time: 722s
+   Ep 1 | Step 2550 | PPL: 96.19 | Time: 737s
+   Ep 1 | Step 2600 | PPL: 115.07 | Time: 751s
+   Ep 1 | Step 2650 | PPL: 93.40 | Time: 766s
+   Ep 1 | Step 2700 | PPL: 91.44 | Time: 780s
+   Ep 1 | Step 2750 | PPL: 109.79 | Time: 794s
+   Ep 1 | Step 2800 | PPL: 86.04 | Time: 809s
+   Ep 1 | Step 2850 | PPL: 89.36 | Time: 823s
+   Ep 1 | Step 2900 | PPL: 82.29 | Time: 838s
+   Ep 1 | Step 2950 | PPL: 68.63 | Time: 852s
+   Ep 1 | Step 3000 | PPL: 69.70 | Time: 866s
+   Ep 1 | Step 3050 | PPL: 81.97 | Time: 881s
+   Ep 1 | Step 3100 | PPL: 59.78 | Time: 895s
+   Ep 1 | Step 3150 | PPL: 71.84 | Time: 909s
+   🏁 Validating Epoch 1...
+   🏆 END EPOCH 1 | VALID PPL: 70.85 🏆
+   Ep 2 | Step 50 | PPL: 65.19 | Time: 935s
+   Ep 2 | Step 100 | PPL: 66.95 | Time: 949s
+   Ep 2 | Step 150 | PPL: 103.99 | Time: 964s
+   Ep 2 | Step 200 | PPL: 78.21 | Time: 978s
+   Ep 2 | Step 250 | PPL: 69.97 | Time: 992s
+   Ep 2 | Step 300 | PPL: 69.55 | Time: 1007s
+   Ep 2 | Step 350 | PPL: 57.10 | Time: 1021s
+   Ep 2 | Step 400 | PPL: 81.47 | Time: 1036s
+   Ep 2 | Step 450 | PPL: 69.41 | Time: 1050s
+   Ep 2 | Step 500 | PPL: 45.92 | Time: 1064s
+   Ep 2 | Step 550 | PPL: 52.75 | Time: 1079s
+   Ep 2 | Step 600 | PPL: 54.46 | Time: 1093s
+   Ep 2 | Step 650 | PPL: 76.05 | Time: 1108s
+   Ep 2 | Step 700 | PPL: 74.44 | Time: 1122s
+   Ep 2 | Step 750 | PPL: 72.79 | Time: 1136s
+   Ep 2 | Step 800 | PPL: 82.13 | Time: 1151s
+   Ep 2 | Step 850 | PPL: 64.31 | Time: 1165s
+   Ep 2 | Step 900 | PPL: 54.98 | Time: 1180s
+   Ep 2 | Step 950 | PPL: 67.83 | Time: 1194s
+   Ep 2 | Step 1000 | PPL: 79.56 | Time: 1208s
+   Ep 2 | Step 1050 | PPL: 66.53 | Time: 1223s
+   Ep 2 | Step 1100 | PPL: 74.18 | Time: 1237s
+   Ep 2 | Step 1150 | PPL: 62.73 | Time: 1251s
+   Ep 2 | Step 1200 | PPL: 61.02 | Time: 1266s
+   Ep 2 | Step 1250 | PPL: 70.61 | Time: 1280s
+   Ep 2 | Step 1300 | PPL: 80.17 | Time: 1294s
+   Ep 2 | Step 1350 | PPL: 47.01 | Time: 1309s
+   Ep 2 | Step 1400 | PPL: 55.01 | Time: 1323s
+   Ep 2 | Step 1450 | PPL: 70.27 | Time: 1338s
+   Ep 2 | Step 1500 | PPL: 57.69 | Time: 1352s
+   Ep 2 | Step 1550 | PPL: 55.02 | Time: 1366s
+   Ep 2 | Step 1600 | PPL: 74.21 | Time: 1381s
+   Ep 2 | Step 1650 | PPL: 60.60 | Time: 1395s
+   Ep 2 | Step 1700 | PPL: 54.74 | Time: 1410s
+   Ep 2 | Step 1750 | PPL: 51.98 | Time: 1424s
+   Ep 2 | Step 1800 | PPL: 55.98 | Time: 1439s
+   Ep 2 | Step 1850 | PPL: 62.26 | Time: 1453s
+   Ep 2 | Step 1900 | PPL: 65.70 | Time: 1467s
+   Ep 2 | Step 1950 | PPL: 71.78 | Time: 1482s
+   Ep 2 | Step 2000 | PPL: 66.11 | Time: 1496s
+   Ep 2 | Step 2050 | PPL: 55.16 | Time: 1510s
+   Ep 2 | Step 2100 | PPL: 71.06 | Time: 1525s
+   Ep 2 | Step 2150 | PPL: 56.50 | Time: 1539s
+   Ep 2 | Step 2200 | PPL: 75.43 | Time: 1553s
+   Ep 2 | Step 2250 | PPL: 77.54 | Time: 1567s
+   Ep 2 | Step 2300 | PPL: 50.48 | Time: 1582s
+   Ep 2 | Step 2350 | PPL: 63.08 | Time: 1596s
+   Ep 2 | Step 2400 | PPL: 41.61 | Time: 1611s
+   Ep 2 | Step 2450 | PPL: 62.88 | Time: 1625s
+   Ep 2 | Step 2500 | PPL: 47.39 | Time: 1640s
+   Ep 2 | Step 2550 | PPL: 62.15 | Time: 1655s
+   Ep 2 | Step 2600 | PPL: 45.32 | Time: 1669s
+   Ep 2 | Step 2650 | PPL: 60.07 | Time: 1684s
+   Ep 2 | Step 2700 | PPL: 53.04 | Time: 1698s
+   Ep 2 | Step 2750 | PPL: 77.32 | Time: 1713s
+   Ep 2 | Step 2800 | PPL: 51.53 | Time: 1727s
+   Ep 2 | Step 2850 | PPL: 72.74 | Time: 1742s
+   Ep 2 | Step 2900 | PPL: 41.62 | Time: 1756s
+   Ep 2 | Step 2950 | PPL: 81.66 | Time: 1770s
+   Ep 2 | Step 3000 | PPL: 46.37 | Time: 1785s
+   Ep 2 | Step 3050 | PPL: 60.94 | Time: 1799s
+   Ep 2 | Step 3100 | PPL: 73.13 | Time: 1814s
+   Ep 2 | Step 3150 | PPL: 74.02 | Time: 1828s
+   🏁 Validating Epoch 2...
+   🏆 END EPOCH 2 | VALID PPL: 51.19 🏆
+   Ep 3 | Step 50 | PPL: 54.58 | Time: 1854s
+   Ep 3 | Step 100 | PPL: 61.76 | Time: 1868s
+   Ep 3 | Step 150 | PPL: 57.02 | Time: 1882s
+   Ep 3 | Step 200 | PPL: 53.74 | Time: 1897s
+   Ep 3 | Step 250 | PPL: 43.23 | Time: 1911s
+   Ep 3 | Step 300 | PPL: 46.89 | Time: 1926s
+   Ep 3 | Step 350 | PPL: 48.28 | Time: 1940s
+   Ep 3 | Step 400 | PPL: 57.55 | Time: 1954s
+   Ep 3 | Step 450 | PPL: 46.45 | Time: 1969s
+   Ep 3 | Step 500 | PPL: 54.56 | Time: 1983s
+   Ep 3 | Step 550 | PPL: 71.22 | Time: 1997s
+   Ep 3 | Step 600 | PPL: 43.24 | Time: 2012s
+   Ep 3 | Step 650 | PPL: 56.27 | Time: 2026s
+   Ep 3 | Step 700 | PPL: 66.30 | Time: 2041s
+   Ep 3 | Step 750 | PPL: 56.94 | Time: 2055s
+   Ep 3 | Step 800 | PPL: 61.54 | Time: 2070s
+   Ep 3 | Step 850 | PPL: 63.92 | Time: 2085s
+   Ep 3 | Step 900 | PPL: 68.22 | Time: 2099s
+   Ep 3 | Step 950 | PPL: 39.80 | Time: 2114s
+   Ep 3 | Step 1000 | PPL: 53.66 | Time: 2129s
+   Ep 3 | Step 1050 | PPL: 56.11 | Time: 2143s
+   Ep 3 | Step 1100 | PPL: 55.64 | Time: 2157s
+   Ep 3 | Step 1150 | PPL: 37.91 | Time: 2172s
+   Ep 3 | Step 1200 | PPL: 59.76 | Time: 2186s
+   Ep 3 | Step 1250 | PPL: 48.17 | Time: 2201s
+   Ep 3 | Step 1300 | PPL: 54.11 | Time: 2215s
+   Ep 3 | Step 1350 | PPL: 52.41 | Time: 2230s
+   Ep 3 | Step 1400 | PPL: 39.28 | Time: 2244s
+   Ep 3 | Step 1450 | PPL: 53.86 | Time: 2259s
+   Ep 3 | Step 1500 | PPL: 52.36 | Time: 2273s
+   Ep 3 | Step 1550 | PPL: 66.75 | Time: 2288s
+   Ep 3 | Step 1600 | PPL: 53.90 | Time: 2302s
+   Ep 3 | Step 1650 | PPL: 71.88 | Time: 2316s
+   Ep 3 | Step 1700 | PPL: 53.12 | Time: 2331s
+   Ep 3 | Step 1750 | PPL: 46.26 | Time: 2345s
+   Ep 3 | Step 1800 | PPL: 62.48 | Time: 2360s
+   Ep 3 | Step 1850 | PPL: 41.22 | Time: 2374s
+   Ep 3 | Step 1900 | PPL: 59.47 | Time: 2388s
+   Ep 3 | Step 1950 | PPL: 58.54 | Time: 2403s
+   Ep 3 | Step 2000 | PPL: 59.09 | Time: 2417s
+   Ep 3 | Step 2050 | PPL: 53.41 | Time: 2432s
+   Ep 3 | Step 2100 | PPL: 54.52 | Time: 2446s
+   Ep 3 | Step 2150 | PPL: 55.56 | Time: 2461s
+   Ep 3 | Step 2200 | PPL: 43.56 | Time: 2475s
+   Ep 3 | Step 2250 | PPL: 57.62 | Time: 2489s
+   Ep 3 | Step 2300 | PPL: 62.43 | Time: 2504s
+   Ep 3 | Step 2350 | PPL: 47.15 | Time: 2518s
+   Ep 3 | Step 2400 | PPL: 55.66 | Time: 2533s
+   Ep 3 | Step 2450 | PPL: 61.24 | Time: 2547s
+   Ep 3 | Step 2500 | PPL: 68.67 | Time: 2561s
+   Ep 3 | Step 2550 | PPL: 56.27 | Time: 2576s
+   Ep 3 | Step 2600 | PPL: 52.62 | Time: 2590s
+   Ep 3 | Step 2650 | PPL: 44.92 | Time: 2605s
+   Ep 3 | Step 2700 | PPL: 42.76 | Time: 2619s
+   Ep 3 | Step 2750 | PPL: 61.09 | Time: 2634s
+   Ep 3 | Step 2800 | PPL: 51.50 | Time: 2648s
+   Ep 3 | Step 2850 | PPL: 37.28 | Time: 2663s
+   Ep 3 | Step 2900 | PPL: 50.40 | Time: 2677s
+   Ep 3 | Step 2950 | PPL: 37.92 | Time: 2691s
+   Ep 3 | Step 3000 | PPL: 58.98 | Time: 2706s
+   Ep 3 | Step 3050 | PPL: 55.02 | Time: 2720s
+   Ep 3 | Step 3100 | PPL: 50.07 | Time: 2734s
+   Ep 3 | Step 3150 | PPL: 48.64 | Time: 2749s
+   🏁 Validating Epoch 3...
+   🏆 END EPOCH 3 | VALID PPL: 48.08 🏆
+
+🟢 LAUNCHING MAMBA...
+
+🥊 FIGHTER: Mamba
+   Params: 61.42M
+   Ep 1 | Step 50 | PPL: 51376.45 | Time: 14s
+   Ep 1 | Step 100 | PPL: 32002.69 | Time: 27s
+   Ep 1 | Step 150 | PPL: 13911.65 | Time: 41s
+   Ep 1 | Step 200 | PPL: nan | Time: 54s
+   Ep 1 | Step 250 | PPL: 10138.37 | Time: 68s
+   Ep 1 | Step 300 | PPL: nan | Time: 81s
+   Ep 1 | Step 350 | PPL: nan | Time: 95s
+   Ep 1 | Step 400 | PPL: nan | Time: 108s
+   Ep 1 | Step 450 | PPL: nan | Time: 122s
+   Ep 1 | Step 500 | PPL: 12786.71 | Time: 135s
+   Ep 1 | Step 550 | PPL: nan | Time: 149s
+   Ep 1 | Step 600 | PPL: nan | Time: 162s
+   Ep 1 | Step 650 | PPL: nan | Time: 175s
+   Ep 1 | Step 700 | PPL: nan | Time: 189s
+   Ep 1 | Step 750 | PPL: nan | Time: 202s
+   Ep 1 | Step 800 | PPL: 11472.41 | Time: 216s
+   Ep 1 | Step 850 | PPL: 11182.98 | Time: 229s
+   Ep 1 | Step 900 | PPL: nan | Time: 243s
+   Ep 1 | Step 950 | PPL: 10631.27 | Time: 256s
+   Ep 1 | Step 1000 | PPL: nan | Time: 270s
+   Ep 1 | Step 1050 | PPL: 13130.80 | Time: 283s
+   Ep 1 | Step 1100 | PPL: 10436.50 | Time: 296s
+---------------------------------------------------------------------------
+KeyboardInterrupt                         Traceback (most recent call last)
+/tmp/ipython-input-2772891583.py in <cell line: 0>()
+    259 
+    260     print("\n🟢 LAUNCHING MAMBA...")
+--> 261     results['Mamba'] = train_model("Mamba", mamba, train_dl, valid_dl, V_SIZE)
+    262 
+    263     print("\n================ FINAL RESULTS ================")
+
+7 frames
+/usr/local/lib/python3.12/dist-packages/einops/einops.py in rearrange(tensor, pattern, **axes_lengths)
+    543 
+    544 
+--> 545 def rearrange(tensor: Union[Tensor, List[Tensor]], pattern: str, **axes_lengths: Size) -> Tensor:
+    546     """
+    547     einops.rearrange is a reader-friendly smart element reordering for multidimensional tensors.
+
+KeyboardInterrupt: 

@@ -1,0 +1,507 @@
+# @title 🔬 BENCHMARK: INN vs Baselines on Causal Logic Task
+# @markdown Entraînement correct de tous les modèles sur la même tâche
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import math
+import random
+from collections import OrderedDict
+
+# ==========================================
+# CONFIGURATION GLOBALE
+# ==========================================
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"🔬 BENCHMARK: Causal Logic Task on {DEVICE}")
+
+# Fix seed for reproducibility
+torch.manual_seed(42)
+random.seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(42)
+
+# Hyperparamètres
+D_MODEL = 128
+D_STATE = 256
+VOCAB_SIZE = 100
+LR = 2e-3
+SEQ_LEN = 64
+N_NEURONS = 4
+
+# Tokens
+KEY_A, KEY_B, KEY_C = 10, 11, 12
+OP_TOKEN = 99
+NOISE_START = 30
+TARGET_TOKENS = {True: 1, False: 0}
+
+# ==========================================
+# ARCHITECTURE INN V11
+# ==========================================
+
+class LockedMemoryNeuron(nn.Module):
+    """Neurone avec matrice récurrente figée à l'Identité pour rétention parfaite."""
+    def __init__(self, d_model, d_state):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.gru = nn.GRU(d_model, d_state, batch_first=True)
+        self.out_proj = nn.Linear(d_state, d_model)
+        
+        with torch.no_grad():
+            self.gru.weight_hh_l0.zero_()
+            i_start, i_end = 2 * d_state, 3 * d_state
+            self.gru.weight_hh_l0[i_start:i_end].copy_(torch.eye(d_state))
+            self.gru.bias_hh_l0.zero_()
+            self.gru.bias_hh_l0[d_state:2*d_state].fill_(-5.0)  # Bias négatif pour rétention
+            nn.init.orthogonal_(self.gru.weight_ih_l0)
+        
+        self.gru.weight_hh_l0.requires_grad = False
+        self.gru.bias_hh_l0.requires_grad = False
+        
+    def forward(self, x, h):
+        if h is None: 
+            h = torch.zeros(1, x.size(0), self.d_state, device=x.device)
+        o, h_new = self.gru(x, h)
+        return self.out_proj(o), h_new
+
+class ComputeNeuron(nn.Module):
+    """Neurone standard, entièrement entraînable, dédié au calcul."""
+    def __init__(self, d_model, d_state):
+        super().__init__()
+        self.gru = nn.GRU(d_model, d_state, batch_first=True)
+        self.out_proj = nn.Linear(d_state, d_model)
+        
+        for name, param in self.gru.named_parameters():
+            if 'weight_hh' in name:
+                nn.init.orthogonal_(param)
+                
+    def forward(self, x, h):
+        if h is None: 
+            h = torch.zeros(1, x.size(0), self.gru.hidden_size, device=x.device)
+        o, h_new = self.gru(x, h)
+        return self.out_proj(o), h_new
+
+class LifecycleINN_V11(nn.Module):
+    """INN V11: 2 Locked Memory + 2 Compute Neurons."""
+    def __init__(self):
+        super().__init__()
+        self.embedding = nn.Embedding(VOCAB_SIZE, D_MODEL)
+        self.neurons = nn.ModuleList([
+            LockedMemoryNeuron(D_MODEL, D_STATE),
+            LockedMemoryNeuron(D_MODEL, D_STATE),
+            ComputeNeuron(D_MODEL, D_STATE),
+            ComputeNeuron(D_MODEL, D_STATE)
+        ])
+        self.attn_q = nn.Linear(D_MODEL, D_MODEL)
+        self.attn_k = nn.Linear(D_MODEL, D_MODEL)
+        self.attn_v = nn.Linear(D_MODEL, D_MODEL)
+        self.workspace_out = nn.Linear(D_MODEL, D_MODEL)
+        self.norm = nn.LayerNorm(D_MODEL)
+        self.readout = nn.Linear(D_MODEL * N_NEURONS, VOCAB_SIZE)
+
+    def run_workspace(self, stack):
+        B, S, N, D = stack.shape
+        flat = stack.view(B*S, N, D)
+        q = self.attn_q(flat)
+        k = self.attn_k(flat)
+        v = self.attn_v(flat)
+        attn = F.softmax(torch.matmul(q, k.transpose(-2,-1)) / math.sqrt(D), dim=-1)
+        mixed = torch.matmul(attn, v)
+        out = self.norm(flat + self.workspace_out(mixed))
+        return out.view(B, S, N, D)
+
+    def forward(self, x, h=None):
+        if h is None: 
+            h = [None] * N_NEURONS
+        x_emb = self.embedding(x)
+        outs, new_h = [], []
+        for i, n in enumerate(self.neurons):
+            o, hh = n(x_emb, h[i])
+            outs.append(o)
+            new_h.append(hh)
+        stack = torch.stack(outs, dim=2)
+        integ = self.run_workspace(stack)
+        return self.readout(integ.view(x.size(0), x.size(1), -1)), new_h
+
+# ==========================================
+# BASELINES
+# ==========================================
+
+class BaselineLSTM(nn.Module):
+    """LSTM baseline avec état persistant."""
+    def __init__(self):
+        super().__init__()
+        self.embedding = nn.Embedding(VOCAB_SIZE, D_MODEL)
+        self.lstm = nn.LSTM(D_MODEL, D_STATE, num_layers=2, batch_first=True)
+        self.readout = nn.Linear(D_STATE, VOCAB_SIZE)
+
+    def forward(self, x, h=None):
+        B = x.size(0)
+        if h is None:
+            h_prev = torch.zeros(self.lstm.num_layers, B, self.lstm.hidden_size, device=x.device)
+            c_prev = torch.zeros(self.lstm.num_layers, B, self.lstm.hidden_size, device=x.device)
+            h = (h_prev, c_prev)
+        x_emb = self.embedding(x)
+        lstm_out, (h_new, c_new) = self.lstm(x_emb, h)
+        logits = self.readout(lstm_out)
+        return logits, (h_new.detach(), c_new.detach())
+
+class BaselineTransformer(nn.Module):
+    """Transformer baseline (stateless par nature)."""
+    def __init__(self):
+        super().__init__()
+        self.embedding = nn.Embedding(VOCAB_SIZE, D_MODEL)
+        self.pos_encoder = nn.Embedding(512, D_MODEL)
+        layer = nn.TransformerEncoderLayer(
+            d_model=D_MODEL, 
+            nhead=4, 
+            dim_feedforward=D_MODEL*4, 
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(layer, num_layers=2)
+        self.readout = nn.Linear(D_MODEL, VOCAB_SIZE)
+
+    def forward(self, x, h=None):
+        B, S = x.shape
+        if S > 512:
+            x = x[:, -512:]
+            S = 512
+        x = self.embedding(x)
+        positions = torch.arange(0, S, device=x.device).unsqueeze(0)
+        x = x + self.pos_encoder(positions)
+        mask = nn.Transformer.generate_square_subsequent_mask(S).to(x.device)
+        out = self.transformer(x, mask=mask, is_causal=True)
+        return self.readout(out), None
+
+class BaselineMambaSim(nn.Module):
+    """Simulation Mamba avec GRU orthogonal (sans locked memory)."""
+    def __init__(self):
+        super().__init__()
+        self.embedding = nn.Embedding(VOCAB_SIZE, D_MODEL)
+        self.gru = nn.GRU(D_MODEL, D_STATE, batch_first=True)
+        self.readout = nn.Linear(D_STATE, VOCAB_SIZE)
+        
+        # Initialisation orthogonale (meilleure chance pour la mémoire)
+        for name, param in self.gru.named_parameters():
+            if 'weight_hh' in name:
+                nn.init.orthogonal_(param)
+
+    def forward(self, x, h=None):
+        B = x.size(0)
+        if h is None:
+            h = torch.zeros(1, B, self.gru.hidden_size, device=x.device)
+        x_emb = self.embedding(x)
+        gru_out, h_new = self.gru(x_emb, h)
+        logits = self.readout(gru_out)
+        return logits, h_new.detach()
+
+# ==========================================
+# GÉNÉRATEUR DE FLUX
+# ==========================================
+
+class CumulativeDriftStream:
+    """Génère la tâche: Stocke 3 valeurs (VA, VB, VC), question: (VA * VB) > VC ?"""
+    def generate_chunk(self, batch_size, seq_len):
+        x = torch.randint(NOISE_START, VOCAB_SIZE, (batch_size, seq_len))
+        y = x.clone()
+        mask = torch.zeros_like(x).float()
+        VAL_RANGE = range(0, 4)
+
+        for b in range(batch_size):
+            va = random.choice(VAL_RANGE)
+            vb = random.choice(VAL_RANGE)
+            vc = random.choice(VAL_RANGE)
+            target_bool = (va * vb) > vc
+            target_token = TARGET_TOKENS[target_bool]
+            
+            pos_a = random.randint(0, seq_len // 4)
+            x[b, pos_a], x[b, pos_a + 1] = KEY_A, va
+            
+            pos_b = random.randint(seq_len // 4 + 5, seq_len // 2)
+            x[b, pos_b], x[b, pos_b + 1] = KEY_B, vb
+            
+            pos_c = random.randint(seq_len // 2 + 5, 3 * seq_len // 4)
+            x[b, pos_c], x[b, pos_c + 1] = KEY_C, vc
+            
+            query_pos = random.randint(3 * seq_len // 4 + 5, seq_len - 2)
+            x[b, query_pos], x[b, query_pos + 1] = OP_TOKEN, OP_TOKEN
+            y[b, query_pos + 1] = target_token
+            mask[b, query_pos + 1] = 1.0
+        
+        return x.to(DEVICE), y.to(DEVICE), mask.to(DEVICE)
+
+# ==========================================
+# ENTRAÎNEMENT
+# ==========================================
+
+def train_model(model, name, num_steps=10000):
+    """Entraînement unifié pour tous les modèles sur la même tâche."""
+    print(f"\n🏋️ Training {name}...")
+    model.to(DEVICE)
+    
+    if name == "INN":
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+    else:
+        trainable_params = list(model.parameters())
+    
+    optimizer = optim.Adam(trainable_params, lr=LR)
+    stream = CumulativeDriftStream()
+    
+    for step in range(num_steps):
+        x, y, mask = stream.generate_chunk(32, SEQ_LEN)
+        logits, _ = model(x, None)
+        
+        loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), y.view(-1), reduction='none')
+        loss = (loss * mask.view(-1)).sum() / (mask.sum() + 1e-6)
+        
+        optimizer.zero_grad()
+        loss.backward()
+        
+        # Gradient clipping pour stabilité
+        if name == "INN":
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+        
+        optimizer.step()
+        
+        if step % 500 == 0:
+            print(f"  Step {step} | Loss: {loss.item():.4f}")
+            if loss.item() < 0.05:
+                print(f"  ✅ {name} CONVERGED!")
+                break
+    
+    return model
+
+# ==========================================
+# BENCHMARK
+# ==========================================
+
+def benchmark_model(model, name, horizons=[2000, 5000, 10000, 20000, 50000, 100000]):
+    """Benchmark unifié pour tous les modèles."""
+    print(f"\n🧐 Testing {name}...")
+    model.eval()
+    results = OrderedDict()
+    
+    TEST_VA, TEST_VB, TEST_VC = 3, 3, 5
+    TARGET = TARGET_TOKENS[(TEST_VA * TEST_VB) > TEST_VC]
+    NOISE_CHUNK_SIZE = 100
+    
+    for H in horizons:
+        h = None
+        
+        # Store A
+        _, h = model(torch.tensor([[KEY_A, TEST_VA]]).to(DEVICE), h)
+        
+        # Bruit 1 (H/3)
+        n_chunks_1 = (H // 3) // NOISE_CHUNK_SIZE
+        for _ in range(n_chunks_1):
+            noise = torch.randint(NOISE_START, VOCAB_SIZE, (1, NOISE_CHUNK_SIZE)).to(DEVICE)
+            _, h = model(noise, h)
+        
+        # Store B
+        _, h = model(torch.tensor([[KEY_B, TEST_VB]]).to(DEVICE), h)
+        
+        # Bruit 2 (H/3)
+        n_chunks_2 = (H // 3) // NOISE_CHUNK_SIZE
+        for _ in range(n_chunks_2):
+            noise = torch.randint(NOISE_START, VOCAB_SIZE, (1, NOISE_CHUNK_SIZE)).to(DEVICE)
+            _, h = model(noise, h)
+        
+        # Store C
+        _, h = model(torch.tensor([[KEY_C, TEST_VC]]).to(DEVICE), h)
+        
+        # Bruit 3 (reste)
+        remaining = H - (n_chunks_1 + n_chunks_2) * NOISE_CHUNK_SIZE
+        n_chunks_3 = remaining // NOISE_CHUNK_SIZE
+        for _ in range(n_chunks_3):
+            noise = torch.randint(NOISE_START, VOCAB_SIZE, (1, NOISE_CHUNK_SIZE)).to(DEVICE)
+            _, h = model(noise, h)
+        
+        # Query
+        query_seq = torch.tensor([[OP_TOKEN, OP_TOKEN]]).to(DEVICE)
+        logits, _ = model(query_seq, h)
+        
+        pred = logits[0, -1].argmax().item()
+        conf = F.softmax(logits[0, -1], dim=0)[pred].item()
+        success = (pred == TARGET)
+        res = "✅" if success else f"❌ ({pred})"
+        print(f"  H={H:6d} | {res} | Conf: {conf:.1%}")
+        results[H] = success
+    
+    return results
+
+# ==========================================
+# EXECUTION PRINCIPALE
+# ==========================================
+
+if __name__ == "__main__":
+    print("=" * 70)
+    print("BENCHMARK: Causal Logic Task - INN vs Baselines")
+    print("=" * 70)
+    
+    horizons = [2000, 5000, 10000, 20000, 50000, 100000]
+    
+    # 1. INN V11
+    print("\n" + "=" * 70)
+    print("MODEL 1: INN V11 (Locked Vault)")
+    print("=" * 70)
+    inn_model = LifecycleINN_V11()
+    inn_model = train_model(inn_model, "INN")
+    inn_results = benchmark_model(inn_model, "INN", horizons)
+    
+    # 2. LSTM Baseline
+    print("\n" + "=" * 70)
+    print("MODEL 2: LSTM Baseline")
+    print("=" * 70)
+    lstm_model = BaselineLSTM()
+    lstm_model = train_model(lstm_model, "LSTM")
+    lstm_results = benchmark_model(lstm_model, "LSTM", horizons)
+    
+    # 3. Transformer Baseline
+    print("\n" + "=" * 70)
+    print("MODEL 3: Transformer Baseline")
+    print("=" * 70)
+    trans_model = BaselineTransformer()
+    trans_model = train_model(trans_model, "Transformer")
+    trans_results = benchmark_model(trans_model, "Transformer", horizons)
+    
+    # 4. Mamba Sim Baseline
+    print("\n" + "=" * 70)
+    print("MODEL 4: Mamba Sim (Orthogonal GRU)")
+    print("=" * 70)
+    mamba_model = BaselineMambaSim()
+    mamba_model = train_model(mamba_model, "Mamba")
+    mamba_results = benchmark_model(mamba_model, "Mamba", horizons)
+    
+    # Summary Table
+    print("\n" + "=" * 70)
+    print("SUMMARY TABLE")
+    print("=" * 70)
+    print(f"{'Horizon':<10} | {'INN':<6} | {'LSTM':<6} | {'Transformer':<12} | {'Mamba':<6}")
+    print("-" * 70)
+    for H in horizons:
+        inn_res = "✅" if inn_results.get(H) else "❌"
+        lstm_res = "✅" if lstm_results.get(H) else "❌"
+        trans_res = "✅" if trans_results.get(H) else "❌"
+        mamba_res = "✅" if mamba_results.get(H) else "❌"
+        print(f"{H:>9}  | {inn_res:<6} | {lstm_res:<6} | {trans_res:<12} | {mamba_res:<6}")
+
+🔬 BENCHMARK: Causal Logic Task on cuda
+======================================================================
+BENCHMARK: Causal Logic Task - INN vs Baselines
+======================================================================
+
+======================================================================
+MODEL 1: INN V11 (Locked Vault)
+======================================================================
+
+🏋️ Training INN...
+  Step 0 | Loss: 4.4413
+  Step 500 | Loss: 0.0502
+  Step 1000 | Loss: 0.0000
+  ✅ INN CONVERGED!
+
+🧐 Testing INN...
+  H=  2000 | ✅ | Conf: 100.0%
+  H=  5000 | ✅ | Conf: 100.0%
+  H= 10000 | ✅ | Conf: 100.0%
+  H= 20000 | ✅ | Conf: 100.0%
+  H= 50000 | ✅ | Conf: 99.9%
+  H=100000 | ✅ | Conf: 100.0%
+
+======================================================================
+MODEL 2: LSTM Baseline
+======================================================================
+
+🏋️ Training LSTM...
+  Step 0 | Loss: 4.6502
+  Step 500 | Loss: 0.8189
+  Step 1000 | Loss: 0.7757
+  Step 1500 | Loss: 0.6509
+  Step 2000 | Loss: 0.6943
+  Step 2500 | Loss: 0.6853
+  Step 3000 | Loss: 0.6960
+  Step 3500 | Loss: 0.6912
+  Step 4000 | Loss: 0.6476
+  Step 4500 | Loss: 0.6933
+  Step 5000 | Loss: 0.6912
+  Step 5500 | Loss: 0.6872
+  Step 6000 | Loss: 0.6758
+  Step 6500 | Loss: 0.6436
+  Step 7000 | Loss: 0.6337
+  Step 7500 | Loss: 0.6775
+  Step 8000 | Loss: 0.7538
+  Step 8500 | Loss: 0.6771
+  Step 9000 | Loss: 0.7359
+  Step 9500 | Loss: 0.6638
+
+🧐 Testing LSTM...
+  H=  2000 | ❌ (0) | Conf: 54.0%
+  H=  5000 | ❌ (0) | Conf: 54.0%
+  H= 10000 | ❌ (0) | Conf: 54.0%
+  H= 20000 | ❌ (0) | Conf: 54.0%
+  H= 50000 | ❌ (0) | Conf: 54.0%
+  H=100000 | ❌ (0) | Conf: 54.0%
+
+======================================================================
+MODEL 3: Transformer Baseline
+======================================================================
+
+🏋️ Training Transformer...
+  Step 0 | Loss: 5.4153
+  Step 500 | Loss: 0.3749
+  Step 1000 | Loss: 0.3040
+  Step 1500 | Loss: 0.2141
+  Step 2000 | Loss: 0.1407
+  Step 2500 | Loss: 0.1298
+  Step 3000 | Loss: 0.1914
+  Step 3500 | Loss: 0.1084
+  Step 4000 | Loss: 0.2459
+  Step 4500 | Loss: 0.2060
+  Step 5000 | Loss: 0.2368
+  Step 5500 | Loss: 0.2138
+  Step 6000 | Loss: 0.3453
+  Step 6500 | Loss: 0.4446
+  Step 7000 | Loss: 0.0615
+  Step 7500 | Loss: 0.0980
+  Step 8000 | Loss: 0.1472
+  Step 8500 | Loss: 0.0363
+  ✅ Transformer CONVERGED!
+
+🧐 Testing Transformer...
+  H=  2000 | ✅ | Conf: 99.9%
+  H=  5000 | ✅ | Conf: 99.9%
+  H= 10000 | ✅ | Conf: 99.9%
+  H= 20000 | ✅ | Conf: 99.9%
+  H= 50000 | ✅ | Conf: 99.9%
+  H=100000 | ✅ | Conf: 99.9%
+
+======================================================================
+MODEL 4: Mamba Sim (Orthogonal GRU)
+======================================================================
+
+🏋️ Training Mamba...
+  Step 0 | Loss: 4.5046
+  Step 500 | Loss: 0.0014
+  ✅ Mamba CONVERGED!
+
+🧐 Testing Mamba...
+  H=  2000 | ✅ | Conf: 100.0%
+  H=  5000 | ✅ | Conf: 99.9%
+  H= 10000 | ✅ | Conf: 99.9%
+  H= 20000 | ✅ | Conf: 99.9%
+  H= 50000 | ✅ | Conf: 99.9%
+  H=100000 | ✅ | Conf: 99.9%
+
+======================================================================
+SUMMARY TABLE
+======================================================================
+Horizon    | INN    | LSTM   | Transformer  | Mamba 
+----------------------------------------------------------------------
+     2000  | ✅      | ❌      | ✅            | ✅     
+     5000  | ✅      | ❌      | ✅            | ✅     
+    10000  | ✅      | ❌      | ✅            | ✅     
+    20000  | ✅      | ❌      | ✅            | ✅     
+    50000  | ✅      | ❌      | ✅            | ✅     
+   100000  | ✅      | ❌      | ✅            | ✅     

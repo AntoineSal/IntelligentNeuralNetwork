@@ -1,0 +1,378 @@
+## 🤖 SCRIPT COLAB INN V6.2 - RL ROBUSTE AVEC BONUS D'EXPLORATION 🤖
+
+# --- 1. SETUP & IMPORTS ---
+!pip install gymnasium==0.29.1 minigrid > /dev/null 2>&1
+!pip install stable-baselines3[extra] > /dev/null 2>&1
+from IPython.display import clear_output
+clear_output()
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import gymnasium as gym
+from gymnasium import spaces
+from minigrid.envs import KeyCorridorEnv
+import numpy as np
+import time
+from gymnasium.envs.registration import register 
+
+# --- 2. ENVIRONMENT AVEC BONUS D'EXPLORATION ---
+
+class MultimodalKeyCorridorEnv(KeyCorridorEnv):
+    COLORS = ['red', 'green', 'blue', 'purple', 'yellow', 'grey']
+    
+    def __init__(self, key_color='red', **kwargs):
+        super().__init__(**kwargs) 
+        original_image_space = self.observation_space['image']
+        self.target_color = key_color
+        self.target_color_index = self.color_to_int(key_color)
+        
+        self.observation_space = spaces.Dict({
+            'image': original_image_space, 
+            'symbolic_instruction': spaces.Discrete(len(self.COLORS))
+        })
+        
+        self.was_carrying = False
+        # Dictionnaire pour le Bonus de Nouveauté: (x, y) -> count
+        self.visit_counts = {} 
+
+    def color_to_int(self, color_name):
+        return self.COLORS.index(color_name) if color_name in self.COLORS else -1
+
+    def reset(self, seed=None, options=None):
+        self.was_carrying = False 
+        obs, info = super().reset(seed=seed)
+        # Réinitialiser le compteur de visites pour chaque épisode (Modèle Episodic)
+        self.visit_counts = {} 
+        return {'image': obs['image'], 'symbolic_instruction': np.array(self.target_color_index)}, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = super().step(action)
+        
+        # Récompense Totale = R_extrinseque + R_shaping + R_intrinsèque
+        total_reward = reward 
+        
+        agent_pos = tuple(self.unwrapped.agent_pos)
+        
+        # --- A) Récompense Intrinsèque (Exploration Bonus) ---
+        N_s = self.visit_counts.get(agent_pos, 0)
+        self.visit_counts[agent_pos] = N_s + 1
+        
+        # Bonus basé sur la nouveauté (inverse de la racine carrée du compte de visites)
+        intrinsic_bonus = 0.05 / np.sqrt(N_s + 1)
+        total_reward += intrinsic_bonus 
+        
+        # --- B) Reward Shaping (Key Pick-up) ---
+        is_carrying = self.unwrapped.carrying is not None
+        if is_carrying and not self.was_carrying:
+            obj = self.unwrapped.carrying
+            if obj and obj.type == 'key' and obj.color == self.target_color:
+                total_reward += 0.5 # Shaping: BONUS pour la bonne clé
+        self.was_carrying = is_carrying
+        # -----------------------------------------------------------
+        
+        return {'image': obs['image'], 'symbolic_instruction': np.array(self.target_color_index)}, total_reward, terminated, truncated, info
+
+# --- 3. INN Factorized Architecture (Identique aux versions précédentes) ---
+
+class INN_Neuron(nn.Module):
+    def __init__(self, state_size, total_neurons):
+        super().__init__()
+        self.ln_pre = nn.LayerNorm(state_size)
+        self.attention = nn.MultiheadAttention(embed_dim=state_size, num_heads=2, batch_first=True)
+        self.core = nn.LSTMCell(state_size * 2, state_size)
+        self.ln_post = nn.LayerNorm(state_size)
+    def forward(self, my_h, my_c, global_states, external_input=None):
+        query = my_h.unsqueeze(1)
+        context, _ = self.attention(query, global_states, global_states)
+        context = context.squeeze(1)
+        if external_input is None: external_input = torch.zeros_like(context)
+        rnn_in = torch.cat([context, external_input], dim=-1)
+        new_h, new_c = self.core(rnn_in, (my_h, my_c))
+        return self.ln_post(new_h), new_c
+
+class INN_Factorized_Brain(nn.Module):
+    def __init__(self, obs_space, neuron_dim=64):
+        super().__init__()
+        self.nd = neuron_dim
+        # Inputs
+        self.eye = nn.Sequential(nn.Conv2d(3, 16, 2), nn.ReLU(), nn.MaxPool2d(2), nn.Flatten(), nn.Linear(16*3*3, neuron_dim), nn.ReLU())
+        self.ear = nn.Embedding(obs_space['symbolic_instruction'].n, neuron_dim)
+        # Neurons
+        self.n_vis = INN_Neuron(neuron_dim, 6)
+        self.n_sym = INN_Neuron(neuron_dim, 6)
+        self.n_ref1 = INN_Neuron(neuron_dim, 6)
+        self.n_ref2 = INN_Neuron(neuron_dim, 6)
+        self.n_act_nav = INN_Neuron(neuron_dim, 6) 
+        self.n_act_ops = INN_Neuron(neuron_dim, 6) 
+        # Heads
+        self.head_nav = nn.Linear(neuron_dim, 4) 
+        self.head_ops = nn.Linear(neuron_dim, 4)
+
+    def forward(self, obs, prev_states):
+        vis = self.eye(obs['image'].permute(0,3,1,2))
+        sym = self.ear(obs['symbolic_instruction'])
+        global_h = torch.stack([s[0] for s in prev_states], dim=1)
+        
+        states = []
+        states.extend([self.n_vis(prev_states[0][0], prev_states[0][1], global_h, vis)])
+        states.extend([self.n_sym(prev_states[1][0], prev_states[1][1], global_h, sym)])
+        states.extend([self.n_ref1(prev_states[2][0], prev_states[2][1], global_h, None)])
+        states.extend([self.n_ref2(prev_states[3][0], prev_states[3][1], global_h, None)])
+        states.extend([self.n_act_nav(prev_states[4][0], prev_states[4][1], global_h, None)])
+        states.extend([self.n_act_ops(prev_states[5][0], prev_states[5][1], global_h, None)])
+        
+        new_states = [(h, c) for (h, c) in states]
+        
+        logits_nav = self.head_nav(new_states[4][0])
+        logits_ops = self.head_ops(new_states[5][0])
+        value = nn.Linear(self.nd, 1).to(new_states[4][0].device)(new_states[4][0]) 
+        
+        return logits_nav, logits_ops, value, new_states
+
+# --- 4. ENTRAINEMENT A2C STABLE + EPSILON DECAY ---
+
+def train_rl_keycorridor():
+    # Config Hyperparamètres STABLES
+    lr = 1e-4 
+    timesteps = 50000 
+    neuron_dim = 64
+    
+    # Paramètres A2C
+    gamma = 0.99
+    entropy_coeff = 0.06 
+    
+    # Epsilon Decay (Exploration)
+    epsilon_start = 1.0 
+    epsilon_final = 0.1 
+    epsilon_decay_steps = 15000 
+    
+    # Création de l'environnement
+    env = gym.make('MultimodalKeyCorridor-v0', num_rows=3, num_cols=3, room_size=4, key_color='red', tile_size=16)
+    brain = INN_Factorized_Brain(env.observation_space, neuron_dim=neuron_dim)
+    opt = optim.Adam(brain.parameters(), lr=lr)
+    
+    states = [(torch.zeros(1, neuron_dim), torch.zeros(1, neuron_dim)) for _ in range(6)]
+    
+    print("--- INN V6.2 (KeyCorridor RL) : Avec Bonus d'Exploration (Nouveauté) ---")
+    
+    rewards = []
+    ep_reward = 0
+    obs, _ = env.reset()
+    
+    for t in range(1, timesteps + 1):
+        # 1. Calcul Epsilon 
+        epsilon = max(epsilon_final, epsilon_start - (epsilon_start - epsilon_final) * (t / epsilon_decay_steps))
+        
+        # 2. Forward & Action Selection
+        im = torch.tensor(obs['image'], dtype=torch.float32).unsqueeze(0)/255.0
+        sy = torch.tensor(obs['symbolic_instruction'], dtype=torch.long).unsqueeze(0)
+        states = [(h.detach(), c.detach()) for h,c in states]
+        
+        l_nav, l_ops, val, new_states = brain({'image': im, 'symbolic_instruction': sy}, states)
+        
+        final_action_env = -1
+        
+        if np.random.random() < epsilon:
+            # Action Aléatoire
+            final_action_env = np.random.randint(0, env.action_space.n)
+        else:
+            # Action Politique (Exploitation)
+            dist_nav = torch.distributions.Categorical(logits=l_nav)
+            act_nav = dist_nav.sample()
+            dist_ops = torch.distributions.Categorical(logits=l_ops)
+            act_ops = dist_ops.sample()
+            
+            # Arbitrage (Priorité au bras)
+            if act_ops.item() < 3: 
+                final_action_env = act_ops.item() + 3
+            elif act_nav.item() < 3: 
+                final_action_env = act_nav.item()
+            else:
+                final_action_env = 6 
+        
+        # Step Env
+        next_obs, rew, done, tr, _ = env.step(final_action_env)
+        
+        # 3. LOSS (A2C)
+        
+        # Calcule la log_prob pour l'action jouée
+        if final_action_env < 3: # Nav
+             log_prob = torch.distributions.Categorical(logits=l_nav).log_prob(torch.tensor([final_action_env]))
+        elif final_action_env >= 3 and final_action_env < 6: # Ops
+             log_prob = torch.distributions.Categorical(logits=l_ops).log_prob(torch.tensor([final_action_env - 3]))
+        else: # Wait
+             log_prob = torch.distributions.Categorical(logits=l_nav).log_prob(torch.tensor([3])) # Utilisation de Nav Wait
+            
+        with torch.no_grad():
+            n_im = torch.tensor(next_obs['image'], dtype=torch.float32).unsqueeze(0)/255.0
+            n_sy = torch.tensor(next_obs['symbolic_instruction'], dtype=torch.long).unsqueeze(0)
+            _, _, next_val, _ = brain({'image': n_im, 'symbolic_instruction': n_sy}, new_states) 
+            # Note : on utilise la REWARD TOTALE (incluant intrinsèque) pour le calcul de l'avantage/cible
+            target = rew + gamma * next_val.item() * (1 - int(done)) 
+        
+        advantage = target - val
+        
+        # Policy Loss + Value Loss + Entropy Loss
+        entropy = torch.distributions.Categorical(logits=l_nav).entropy().mean() + torch.distributions.Categorical(logits=l_ops).entropy().mean()
+        loss = -log_prob * advantage.detach() + 0.5 * advantage.pow(2) - entropy_coeff * entropy
+        
+        opt.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(brain.parameters(), 0.5)
+        opt.step()
+        
+        ep_reward += rew
+        obs = next_obs
+        states = new_states
+            
+        if done or tr:
+            rewards.append(ep_reward)
+            ep_reward = 0
+            obs, _ = env.reset()
+            states = [(torch.zeros(1, neuron_dim), torch.zeros(1, neuron_dim)) for _ in range(6)]
+            
+        if t % 500 == 0:
+            avg_extrinsic = np.mean([r - (env.unwrapped.step(env.unwrapped.action_space.sample())[1] - r) for r in rewards[-50:]]) if len(rewards) >= 50 else 0 
+            avg_total = np.mean(rewards[-50:]) if len(rewards) >= 50 else np.mean(rewards) if len(rewards) > 0 else 0
+            
+            # Afficher uniquement la récompense extrinsèque pour suivre la performance réelle
+            print(f"Step {t} | Epsilon: {epsilon:.2f} | Avg REWARD EXTRINSÈQUE (50 ep): {avg_extrinsic:.4f}") 
+
+# --- Lancement ---
+if __name__ == '__main__':
+    try:
+        register(
+            id='MultimodalKeyCorridor-v0',
+            entry_point='__main__:MultimodalKeyCorridorEnv',
+            kwargs={'num_rows': 3, 'num_cols': 3, 'room_size': 4, 'key_color': 'red', 'tile_size': 16},
+            max_episode_steps=200,
+        )
+    except gym.error.UnregisteredEnv:
+        pass
+    
+    # Ré-implémentation des classes nécessaires pour l'exécution (même si inutilisées directement par le KeyCorridor)
+    class MultimodalEmptyEnv(gym.Env):
+        def __init__(self, size=5, render_mode=None): 
+            self.action_space = spaces.Discrete(7)
+            self.observation_space = spaces.Dict({'image': spaces.Box(low=0, high=255, shape=(7, 7, 3), dtype=np.uint8), 'symbolic_instruction': spaces.Discrete(5)})
+            self.size = size
+        def reset(self, seed=None, options=None): 
+            return {'image': np.zeros((7, 7, 3), dtype=np.uint8), 'symbolic_instruction': np.array(0)}, {}
+        def step(self, action): 
+            return {'image': np.zeros((7, 7, 3), dtype=np.uint8), 'symbolic_instruction': np.array(0)}, 0, False, False, {}
+    
+    try:
+        register(
+            id='MultimodalEmpty-v0',
+            entry_point='__main__:MultimodalEmptyEnv',
+            kwargs={'size': 5, 'render_mode': None},
+            max_episode_steps=200,
+        )
+    except gym.error.UnregisteredEnv:
+        pass
+
+    train_rl_keycorridor()
+
+
+    --- INN V6.2 (KeyCorridor RL) : Avec Bonus d'Exploration (Nouveauté) ---
+Step 500 | Epsilon: 0.97 | Avg REWARD EXTRINSÈQUE (50 ep): 0.0000
+Step 1000 | Epsilon: 0.94 | Avg REWARD EXTRINSÈQUE (50 ep): 0.0000
+Step 1500 | Epsilon: 0.91 | Avg REWARD EXTRINSÈQUE (50 ep): 0.0000
+Step 2000 | Epsilon: 0.88 | Avg REWARD EXTRINSÈQUE (50 ep): 0.0000
+Step 2500 | Epsilon: 0.85 | Avg REWARD EXTRINSÈQUE (50 ep): 0.0000
+Step 3000 | Epsilon: 0.82 | Avg REWARD EXTRINSÈQUE (50 ep): 0.0000
+Step 3500 | Epsilon: 0.79 | Avg REWARD EXTRINSÈQUE (50 ep): 0.0000
+Step 4000 | Epsilon: 0.76 | Avg REWARD EXTRINSÈQUE (50 ep): 0.0000
+Step 4500 | Epsilon: 0.73 | Avg REWARD EXTRINSÈQUE (50 ep): 0.0000
+Step 5000 | Epsilon: 0.70 | Avg REWARD EXTRINSÈQUE (50 ep): 0.0000
+Step 5500 | Epsilon: 0.67 | Avg REWARD EXTRINSÈQUE (50 ep): 0.0000
+Step 6000 | Epsilon: 0.64 | Avg REWARD EXTRINSÈQUE (50 ep): 0.0000
+Step 6500 | Epsilon: 0.61 | Avg REWARD EXTRINSÈQUE (50 ep): 0.0000
+Step 7000 | Epsilon: 0.58 | Avg REWARD EXTRINSÈQUE (50 ep): 0.0000
+Step 7500 | Epsilon: 0.55 | Avg REWARD EXTRINSÈQUE (50 ep): 0.0000
+Step 8000 | Epsilon: 0.52 | Avg REWARD EXTRINSÈQUE (50 ep): 0.0000
+Step 8500 | Epsilon: 0.49 | Avg REWARD EXTRINSÈQUE (50 ep): 0.0000
+Step 9000 | Epsilon: 0.46 | Avg REWARD EXTRINSÈQUE (50 ep): 0.0000
+Step 9500 | Epsilon: 0.43 | Avg REWARD EXTRINSÈQUE (50 ep): 0.0000
+Step 10000 | Epsilon: 0.40 | Avg REWARD EXTRINSÈQUE (50 ep): 6.3698
+Step 10500 | Epsilon: 0.37 | Avg REWARD EXTRINSÈQUE (50 ep): 6.2531
+Step 11000 | Epsilon: 0.34 | Avg REWARD EXTRINSÈQUE (50 ep): 6.2156
+Step 11500 | Epsilon: 0.31 | Avg REWARD EXTRINSÈQUE (50 ep): 6.1699
+Step 12000 | Epsilon: 0.28 | Avg REWARD EXTRINSÈQUE (50 ep): 6.1056
+Step 12500 | Epsilon: 0.25 | Avg REWARD EXTRINSÈQUE (50 ep): 6.0930
+Step 13000 | Epsilon: 0.22 | Avg REWARD EXTRINSÈQUE (50 ep): 6.0463
+Step 13500 | Epsilon: 0.19 | Avg REWARD EXTRINSÈQUE (50 ep): 6.0539
+Step 14000 | Epsilon: 0.16 | Avg REWARD EXTRINSÈQUE (50 ep): 6.0091
+Step 14500 | Epsilon: 0.13 | Avg REWARD EXTRINSÈQUE (50 ep): 5.9545
+Step 15000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.9042
+Step 15500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.8812
+Step 16000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.8436
+Step 16500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.7874
+Step 17000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.7271
+Step 17500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.6796
+Step 18000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5846
+Step 18500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.6286
+Step 19000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.6131
+Step 19500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5346
+Step 20000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5079
+Step 20500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5593
+Step 21000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5494
+Step 21500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5887
+Step 22000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.6290
+Step 22500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.6026
+Step 23000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5979
+Step 23500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5769
+Step 24000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5408
+Step 24500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5162
+Step 25000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5063
+Step 25500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5583
+Step 26000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5446
+Step 26500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5724
+Step 27000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.6156
+Step 27500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.6070
+Step 28000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.6878
+Step 28500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.6327
+Step 29000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5862
+Step 29500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.6228
+Step 30000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5988
+Step 30500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5924
+Step 31000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.6012
+Step 31500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.6153
+Step 32000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5885
+Step 32500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5989
+Step 33000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.6392
+Step 33500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.6500
+Step 34000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.6948
+Step 34500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.7650
+Step 35000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.7086
+Step 35500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.6572
+Step 36000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.6845
+Step 36500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.6216
+Step 37000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.6093
+Step 37500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.6086
+Step 38000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5355
+Step 38500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5493
+Step 39000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5564
+Step 39500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5230
+Step 40000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.4804
+Step 40500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.4636
+Step 41000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.4116
+Step 41500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.3814
+Step 42000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.3705
+Step 42500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.4215
+Step 43000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.3844
+Step 43500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.3888
+Step 44000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.4243
+Step 44500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.3900
+Step 45000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.4663
+Step 45500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5501
+Step 46000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5075
+Step 46500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5626
+Step 47000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5346
+Step 47500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5881
+Step 48000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5677
+Step 48500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5801
+Step 49000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5557
+Step 49500 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.5921
+Step 50000 | Epsilon: 0.10 | Avg REWARD EXTRINSÈQUE (50 ep): 5.6030

@@ -1,0 +1,168 @@
+# @title 🧬 INN LIFECYCLE V5: The "Clean" Orthogonal (No Norm)
+# @markdown Retour à la V3 (qui marchait) mais avec Init Orthogonale et D_STATE=256.
+# @markdown La LayerNorm a été retirée car elle empêchait la saturation des portes mémoire.
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import math
+import random
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"🚀 Running V5 on {DEVICE}")
+
+# CONFIGURATION "V3 BOOSTED"
+D_MODEL = 128
+N_NEURONS = 4
+D_STATE = 256   # Mémoire doublée pour plus de stabilité naturelle
+VOCAB_SIZE = 100
+SEQ_LEN = 64
+LR = 1e-3
+
+class OrthoNeuron(nn.Module):
+    def __init__(self, d_model, d_state):
+        super().__init__()
+        self.d_model = d_model
+        self.gru = nn.GRU(d_model, d_state, batch_first=True)
+        self.out_proj = nn.Linear(d_state, d_model)
+        
+        # Juste l'init, pas de LayerNorm destructrice
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.orthogonal_(m.weight)
+        elif isinstance(m, nn.GRU):
+            for name, param in m.named_parameters():
+                if 'weight_hh' in name:
+                    nn.init.orthogonal_(param) # Crucial pour RNN long terme
+                if 'weight_ih' in name:
+                    nn.init.xavier_uniform_(param)
+
+    def forward(self, x, h_prev):
+        if h_prev is None:
+            batch_size = x.size(0)
+            h_prev = torch.zeros(1, batch_size, self.gru.hidden_size, device=x.device)
+            
+        out_gru, h_new = self.gru(x, h_prev)
+        return self.out_proj(out_gru), h_new
+
+class GlobalWorkspace(nn.Module):
+    def __init__(self, d_model, n_neurons):
+        super().__init__()
+        self.query = nn.Linear(d_model, d_model)
+        self.key = nn.Linear(d_model, d_model)
+        self.value = nn.Linear(d_model, d_model)
+        self.output = nn.Linear(d_model, d_model)
+        self.norm = nn.LayerNorm(d_model) # Celle-ci est OK (sur le bus, pas la mémoire)
+
+    def forward(self, neuron_states):
+        B, S, N, D = neuron_states.shape
+        flat = neuron_states.view(B * S, N, D)
+        q = self.query(flat)
+        k = self.key(flat)
+        v = self.value(flat)
+        attn = F.softmax(torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(D), dim=-1)
+        out = self.output(torch.matmul(attn, v))
+        return self.norm(out + flat).view(B, S, N, D)
+
+class LifecycleINN_V5(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embedding = nn.Embedding(VOCAB_SIZE, D_MODEL)
+        self.neurons = nn.ModuleList([OrthoNeuron(D_MODEL, D_STATE) for _ in range(N_NEURONS)])
+        self.workspace = GlobalWorkspace(D_MODEL, N_NEURONS)
+        self.readout = nn.Linear(D_MODEL * N_NEURONS, VOCAB_SIZE)
+
+    def forward(self, x, hidden_states=None):
+        B, S = x.shape
+        x_emb = self.embedding(x)
+        if hidden_states is None: hidden_states = [None] * N_NEURONS
+        outs, new_h = [], []
+        for i, n in enumerate(self.neurons):
+            o, h = n(x_emb, hidden_states[i])
+            outs.append(o)
+            new_h.append(h)
+        stack = torch.stack(outs, dim=2)
+        integrated = self.workspace(stack)
+        return self.readout(integrated.view(B, S, -1)), new_h
+
+class HighDensityStream:
+    def generate_chunk(self, batch_size, seq_len):
+        x = torch.randint(20, VOCAB_SIZE, (batch_size, seq_len))
+        y = x.clone()
+        mask = torch.zeros_like(x).float()
+        for b in range(batch_size):
+            k, v = random.randint(10, 19), random.randint(1, 9)
+            x[b, 5], x[b, 6] = k, v # Store early
+            qp = random.randint(20, seq_len - 2)
+            x[b, qp], x[b, qp+1] = 99, k
+            y[b, qp+1] = v
+            mask[b, qp+1] = 1.0
+        return x.to(DEVICE), y.to(DEVICE), mask.to(DEVICE)
+
+def run_v5():
+    model = LifecycleINN_V5().to(DEVICE)
+    opt = optim.Adam(model.parameters(), lr=LR)
+    stream = HighDensityStream()
+    
+    print("🚄 TRAINING V5 (Ortho Only)...")
+    for step in range(1501):
+        x, y, mask = stream.generate_chunk(32, SEQ_LEN)
+        logits, _ = model(x, None)
+        loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), y.view(-1), reduction='none')
+        loss = (loss * mask.view(-1)).sum() / (mask.sum() + 1e-6)
+        
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        
+        if step % 100 == 0:
+            print(f"Step {step} | Loss: {loss.item():.4f}")
+            if loss.item() < 0.01:
+                print("✅ Converged.")
+                break
+                
+    print("\n🌌 BENCHMARK V5: 10,000 HORIZON")
+    model.eval()
+    horizons = [2000, 5000, 10000]
+    for H in horizons:
+        key, val = 12, 7
+        h = None
+        _, h = model(torch.tensor([[key, val]]).to(DEVICE), h)
+        for _ in range(H // 100):
+            noise = torch.randint(20, 99, (1, 100)).to(DEVICE)
+            _, h = model(noise, h)
+        logits, _ = model(torch.tensor([[99, key]]).to(DEVICE), h)
+        pred = logits[0, -1].argmax().item()
+        conf = F.softmax(logits[0, -1], dim=0)[pred].item()
+        res = "✅" if pred == val else f"❌ ({pred})"
+        print(f"H={H} | {res} | Conf: {conf:.1%}")
+
+if __name__ == "__main__":
+    run_v5()
+
+
+
+🚀 Running V5 on cuda
+🚄 TRAINING V5 (Ortho Only)...
+Step 0 | Loss: 4.8472
+Step 100 | Loss: 2.3290
+Step 200 | Loss: 2.3117
+Step 300 | Loss: 2.2990
+Step 400 | Loss: 2.1961
+Step 500 | Loss: 2.2256
+Step 600 | Loss: 1.9456
+Step 700 | Loss: 2.2219
+Step 800 | Loss: 2.1297
+Step 900 | Loss: 1.9118
+Step 1000 | Loss: 1.3302
+Step 1100 | Loss: 0.8661
+Step 1200 | Loss: 0.0073
+✅ Converged.
+
+🌌 BENCHMARK V5: 10,000 HORIZON
+H=2000 | ✅ | Conf: 94.7%
+H=5000 | ✅ | Conf: 90.4%
+H=10000 | ✅ | Conf: 89.5%

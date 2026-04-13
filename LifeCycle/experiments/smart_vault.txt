@@ -1,0 +1,282 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import matplotlib.pyplot as plt
+import random
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"🔓 DEATHMATCH V2: Smart Vault vs Mamba on {DEVICE}")
+
+# Hyperparamètres
+D_MODEL = 128
+D_STATE = 256
+VOCAB_SIZE = 100
+LR = 2e-3 # Un peu plus de learning rate pour apprendre le trigger
+SEQ_LEN = 32 
+
+KEY_TOKEN = 10
+OP_TOKEN = 99
+NOISE_START = 20
+
+# ==============================================================================
+# 1. INN V20: SMART VAULT (Input-Dependent Gating)
+# ==============================================================================
+class SmartVaultNeuron(nn.Module):
+    def __init__(self, d_model, d_state):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        
+        # On décompose le GRU pour contrôler la porte Z (Update Gate)
+        self.input_proj = nn.Linear(d_model, d_state * 3) # x -> z, r, h_tilde
+        self.hidden_proj = nn.Linear(d_state, d_state * 3) # h -> z, r, h_tilde
+        
+        with torch.no_grad():
+            # 1. IDENTITÉ SUR LA MÉMOIRE (W_hh)
+            # On annule tout sauf la partie 'h_tilde' qui doit être l'identité
+            self.hidden_proj.weight.zero_()
+            
+            # La partie h_tilde (3ème bloc) est l'identité
+            # h_new = (1-z)*h + z*h_tilde. Si z=1, h_new = h_tilde.
+            # On veut h_tilde = h_prev + x. Donc h_partie doit être identité.
+            i_start = 2 * d_state
+            i_end = 3 * d_state
+            self.hidden_proj.weight[i_start:i_end].copy_(torch.eye(d_state))
+            
+            # 2. LE BIAIS DE FERMETURE (-15.0)
+            # On met le biais de la porte Z (Update) à -15 par défaut.
+            self.input_proj.bias.zero_()
+            self.hidden_proj.bias.zero_()
+            
+            # Update Gate (z) est le premier bloc [0:d_state]
+            # Biais -15 sur l'entrée pour que par défaut, z soit proche de 0
+            self.input_proj.bias[0:d_state].fill_(-15.0) 
+            
+        # ON FIGE LA RÉCURRENCE (Le Coffre)
+        self.hidden_proj.weight.requires_grad = False
+        self.hidden_proj.bias.requires_grad = False
+        
+        # ON LAISSE L'ENTRÉE LIBRE (La Serrure)
+        # Le réseau peut apprendre "Si je vois KEY_TOKEN, j'ajoute +20 au biais"
+        self.input_proj.weight.requires_grad = True
+        self.input_proj.bias.requires_grad = True
+
+    def forward(self, x, h):
+        if h is None: h = torch.zeros(x.size(0), self.d_state, device=x.device)
+        
+        # Calcul des portes manuellement pour insérer notre logique
+        # x: [Batch, D]
+        gates_x = self.input_proj(x) 
+        gates_h = self.hidden_proj(h)
+        
+        x_z, x_r, x_h = gates_x.chunk(3, dim=1)
+        h_z, h_r, h_h = gates_h.chunk(3, dim=1)
+        
+        # Update Gate z
+        # C'est ici que la magie opère. x_z contient le biais -15 + Wx*x
+        z = torch.sigmoid(x_z + h_z) 
+        
+        # Reset Gate r (On laisse standard)
+        r = torch.sigmoid(x_r + h_r)
+        
+        # Candidate h_tilde
+        h_tilde = torch.tanh(x_h + (r * h_h))
+        
+        # Règle de mise à jour GRU
+        h_new = (1 - z) * h + z * h_tilde
+        
+        return h_new
+
+class INN_SmartVault(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embedding = nn.Embedding(VOCAB_SIZE, D_MODEL)
+        self.vault = SmartVaultNeuron(D_MODEL, D_STATE)
+        self.readout = nn.Linear(D_STATE, VOCAB_SIZE)
+    
+    def forward(self, x, h=None):
+        # x: [B, S]
+        emb = self.embedding(x) # [B, S, D]
+        
+        # Boucle manuelle car SmartVaultNeuron est une Cell
+        outputs = []
+        current_h = h
+        
+        for t in range(x.size(1)):
+            current_h = self.vault(emb[:, t, :], current_h)
+            outputs.append(current_h)
+            
+        # Stack pour readout
+        outputs = torch.stack(outputs, dim=1)
+        return self.readout(outputs), current_h
+
+# ==============================================================================
+# 2. MAMBA SIM (Identique)
+# ==============================================================================
+class MambaSim(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embedding = nn.Embedding(VOCAB_SIZE, D_MODEL)
+        self.gru = nn.GRU(D_MODEL, D_STATE, batch_first=True)
+        self.readout = nn.Linear(D_STATE, VOCAB_SIZE)
+        for name, param in self.gru.named_parameters():
+            if 'weight_hh' in name: nn.init.orthogonal_(param)
+            
+    def forward(self, x, h=None):
+        if h is None: h = torch.zeros(1, x.size(0), self.gru.hidden_size, device=x.device)
+        emb = self.embedding(x)
+        out, h_new = self.gru(emb, h)
+        return self.readout(out), h_new.detach()
+
+# ==============================================================================
+# 3. ENGINE
+# ==============================================================================
+
+class SingleNeedleStream:
+    def generate_chunk(self, batch_size, seq_len):
+        x = torch.randint(NOISE_START, VOCAB_SIZE, (batch_size, seq_len))
+        y = x.clone(); mask = torch.zeros_like(x).float()
+        for b in range(batch_size):
+            val = random.randint(1, 9)
+            x[b, 0] = KEY_TOKEN; x[b, 1] = val 
+            x[b, -2] = OP_TOKEN; y[b, -1] = val; mask[b, -1] = 1.0 
+        return x.to(DEVICE), y.to(DEVICE), mask.to(DEVICE)
+
+def train_until_convergence(model, name):
+    print(f"\n⚡ Training {name}...")
+    model.to(DEVICE)
+    opt = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LR)
+    stream = SingleNeedleStream()
+    
+    for step in range(3001):
+        x, y, mask = stream.generate_chunk(32, SEQ_LEN)
+        
+        if name == "INN (Smart)":
+            logits, _ = model(x, None)
+        else:
+            logits, _ = model(x, None)
+            
+        loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), y.view(-1), reduction='none')
+        loss = (loss * mask.view(-1)).sum() / (mask.sum() + 1e-6)
+        
+        opt.zero_grad(); loss.backward(); opt.step()
+        
+        if step % 500 == 0:
+            print(f"  Step {step} | Loss: {loss.item():.4f}")
+            if loss.item() < 0.01:
+                print("  ✅ Converged.")
+                return model
+    return model
+
+def benchmark_deathmatch(inn_model, mamba_model):
+    print("\n💀 STARTING DEATHMATCH V2...")
+    horizons = [2000, 10000, 50000, 100000, 200000, 500000] # On pousse jusqu'à 500k !
+    
+    inn_scores, mamba_scores = [], []
+    
+    for H in horizons:
+        print(f"\n--- Horizon {H} Tokens ---")
+        val = 7
+        
+        # 1. Store
+        start_seq = torch.tensor([[KEY_TOKEN, val]]).to(DEVICE)
+        
+        # INN: forward manuel
+        with torch.no_grad():
+            _, h_inn = inn_model(start_seq, None)
+            _, h_mamba = mamba_model(start_seq, None)
+        
+        # 2. Wait
+        chunk_size = 1000 
+        n_chunks = H // chunk_size
+        
+        for _ in range(n_chunks):
+            noise = torch.randint(NOISE_START, VOCAB_SIZE, (1, chunk_size)).to(DEVICE)
+            with torch.no_grad():
+                # Pour INN, comme c'est une Cell custom dans une boucle, 
+                # on appelle le forward normal qui gère la boucle
+                _, h_inn = inn_model(noise, h_inn)
+                _, h_mamba = mamba_model(noise, h_mamba)
+                
+        # 3. Query
+        query_seq = torch.tensor([[OP_TOKEN]]).to(DEVICE)
+        
+        with torch.no_grad():
+            logits_inn, _ = inn_model(query_seq, h_inn)
+            # Le logits INN est [B, S, C], on veut le dernier token
+            pred_inn = logits_inn[0, -1].argmax().item()
+            conf_inn = F.softmax(logits_inn[0, -1], dim=0)[pred_inn].item()
+            
+            logits_mamba, _ = mamba_model(query_seq, h_mamba)
+            pred_mamba = logits_mamba[0, -1].argmax().item()
+            conf_mamba = F.softmax(logits_mamba[0, -1], dim=0)[pred_mamba].item()
+        
+        inn_ok = (pred_inn == val)
+        mamba_ok = (pred_mamba == val)
+        
+        print(f"INN   (Smart) | {'✅' if inn_ok else '❌'} (Pred {pred_inn}) | Conf: {conf_inn:.1%}")
+        print(f"Mamba (Learn) | {'✅' if mamba_ok else '❌'} (Pred {pred_mamba}) | Conf: {conf_mamba:.1%}")
+        
+        inn_scores.append(100 if inn_ok else 0)
+        mamba_scores.append(100 if mamba_ok else 0)
+        
+    return horizons, inn_scores, mamba_scores
+
+if __name__ == "__main__":
+    inn = INN_SmartVault()
+    inn = train_until_convergence(inn, "INN (Smart)")
+    
+    mamba = MambaSim()
+    mamba = train_until_convergence(mamba, "Mamba Sim")
+    
+    horizons, y_inn, y_mamba = benchmark_deathmatch(inn, mamba)
+    
+    # Plot final
+    plt.figure(figsize=(10, 6))
+    plt.plot(horizons, y_inn, 'o-', color='teal', linewidth=3, label='INN (Smart Vault)')
+    plt.plot(horizons, y_mamba, 'x--', color='orange', linewidth=2, label='Mamba (Learned)')
+    plt.xscale('log'); plt.xlabel('Horizon'); plt.ylabel('Success'); plt.legend(); plt.grid(True)
+    plt.show()
+
+
+
+    🔓 DEATHMATCH V2: Smart Vault vs Mamba on cuda
+
+⚡ Training INN (Smart)...
+  Step 0 | Loss: 4.6133
+  Step 500 | Loss: 0.1895
+  Step 1000 | Loss: 0.0110
+  Step 1500 | Loss: 0.0053
+  ✅ Converged.
+
+⚡ Training Mamba Sim...
+  Step 0 | Loss: 4.6154
+  Step 500 | Loss: 0.0012
+  ✅ Converged.
+
+💀 STARTING DEATHMATCH V2...
+
+--- Horizon 2000 Tokens ---
+INN   (Smart) | ✅ (Pred 7) | Conf: 99.0%
+Mamba (Learn) | ✅ (Pred 7) | Conf: 99.5%
+
+--- Horizon 10000 Tokens ---
+INN   (Smart) | ✅ (Pred 7) | Conf: 98.8%
+Mamba (Learn) | ✅ (Pred 7) | Conf: 98.4%
+
+--- Horizon 50000 Tokens ---
+INN   (Smart) | ✅ (Pred 7) | Conf: 97.8%
+Mamba (Learn) | ✅ (Pred 7) | Conf: 77.3%
+
+--- Horizon 100000 Tokens ---
+INN   (Smart) | ✅ (Pred 7) | Conf: 95.7%
+Mamba (Learn) | ✅ (Pred 7) | Conf: 47.2%
+
+--- Horizon 200000 Tokens ---
+INN   (Smart) | ✅ (Pred 7) | Conf: 87.4%
+Mamba (Learn) | ❌ (Pred 1) | Conf: 47.8%
+
+--- Horizon 500000 Tokens ---
+INN   (Smart) | ❌ (Pred 5) | Conf: 51.6%
+Mamba (Learn) | ❌ (Pred 1) | Conf: 65.4%

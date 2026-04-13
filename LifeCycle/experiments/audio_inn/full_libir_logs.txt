@@ -1,0 +1,1702 @@
+
+"""
+Top-Tier Paper Benchmark: Efficient Audio Modeling
+==================================================
+Comparaison rigoureuse "Iso-Parameter" (~12M) entre :
+1. INN (Intelligent Neural Network) - Ours (Vectorized Implementation)
+2. WaveNet (Causal Dilated Convolutions) - Baseline SOTA Efficiency
+3. Transformer (Attention Only) - Baseline SOTA Generalist
+
+Task: Discrete Audio Token Modeling (LibriSpeech -> EnCodec)
+Metric: Bits per Dimension (BPD) & Perplexity (Ppl)
+"""
+
+import os
+import time
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import torchaudio
+import soundfile as sf
+import glob
+import pandas as pd
+from torch.utils.data import DataLoader, Dataset
+from transformers import EncodecModel, AutoProcessor
+
+# ==============================================================================
+# CONFIGURATION SCIENTIFIQUE
+# ==============================================================================
+CONFIG = {
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "sample_rate": 24000,
+    "vocab_size": 1024,
+    "seq_len": 1024,      # 1024 tokens
+    "batch_size": 64,     # A100 optimized
+    "epochs": 10,         # 10 Epochs possible thanks to Vectorization (~4h runtime)
+    "lr": 1e-3,           # Aggressive start
+    "seed": 42,
+    "target_params": 12_000_000, 
+    "log_dir": "./benchmark_logs"
+}
+
+if not os.path.exists(CONFIG["log_dir"]):
+    os.makedirs(CONFIG["log_dir"])
+
+# ==============================================================================
+# 1. INN ARCHITECTURE (Ours - Vectorized & Optimized)
+# ==============================================================================
+class INN_Neuron(nn.Module):
+    def __init__(self, d_model, d_rnn):
+        super().__init__()
+        # Vectorized LSTM: Processes (Batch, Seq, Dim) in one cuDNN call
+        self.lstm = nn.LSTM(d_model, d_rnn, batch_first=True)
+        self.out_proj = nn.Linear(d_rnn, d_model)
+        
+    def forward(self, x):
+        # x: (batch, seq, d_model)
+        lstm_out, _ = self.lstm(x)
+        return self.out_proj(lstm_out)
+
+class INN_Model(nn.Module):
+    def __init__(self, vocab_size, d_model, n_neurons, d_rnn, n_heads):
+        super().__init__()
+        self.d_model = d_model
+        self.n_neurons = n_neurons
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        
+        # Parallel Experts
+        self.neurons = nn.ModuleList([INN_Neuron(d_model, d_rnn) for _ in range(n_neurons)])
+        
+        # Global Mixer (Attention)
+        self.mixer_attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.norm_mix = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size)
+        
+    def forward(self, x):
+        batch_size, seq_len = x.size()
+        x_emb = self.embedding(x) # (batch, seq, d_model)
+        
+        # 1. Parallel Neuron Execution (Vectorized)
+        # Each neuron processes the full sequence independently
+        # Result: List of (batch, seq, d_model)
+        neuron_outputs = [n(x_emb) for n in self.neurons] 
+        
+        # Stack: (batch, seq, n_neurons, d_model)
+        stack = torch.stack(neuron_outputs, dim=2)
+        
+        # 2. Global Mixing (Time-step independent mixing)
+        # Flatten batch and seq to treat each timestep as a sample
+        stack_flat = stack.reshape(-1, self.n_neurons, self.d_model) # (batch*seq, n_neurons, d_model)
+        query_flat = x_emb.reshape(-1, 1, self.d_model)              # (batch*seq, 1, d_model)
+        
+        # Attention: "Given context (Query), which Neuron (Key/Value) should I listen to?"
+        attn_out, _ = self.mixer_attn(query_flat, stack_flat, stack_flat)
+        
+        # Residual + Norm
+        mixed = self.norm_mix(attn_out.squeeze(1) + query_flat.squeeze(1))
+        
+        # Output Head
+        logits = self.head(mixed)
+        
+        # Reshape back to sequence
+        return logits.view(batch_size, seq_len, -1)
+
+# ==============================================================================
+# 2. WAVENET ARCHITECTURE (Baseline 1 - Corrected Causal Padding)
+# ==============================================================================
+class CausalConv1d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation=1):
+        super().__init__()
+        self.padding = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, padding=0, dilation=dilation)
+
+    def forward(self, x):
+        # Explicit Left Padding for strict causality
+        if self.padding > 0:
+            x = F.pad(x, (self.padding, 0))
+        return self.conv(x)
+
+class ResidualBlock(nn.Module):
+    def __init__(self, res_channels, skip_channels, dilation):
+        super().__init__()
+        self.filter_conv = CausalConv1d(res_channels, res_channels, 2, dilation)
+        self.gate_conv = CausalConv1d(res_channels, res_channels, 2, dilation)
+        self.res_conv = nn.Conv1d(res_channels, res_channels, 1)
+        self.skip_conv = nn.Conv1d(res_channels, skip_channels, 1)
+
+    def forward(self, x):
+        filter_out = torch.tanh(self.filter_conv(x))
+        gate_out = torch.sigmoid(self.gate_conv(x))
+        x_gated = filter_out * gate_out
+        res_out = self.res_conv(x_gated)
+        skip_out = self.skip_conv(x_gated)
+        return (x + res_out) * math.sqrt(0.5), skip_out
+
+class WaveNet_Model(nn.Module):
+    def __init__(self, vocab_size, d_model, n_layers, n_blocks):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.layers = nn.ModuleList()
+        for _ in range(n_blocks):
+            for i in range(n_layers):
+                dilation = 2 ** i
+                self.layers.append(ResidualBlock(d_model, d_model, dilation))
+        
+        self.end_conv_1 = nn.Conv1d(d_model, d_model, 1)
+        self.end_conv_2 = nn.Conv1d(d_model, vocab_size, 1)
+
+    def forward(self, x):
+        x = self.embedding(x).transpose(1, 2)
+        skip_connections = []
+        for layer in self.layers:
+            x, skip = layer(x)
+            skip_connections.append(skip)
+        out = sum(skip_connections)
+        out = F.relu(out)
+        out = F.relu(self.end_conv_1(out))
+        logits = self.end_conv_2(out)
+        return logits.transpose(1, 2)
+
+# ==============================================================================
+# 3. TRANSFORMER ARCHITECTURE (Baseline 2 - Generalist King)
+# ==============================================================================
+class Transformer_Model(nn.Module):
+    def __init__(self, vocab_size, d_model, n_head, n_layers):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_encoder = nn.Parameter(torch.zeros(1, 2048, d_model)) # Max len 2048
+        
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_head, batch_first=True, dim_feedforward=d_model*4)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.head = nn.Linear(d_model, vocab_size)
+
+    def forward(self, x):
+        seq_len = x.size(1)
+        mask = torch.triu(torch.ones(seq_len, seq_len) * float('-inf'), diagonal=1).to(x.device)
+        x = self.embedding(x) + self.pos_encoder[:, :seq_len, :]
+        x = self.transformer(x, mask=mask, is_causal=True)
+        return self.head(x)
+
+# ==============================================================================
+# DATASET & UTILS
+# ==============================================================================
+class LibriSpeechTokenized(Dataset):
+    def __init__(self, root, url="train-clean-100"):
+        self.files = sorted(glob.glob(os.path.join(root, "LibriSpeech", url, "**", "*.flac"), recursive=True))
+        if len(self.files) == 0:
+            print(f"Downloading LibriSpeech {url} (6.3GB)... This may take a few minutes.")
+            torchaudio.datasets.LIBRISPEECH(root=root, url=url, download=True)
+            self.files = sorted(glob.glob(os.path.join(root, "LibriSpeech", url, "**", "*.flac"), recursive=True))
+        print(f"📚 Dataset Loaded: {len(self.files)} files.")
+        self.resampler = torchaudio.transforms.Resample(orig_freq=16000, new_freq=CONFIG["sample_rate"])
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        try:
+            wav, sr = sf.read(self.files[idx])
+            waveform = torch.from_numpy(wav).float()
+            if waveform.ndim == 1: waveform = waveform.unsqueeze(0)
+            else: waveform = waveform.t()
+            return self.resampler(waveform)
+        except: return torch.zeros(1, CONFIG["sample_rate"])
+
+class AudioTokenizer:
+    def __init__(self, device):
+        self.device = device
+        self.model = EncodecModel.from_pretrained("facebook/encodec_24khz").to(device)
+        self.processor = AutoProcessor.from_pretrained("facebook/encodec_24khz")
+        self.model.eval()
+
+    @torch.no_grad()
+    def encode(self, waveform):
+        raw_audio = [w.squeeze(0).cpu().numpy() for w in waveform]
+        inputs = self.processor(raw_audio=raw_audio, sampling_rate=CONFIG["sample_rate"], return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        outputs = self.model.encode(**inputs)
+        raw_codes = outputs.audio_codes[0]
+        if raw_codes.ndim == 4: raw_codes = raw_codes.squeeze(0)
+        return raw_codes[:, 0, :]
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def run_benchmark(model_name, model, dl, tokenizer):
+    print(f"\n🥊 STARTING BENCHMARK: {model_name}")
+    print(f"📊 Parameters: {count_parameters(model):,}")
+    
+    model = model.to(CONFIG["device"])
+    
+    # COMPILATION: Safe now with Vectorized layers (standard cuDNN)
+    try:
+        print("⚡ Compiling model with torch.compile()...")
+        model = torch.compile(model, mode="reduce-overhead")
+    except Exception as e:
+        print(f"⚠️ Compilation failed: {e}")
+
+    optimizer = optim.AdamW(model.parameters(), lr=CONFIG["lr"])
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG["epochs"] * len(dl))
+    criterion = nn.CrossEntropyLoss()
+    
+    stats = []
+    start_time = time.time()
+    step = 0
+    
+    model.train()
+    
+    for epoch in range(CONFIG["epochs"]):
+        for batch_waves in dl:
+            batch_waves = batch_waves.to(CONFIG["device"])
+            with torch.no_grad():
+                tokens = tokenizer.encode(batch_waves)
+            
+            if tokens.size(1) > CONFIG["seq_len"]: tokens = tokens[:, :CONFIG["seq_len"]]
+            inputs, targets = tokens[:, :-1], tokens[:, 1:]
+            if inputs.size(1) < 10: continue
+
+            optimizer.zero_grad()
+            logits = model(inputs)
+            loss = criterion(logits.reshape(-1, CONFIG["vocab_size"]), targets.reshape(-1))
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            
+            step += 1
+            if step % 10 == 0:
+                ppl = math.exp(loss.item())
+                bits_per_token = loss.item() / math.log(2)
+                elapsed = time.time() - start_time
+                print(f"{model_name} | Step {step} | Loss: {loss.item():.4f} | Ppl: {ppl:.2f} | Bits/Tok: {bits_per_token:.3f} | Time: {elapsed:.0f}s")
+                stats.append({
+                    "model": model_name,
+                    "step": step,
+                    "loss": loss.item(),
+                    "ppl": ppl,
+                    "bits_per_token": bits_per_token,
+                    "time": elapsed
+                })
+    
+    # Save Model
+    torch.save(model.state_dict(), f"{CONFIG['log_dir']}/{model_name}_final.pt")
+    return stats
+
+def main():
+    # Optimization for A100
+    torch.set_float32_matmul_precision('high')
+    
+    print("🚀 LAUNCHING TOP-TIER AUDIO BENCHMARK (Vectorized INN - 10 Epochs)")
+    
+    tokenizer = AudioTokenizer(CONFIG["device"])
+    ds = LibriSpeechTokenized(root="./librispeech_data")
+    
+    def collate_fn(batch):
+        max_len = min(max([w.size(-1) for w in batch]), 24000*8)
+        padded = torch.zeros(len(batch), 1, max_len)
+        for i, w in enumerate(batch):
+            sl = min(w.size(-1), max_len)
+            padded[i, :, :sl] = w[:, :sl]
+        return padded
+
+    dl = DataLoader(ds, batch_size=CONFIG["batch_size"], shuffle=True, collate_fn=collate_fn, num_workers=0)
+    
+    # --- MODEL SETUP (CALIBRATED FOR ~12M PARAMS) ---
+    
+    # 1. INN (Reference - Efficient Distributed)
+    # 20 Neurones (256 dim).
+    # Removed dead code inside neurons -> More params for active neurons.
+    # Params: 20 * (LSTM(256,256) + Linear) + Mixer + Embed ~= 12M
+    inn_model = INN_Model(
+        vocab_size=CONFIG["vocab_size"], d_model=256, n_neurons=20, d_rnn=256, n_heads=8
+    )
+    
+    # 2. WaveNet (Medium)
+    wavenet_model = WaveNet_Model(
+        vocab_size=CONFIG["vocab_size"], d_model=256, n_layers=10, n_blocks=3
+    )
+    
+    # 3. Transformer (Standard GPT-2 Small size)
+    transformer_model = Transformer_Model(
+        vocab_size=CONFIG["vocab_size"], d_model=512, n_head=8, n_layers=4
+    )
+    
+    models = [
+        ("INN", inn_model),
+        ("WaveNet", wavenet_model),
+        ("Transformer", transformer_model)
+    ]
+    
+    all_stats = []
+    
+    for name, model in models:
+        stats = run_benchmark(name, model, dl, tokenizer)
+        all_stats.extend(stats)
+        
+    # Save CSV
+    df = pd.DataFrame(all_stats)
+    df.to_csv(f"{CONFIG['log_dir']}/benchmark_results.csv", index=False)
+    print("\n✅ Benchmark Complete. Results saved to benchmark_results.csv")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+🚀 LAUNCHING TOP-TIER AUDIO BENCHMARK (Vectorized INN - 10 Epochs)
+📚 Dataset Loaded: 28539 files.
+
+🥊 STARTING BENCHMARK: INN
+📊 Parameters: 12,631,552
+⚡ Compiling model with torch.compile()...
+INN | Step 10 | Loss: 5.7459 | Ppl: 312.89 | Bits/Tok: 8.290 | Time: 11s
+INN | Step 20 | Loss: 4.7634 | Ppl: 117.14 | Bits/Tok: 6.872 | Time: 21s
+INN | Step 30 | Loss: 4.5516 | Ppl: 94.78 | Bits/Tok: 6.567 | Time: 32s
+INN | Step 40 | Loss: 4.4107 | Ppl: 82.32 | Bits/Tok: 6.363 | Time: 42s
+INN | Step 50 | Loss: 4.1456 | Ppl: 63.15 | Bits/Tok: 5.981 | Time: 53s
+INN | Step 60 | Loss: 3.9478 | Ppl: 51.82 | Bits/Tok: 5.695 | Time: 63s
+INN | Step 70 | Loss: 3.8929 | Ppl: 49.05 | Bits/Tok: 5.616 | Time: 73s
+INN | Step 80 | Loss: 4.0379 | Ppl: 56.71 | Bits/Tok: 5.825 | Time: 84s
+INN | Step 90 | Loss: 3.9298 | Ppl: 50.90 | Bits/Tok: 5.669 | Time: 94s
+INN | Step 100 | Loss: 3.6595 | Ppl: 38.84 | Bits/Tok: 5.280 | Time: 105s
+INN | Step 110 | Loss: 3.6797 | Ppl: 39.64 | Bits/Tok: 5.309 | Time: 115s
+INN | Step 120 | Loss: 3.7137 | Ppl: 41.01 | Bits/Tok: 5.358 | Time: 126s
+INN | Step 130 | Loss: 3.6608 | Ppl: 38.89 | Bits/Tok: 5.281 | Time: 137s
+INN | Step 140 | Loss: 3.4929 | Ppl: 32.88 | Bits/Tok: 5.039 | Time: 147s
+INN | Step 150 | Loss: 3.4864 | Ppl: 32.67 | Bits/Tok: 5.030 | Time: 158s
+INN | Step 160 | Loss: 3.5963 | Ppl: 36.46 | Bits/Tok: 5.188 | Time: 168s
+INN | Step 170 | Loss: 3.3688 | Ppl: 29.04 | Bits/Tok: 4.860 | Time: 179s
+INN | Step 180 | Loss: 3.5823 | Ppl: 35.96 | Bits/Tok: 5.168 | Time: 189s
+INN | Step 190 | Loss: 3.4618 | Ppl: 31.87 | Bits/Tok: 4.994 | Time: 200s
+INN | Step 200 | Loss: 3.6592 | Ppl: 38.83 | Bits/Tok: 5.279 | Time: 210s
+INN | Step 210 | Loss: 3.3388 | Ppl: 28.18 | Bits/Tok: 4.817 | Time: 221s
+INN | Step 220 | Loss: 3.4470 | Ppl: 31.41 | Bits/Tok: 4.973 | Time: 231s
+INN | Step 230 | Loss: 3.5801 | Ppl: 35.88 | Bits/Tok: 5.165 | Time: 242s
+INN | Step 240 | Loss: 3.4740 | Ppl: 32.26 | Bits/Tok: 5.012 | Time: 252s
+INN | Step 250 | Loss: 3.4614 | Ppl: 31.86 | Bits/Tok: 4.994 | Time: 263s
+INN | Step 260 | Loss: 3.5873 | Ppl: 36.14 | Bits/Tok: 5.175 | Time: 274s
+INN | Step 270 | Loss: 3.5918 | Ppl: 36.30 | Bits/Tok: 5.182 | Time: 284s
+INN | Step 280 | Loss: 3.3563 | Ppl: 28.68 | Bits/Tok: 4.842 | Time: 295s
+INN | Step 290 | Loss: 3.4593 | Ppl: 31.80 | Bits/Tok: 4.991 | Time: 305s
+INN | Step 300 | Loss: 3.4924 | Ppl: 32.87 | Bits/Tok: 5.039 | Time: 316s
+INN | Step 310 | Loss: 3.5754 | Ppl: 35.71 | Bits/Tok: 5.158 | Time: 326s
+INN | Step 320 | Loss: 3.5018 | Ppl: 33.17 | Bits/Tok: 5.052 | Time: 337s
+INN | Step 330 | Loss: 3.3898 | Ppl: 29.66 | Bits/Tok: 4.890 | Time: 348s
+INN | Step 340 | Loss: 3.4195 | Ppl: 30.55 | Bits/Tok: 4.933 | Time: 358s
+INN | Step 350 | Loss: 3.4023 | Ppl: 30.03 | Bits/Tok: 4.908 | Time: 369s
+INN | Step 360 | Loss: 3.5599 | Ppl: 35.16 | Bits/Tok: 5.136 | Time: 379s
+INN | Step 370 | Loss: 3.3946 | Ppl: 29.80 | Bits/Tok: 4.897 | Time: 390s
+INN | Step 380 | Loss: 3.3915 | Ppl: 29.71 | Bits/Tok: 4.893 | Time: 400s
+INN | Step 390 | Loss: 3.3594 | Ppl: 28.77 | Bits/Tok: 4.847 | Time: 411s
+INN | Step 400 | Loss: 3.3687 | Ppl: 29.04 | Bits/Tok: 4.860 | Time: 421s
+INN | Step 410 | Loss: 3.2198 | Ppl: 25.02 | Bits/Tok: 4.645 | Time: 432s
+INN | Step 420 | Loss: 3.3829 | Ppl: 29.46 | Bits/Tok: 4.881 | Time: 443s
+INN | Step 430 | Loss: 3.4790 | Ppl: 32.43 | Bits/Tok: 5.019 | Time: 453s
+INN | Step 440 | Loss: 3.3226 | Ppl: 27.73 | Bits/Tok: 4.794 | Time: 464s
+INN | Step 450 | Loss: 3.4350 | Ppl: 31.03 | Bits/Tok: 4.956 | Time: 474s
+INN | Step 460 | Loss: 3.3283 | Ppl: 27.89 | Bits/Tok: 4.802 | Time: 485s
+INN | Step 470 | Loss: 3.4464 | Ppl: 31.39 | Bits/Tok: 4.972 | Time: 495s
+INN | Step 480 | Loss: 3.2821 | Ppl: 26.63 | Bits/Tok: 4.735 | Time: 506s
+INN | Step 490 | Loss: 3.4247 | Ppl: 30.71 | Bits/Tok: 4.941 | Time: 517s
+INN | Step 500 | Loss: 3.3724 | Ppl: 29.15 | Bits/Tok: 4.865 | Time: 527s
+INN | Step 510 | Loss: 3.3524 | Ppl: 28.57 | Bits/Tok: 4.836 | Time: 538s
+INN | Step 520 | Loss: 3.3226 | Ppl: 27.73 | Bits/Tok: 4.794 | Time: 549s
+INN | Step 530 | Loss: 3.3330 | Ppl: 28.02 | Bits/Tok: 4.809 | Time: 559s
+INN | Step 540 | Loss: 3.4804 | Ppl: 32.47 | Bits/Tok: 5.021 | Time: 570s
+INN | Step 550 | Loss: 3.4176 | Ppl: 30.50 | Bits/Tok: 4.931 | Time: 580s
+INN | Step 560 | Loss: 3.3302 | Ppl: 27.94 | Bits/Tok: 4.804 | Time: 591s
+INN | Step 570 | Loss: 3.4058 | Ppl: 30.14 | Bits/Tok: 4.914 | Time: 601s
+INN | Step 580 | Loss: 3.2326 | Ppl: 25.35 | Bits/Tok: 4.664 | Time: 612s
+INN | Step 590 | Loss: 3.4702 | Ppl: 32.14 | Bits/Tok: 5.006 | Time: 622s
+INN | Step 600 | Loss: 3.2749 | Ppl: 26.44 | Bits/Tok: 4.725 | Time: 633s
+INN | Step 610 | Loss: 3.3698 | Ppl: 29.07 | Bits/Tok: 4.862 | Time: 643s
+INN | Step 620 | Loss: 3.4588 | Ppl: 31.78 | Bits/Tok: 4.990 | Time: 654s
+INN | Step 630 | Loss: 3.3736 | Ppl: 29.18 | Bits/Tok: 4.867 | Time: 665s
+INN | Step 640 | Loss: 3.3130 | Ppl: 27.47 | Bits/Tok: 4.780 | Time: 675s
+INN | Step 650 | Loss: 3.2416 | Ppl: 25.57 | Bits/Tok: 4.677 | Time: 686s
+INN | Step 660 | Loss: 3.3566 | Ppl: 28.69 | Bits/Tok: 4.843 | Time: 696s
+INN | Step 670 | Loss: 3.4158 | Ppl: 30.44 | Bits/Tok: 4.928 | Time: 707s
+INN | Step 680 | Loss: 3.3658 | Ppl: 28.96 | Bits/Tok: 4.856 | Time: 717s
+INN | Step 690 | Loss: 3.3503 | Ppl: 28.51 | Bits/Tok: 4.833 | Time: 728s
+INN | Step 700 | Loss: 3.3572 | Ppl: 28.71 | Bits/Tok: 4.843 | Time: 738s
+INN | Step 710 | Loss: 3.2127 | Ppl: 24.85 | Bits/Tok: 4.635 | Time: 749s
+INN | Step 720 | Loss: 3.1855 | Ppl: 24.18 | Bits/Tok: 4.596 | Time: 759s
+INN | Step 730 | Loss: 3.3114 | Ppl: 27.42 | Bits/Tok: 4.777 | Time: 770s
+INN | Step 740 | Loss: 3.1109 | Ppl: 22.44 | Bits/Tok: 4.488 | Time: 780s
+INN | Step 750 | Loss: 3.2527 | Ppl: 25.86 | Bits/Tok: 4.693 | Time: 791s
+INN | Step 760 | Loss: 3.4209 | Ppl: 30.60 | Bits/Tok: 4.935 | Time: 801s
+INN | Step 770 | Loss: 3.3715 | Ppl: 29.12 | Bits/Tok: 4.864 | Time: 812s
+INN | Step 780 | Loss: 3.2399 | Ppl: 25.53 | Bits/Tok: 4.674 | Time: 823s
+INN | Step 790 | Loss: 3.3428 | Ppl: 28.30 | Bits/Tok: 4.823 | Time: 833s
+INN | Step 800 | Loss: 3.2829 | Ppl: 26.65 | Bits/Tok: 4.736 | Time: 844s
+INN | Step 810 | Loss: 3.3167 | Ppl: 27.57 | Bits/Tok: 4.785 | Time: 854s
+INN | Step 820 | Loss: 3.1806 | Ppl: 24.06 | Bits/Tok: 4.589 | Time: 865s
+INN | Step 830 | Loss: 3.2362 | Ppl: 25.44 | Bits/Tok: 4.669 | Time: 875s
+INN | Step 840 | Loss: 3.2209 | Ppl: 25.05 | Bits/Tok: 4.647 | Time: 886s
+INN | Step 850 | Loss: 3.3427 | Ppl: 28.29 | Bits/Tok: 4.822 | Time: 896s
+INN | Step 860 | Loss: 3.3822 | Ppl: 29.43 | Bits/Tok: 4.879 | Time: 907s
+INN | Step 870 | Loss: 3.1662 | Ppl: 23.72 | Bits/Tok: 4.568 | Time: 917s
+INN | Step 880 | Loss: 3.2248 | Ppl: 25.15 | Bits/Tok: 4.652 | Time: 928s
+INN | Step 890 | Loss: 3.3380 | Ppl: 28.16 | Bits/Tok: 4.816 | Time: 938s
+INN | Step 900 | Loss: 3.2226 | Ppl: 25.09 | Bits/Tok: 4.649 | Time: 949s
+INN | Step 910 | Loss: 3.2327 | Ppl: 25.35 | Bits/Tok: 4.664 | Time: 959s
+INN | Step 920 | Loss: 3.1433 | Ppl: 23.18 | Bits/Tok: 4.535 | Time: 970s
+INN | Step 930 | Loss: 3.1844 | Ppl: 24.15 | Bits/Tok: 4.594 | Time: 980s
+INN | Step 940 | Loss: 3.3177 | Ppl: 27.60 | Bits/Tok: 4.786 | Time: 991s
+INN | Step 950 | Loss: 3.2030 | Ppl: 24.61 | Bits/Tok: 4.621 | Time: 1002s
+INN | Step 960 | Loss: 3.3422 | Ppl: 28.28 | Bits/Tok: 4.822 | Time: 1012s
+INN | Step 970 | Loss: 3.1159 | Ppl: 22.55 | Bits/Tok: 4.495 | Time: 1023s
+INN | Step 980 | Loss: 3.2434 | Ppl: 25.62 | Bits/Tok: 4.679 | Time: 1033s
+INN | Step 990 | Loss: 3.2798 | Ppl: 26.57 | Bits/Tok: 4.732 | Time: 1044s
+INN | Step 1000 | Loss: 3.2798 | Ppl: 26.57 | Bits/Tok: 4.732 | Time: 1054s
+INN | Step 1010 | Loss: 3.2791 | Ppl: 26.55 | Bits/Tok: 4.731 | Time: 1065s
+INN | Step 1020 | Loss: 3.2922 | Ppl: 26.90 | Bits/Tok: 4.750 | Time: 1076s
+INN | Step 1030 | Loss: 3.2864 | Ppl: 26.75 | Bits/Tok: 4.741 | Time: 1086s
+INN | Step 1040 | Loss: 3.1780 | Ppl: 24.00 | Bits/Tok: 4.585 | Time: 1097s
+INN | Step 1050 | Loss: 3.2192 | Ppl: 25.01 | Bits/Tok: 4.644 | Time: 1107s
+INN | Step 1060 | Loss: 3.2777 | Ppl: 26.52 | Bits/Tok: 4.729 | Time: 1118s
+INN | Step 1070 | Loss: 3.0801 | Ppl: 21.76 | Bits/Tok: 4.444 | Time: 1129s
+INN | Step 1080 | Loss: 3.1368 | Ppl: 23.03 | Bits/Tok: 4.525 | Time: 1139s
+INN | Step 1090 | Loss: 3.2218 | Ppl: 25.07 | Bits/Tok: 4.648 | Time: 1150s
+INN | Step 1100 | Loss: 3.2825 | Ppl: 26.64 | Bits/Tok: 4.736 | Time: 1160s
+INN | Step 1110 | Loss: 3.2886 | Ppl: 26.80 | Bits/Tok: 4.744 | Time: 1171s
+INN | Step 1120 | Loss: 3.2448 | Ppl: 25.66 | Bits/Tok: 4.681 | Time: 1181s
+INN | Step 1130 | Loss: 3.0852 | Ppl: 21.87 | Bits/Tok: 4.451 | Time: 1192s
+INN | Step 1140 | Loss: 3.2752 | Ppl: 26.45 | Bits/Tok: 4.725 | Time: 1202s
+INN | Step 1150 | Loss: 3.2491 | Ppl: 25.77 | Bits/Tok: 4.688 | Time: 1213s
+INN | Step 1160 | Loss: 3.2440 | Ppl: 25.64 | Bits/Tok: 4.680 | Time: 1223s
+INN | Step 1170 | Loss: 3.3626 | Ppl: 28.87 | Bits/Tok: 4.851 | Time: 1234s
+INN | Step 1180 | Loss: 3.3017 | Ppl: 27.16 | Bits/Tok: 4.763 | Time: 1245s
+INN | Step 1190 | Loss: 3.2043 | Ppl: 24.64 | Bits/Tok: 4.623 | Time: 1255s
+INN | Step 1200 | Loss: 3.2494 | Ppl: 25.77 | Bits/Tok: 4.688 | Time: 1266s
+INN | Step 1210 | Loss: 3.1540 | Ppl: 23.43 | Bits/Tok: 4.550 | Time: 1276s
+INN | Step 1220 | Loss: 3.1529 | Ppl: 23.40 | Bits/Tok: 4.549 | Time: 1287s
+INN | Step 1230 | Loss: 3.2071 | Ppl: 24.71 | Bits/Tok: 4.627 | Time: 1298s
+INN | Step 1240 | Loss: 3.2262 | Ppl: 25.18 | Bits/Tok: 4.654 | Time: 1308s
+INN | Step 1250 | Loss: 3.2039 | Ppl: 24.63 | Bits/Tok: 4.622 | Time: 1319s
+INN | Step 1260 | Loss: 3.1237 | Ppl: 22.73 | Bits/Tok: 4.507 | Time: 1329s
+INN | Step 1270 | Loss: 3.1906 | Ppl: 24.30 | Bits/Tok: 4.603 | Time: 1340s
+INN | Step 1280 | Loss: 3.2980 | Ppl: 27.06 | Bits/Tok: 4.758 | Time: 1350s
+INN | Step 1290 | Loss: 3.2269 | Ppl: 25.20 | Bits/Tok: 4.655 | Time: 1361s
+INN | Step 1300 | Loss: 3.3059 | Ppl: 27.27 | Bits/Tok: 4.769 | Time: 1372s
+INN | Step 1310 | Loss: 3.2144 | Ppl: 24.89 | Bits/Tok: 4.637 | Time: 1382s
+INN | Step 1320 | Loss: 3.2062 | Ppl: 24.69 | Bits/Tok: 4.626 | Time: 1393s
+INN | Step 1330 | Loss: 3.1813 | Ppl: 24.08 | Bits/Tok: 4.590 | Time: 1403s
+INN | Step 1340 | Loss: 3.1132 | Ppl: 22.49 | Bits/Tok: 4.491 | Time: 1414s
+INN | Step 1350 | Loss: 3.2658 | Ppl: 26.20 | Bits/Tok: 4.711 | Time: 1424s
+INN | Step 1360 | Loss: 3.1441 | Ppl: 23.20 | Bits/Tok: 4.536 | Time: 1435s
+INN | Step 1370 | Loss: 3.1533 | Ppl: 23.41 | Bits/Tok: 4.549 | Time: 1445s
+INN | Step 1380 | Loss: 3.0503 | Ppl: 21.12 | Bits/Tok: 4.401 | Time: 1456s
+INN | Step 1390 | Loss: 3.1542 | Ppl: 23.44 | Bits/Tok: 4.551 | Time: 1466s
+INN | Step 1400 | Loss: 3.1940 | Ppl: 24.39 | Bits/Tok: 4.608 | Time: 1477s
+INN | Step 1410 | Loss: 3.1052 | Ppl: 22.31 | Bits/Tok: 4.480 | Time: 1487s
+INN | Step 1420 | Loss: 3.1047 | Ppl: 22.30 | Bits/Tok: 4.479 | Time: 1498s
+INN | Step 1430 | Loss: 3.0893 | Ppl: 21.96 | Bits/Tok: 4.457 | Time: 1509s
+INN | Step 1440 | Loss: 3.0162 | Ppl: 20.41 | Bits/Tok: 4.351 | Time: 1519s
+INN | Step 1450 | Loss: 3.0670 | Ppl: 21.48 | Bits/Tok: 4.425 | Time: 1530s
+INN | Step 1460 | Loss: 3.1877 | Ppl: 24.23 | Bits/Tok: 4.599 | Time: 1540s
+INN | Step 1470 | Loss: 3.2368 | Ppl: 25.45 | Bits/Tok: 4.670 | Time: 1551s
+INN | Step 1480 | Loss: 3.0330 | Ppl: 20.76 | Bits/Tok: 4.376 | Time: 1561s
+INN | Step 1490 | Loss: 3.2340 | Ppl: 25.38 | Bits/Tok: 4.666 | Time: 1572s
+INN | Step 1500 | Loss: 3.0693 | Ppl: 21.53 | Bits/Tok: 4.428 | Time: 1583s
+INN | Step 1510 | Loss: 3.1635 | Ppl: 23.65 | Bits/Tok: 4.564 | Time: 1593s
+INN | Step 1520 | Loss: 3.1770 | Ppl: 23.97 | Bits/Tok: 4.583 | Time: 1604s
+INN | Step 1530 | Loss: 3.0920 | Ppl: 22.02 | Bits/Tok: 4.461 | Time: 1614s
+INN | Step 1540 | Loss: 3.1399 | Ppl: 23.10 | Bits/Tok: 4.530 | Time: 1625s
+INN | Step 1550 | Loss: 3.2753 | Ppl: 26.45 | Bits/Tok: 4.725 | Time: 1635s
+INN | Step 1560 | Loss: 3.0504 | Ppl: 21.12 | Bits/Tok: 4.401 | Time: 1646s
+INN | Step 1570 | Loss: 3.2432 | Ppl: 25.61 | Bits/Tok: 4.679 | Time: 1656s
+INN | Step 1580 | Loss: 3.2291 | Ppl: 25.26 | Bits/Tok: 4.659 | Time: 1667s
+INN | Step 1590 | Loss: 3.1080 | Ppl: 22.38 | Bits/Tok: 4.484 | Time: 1677s
+INN | Step 1600 | Loss: 3.1337 | Ppl: 22.96 | Bits/Tok: 4.521 | Time: 1688s
+INN | Step 1610 | Loss: 3.0994 | Ppl: 22.18 | Bits/Tok: 4.471 | Time: 1699s
+INN | Step 1620 | Loss: 3.1938 | Ppl: 24.38 | Bits/Tok: 4.608 | Time: 1709s
+INN | Step 1630 | Loss: 3.2643 | Ppl: 26.16 | Bits/Tok: 4.709 | Time: 1720s
+INN | Step 1640 | Loss: 3.0085 | Ppl: 20.26 | Bits/Tok: 4.340 | Time: 1730s
+INN | Step 1650 | Loss: 3.2578 | Ppl: 25.99 | Bits/Tok: 4.700 | Time: 1741s
+INN | Step 1660 | Loss: 3.1602 | Ppl: 23.57 | Bits/Tok: 4.559 | Time: 1751s
+INN | Step 1670 | Loss: 3.2381 | Ppl: 25.49 | Bits/Tok: 4.672 | Time: 1762s
+INN | Step 1680 | Loss: 3.2556 | Ppl: 25.94 | Bits/Tok: 4.697 | Time: 1773s
+INN | Step 1690 | Loss: 3.2207 | Ppl: 25.05 | Bits/Tok: 4.646 | Time: 1783s
+INN | Step 1700 | Loss: 3.2025 | Ppl: 24.59 | Bits/Tok: 4.620 | Time: 1794s
+INN | Step 1710 | Loss: 3.1756 | Ppl: 23.94 | Bits/Tok: 4.581 | Time: 1804s
+INN | Step 1720 | Loss: 3.0690 | Ppl: 21.52 | Bits/Tok: 4.428 | Time: 1815s
+INN | Step 1730 | Loss: 3.1401 | Ppl: 23.11 | Bits/Tok: 4.530 | Time: 1825s
+INN | Step 1740 | Loss: 3.1810 | Ppl: 24.07 | Bits/Tok: 4.589 | Time: 1836s
+INN | Step 1750 | Loss: 3.1168 | Ppl: 22.57 | Bits/Tok: 4.497 | Time: 1847s
+INN | Step 1760 | Loss: 3.1480 | Ppl: 23.29 | Bits/Tok: 4.542 | Time: 1857s
+INN | Step 1770 | Loss: 3.1269 | Ppl: 22.80 | Bits/Tok: 4.511 | Time: 1868s
+INN | Step 1780 | Loss: 3.0757 | Ppl: 21.66 | Bits/Tok: 4.437 | Time: 1879s
+INN | Step 1790 | Loss: 3.0876 | Ppl: 21.93 | Bits/Tok: 4.455 | Time: 1889s
+INN | Step 1800 | Loss: 3.1537 | Ppl: 23.42 | Bits/Tok: 4.550 | Time: 1900s
+INN | Step 1810 | Loss: 3.2187 | Ppl: 25.00 | Bits/Tok: 4.644 | Time: 1910s
+INN | Step 1820 | Loss: 3.0734 | Ppl: 21.61 | Bits/Tok: 4.434 | Time: 1921s
+INN | Step 1830 | Loss: 3.2109 | Ppl: 24.80 | Bits/Tok: 4.632 | Time: 1931s
+INN | Step 1840 | Loss: 3.2887 | Ppl: 26.81 | Bits/Tok: 4.745 | Time: 1942s
+INN | Step 1850 | Loss: 3.0673 | Ppl: 21.48 | Bits/Tok: 4.425 | Time: 1952s
+INN | Step 1860 | Loss: 3.0620 | Ppl: 21.37 | Bits/Tok: 4.417 | Time: 1963s
+INN | Step 1870 | Loss: 3.1643 | Ppl: 23.67 | Bits/Tok: 4.565 | Time: 1973s
+INN | Step 1880 | Loss: 3.1939 | Ppl: 24.38 | Bits/Tok: 4.608 | Time: 1984s
+INN | Step 1890 | Loss: 3.0783 | Ppl: 21.72 | Bits/Tok: 4.441 | Time: 1995s
+INN | Step 1900 | Loss: 3.1601 | Ppl: 23.57 | Bits/Tok: 4.559 | Time: 2005s
+INN | Step 1910 | Loss: 3.0956 | Ppl: 22.10 | Bits/Tok: 4.466 | Time: 2016s
+INN | Step 1920 | Loss: 3.1907 | Ppl: 24.30 | Bits/Tok: 4.603 | Time: 2027s
+INN | Step 1930 | Loss: 3.1067 | Ppl: 22.35 | Bits/Tok: 4.482 | Time: 2037s
+INN | Step 1940 | Loss: 3.1717 | Ppl: 23.85 | Bits/Tok: 4.576 | Time: 2048s
+INN | Step 1950 | Loss: 3.1590 | Ppl: 23.55 | Bits/Tok: 4.557 | Time: 2058s
+INN | Step 1960 | Loss: 3.0288 | Ppl: 20.67 | Bits/Tok: 4.370 | Time: 2069s
+INN | Step 1970 | Loss: 3.2552 | Ppl: 25.92 | Bits/Tok: 4.696 | Time: 2079s
+INN | Step 1980 | Loss: 3.0285 | Ppl: 20.67 | Bits/Tok: 4.369 | Time: 2090s
+INN | Step 1990 | Loss: 3.1158 | Ppl: 22.55 | Bits/Tok: 4.495 | Time: 2100s
+INN | Step 2000 | Loss: 3.1408 | Ppl: 23.12 | Bits/Tok: 4.531 | Time: 2111s
+INN | Step 2010 | Loss: 3.1107 | Ppl: 22.44 | Bits/Tok: 4.488 | Time: 2122s
+INN | Step 2020 | Loss: 3.0980 | Ppl: 22.15 | Bits/Tok: 4.470 | Time: 2132s
+INN | Step 2030 | Loss: 3.1305 | Ppl: 22.88 | Bits/Tok: 4.516 | Time: 2143s
+INN | Step 2040 | Loss: 3.1681 | Ppl: 23.76 | Bits/Tok: 4.571 | Time: 2153s
+INN | Step 2050 | Loss: 3.0108 | Ppl: 20.30 | Bits/Tok: 4.344 | Time: 2164s
+INN | Step 2060 | Loss: 2.9845 | Ppl: 19.78 | Bits/Tok: 4.306 | Time: 2174s
+INN | Step 2070 | Loss: 3.0756 | Ppl: 21.66 | Bits/Tok: 4.437 | Time: 2185s
+INN | Step 2080 | Loss: 3.1640 | Ppl: 23.66 | Bits/Tok: 4.565 | Time: 2195s
+INN | Step 2090 | Loss: 3.1028 | Ppl: 22.26 | Bits/Tok: 4.476 | Time: 2206s
+INN | Step 2100 | Loss: 3.2273 | Ppl: 25.21 | Bits/Tok: 4.656 | Time: 2217s
+INN | Step 2110 | Loss: 3.0531 | Ppl: 21.18 | Bits/Tok: 4.405 | Time: 2227s
+INN | Step 2120 | Loss: 3.1080 | Ppl: 22.38 | Bits/Tok: 4.484 | Time: 2238s
+INN | Step 2130 | Loss: 3.1647 | Ppl: 23.68 | Bits/Tok: 4.566 | Time: 2248s
+INN | Step 2140 | Loss: 3.1293 | Ppl: 22.86 | Bits/Tok: 4.515 | Time: 2259s
+INN | Step 2150 | Loss: 3.1634 | Ppl: 23.65 | Bits/Tok: 4.564 | Time: 2269s
+INN | Step 2160 | Loss: 3.1215 | Ppl: 22.68 | Bits/Tok: 4.503 | Time: 2280s
+INN | Step 2170 | Loss: 3.0184 | Ppl: 20.46 | Bits/Tok: 4.355 | Time: 2291s
+INN | Step 2180 | Loss: 3.0796 | Ppl: 21.75 | Bits/Tok: 4.443 | Time: 2301s
+INN | Step 2190 | Loss: 3.0608 | Ppl: 21.35 | Bits/Tok: 4.416 | Time: 2312s
+INN | Step 2200 | Loss: 3.0781 | Ppl: 21.72 | Bits/Tok: 4.441 | Time: 2322s
+INN | Step 2210 | Loss: 3.1732 | Ppl: 23.88 | Bits/Tok: 4.578 | Time: 2333s
+INN | Step 2220 | Loss: 3.0971 | Ppl: 22.13 | Bits/Tok: 4.468 | Time: 2344s
+INN | Step 2230 | Loss: 3.1592 | Ppl: 23.55 | Bits/Tok: 4.558 | Time: 2354s
+INN | Step 2240 | Loss: 3.1053 | Ppl: 22.32 | Bits/Tok: 4.480 | Time: 2365s
+INN | Step 2250 | Loss: 2.9750 | Ppl: 19.59 | Bits/Tok: 4.292 | Time: 2375s
+INN | Step 2260 | Loss: 3.1522 | Ppl: 23.39 | Bits/Tok: 4.548 | Time: 2386s
+INN | Step 2270 | Loss: 3.1386 | Ppl: 23.07 | Bits/Tok: 4.528 | Time: 2396s
+INN | Step 2280 | Loss: 3.1068 | Ppl: 22.35 | Bits/Tok: 4.482 | Time: 2407s
+INN | Step 2290 | Loss: 3.0970 | Ppl: 22.13 | Bits/Tok: 4.468 | Time: 2417s
+INN | Step 2300 | Loss: 3.1339 | Ppl: 22.96 | Bits/Tok: 4.521 | Time: 2428s
+INN | Step 2310 | Loss: 3.1822 | Ppl: 24.10 | Bits/Tok: 4.591 | Time: 2438s
+INN | Step 2320 | Loss: 3.0067 | Ppl: 20.22 | Bits/Tok: 4.338 | Time: 2449s
+INN | Step 2330 | Loss: 3.0821 | Ppl: 21.81 | Bits/Tok: 4.447 | Time: 2460s
+INN | Step 2340 | Loss: 2.9585 | Ppl: 19.27 | Bits/Tok: 4.268 | Time: 2470s
+INN | Step 2350 | Loss: 2.9488 | Ppl: 19.08 | Bits/Tok: 4.254 | Time: 2481s
+INN | Step 2360 | Loss: 3.0945 | Ppl: 22.08 | Bits/Tok: 4.464 | Time: 2491s
+INN | Step 2370 | Loss: 3.0675 | Ppl: 21.49 | Bits/Tok: 4.425 | Time: 2502s
+INN | Step 2380 | Loss: 3.0950 | Ppl: 22.09 | Bits/Tok: 4.465 | Time: 2512s
+INN | Step 2390 | Loss: 3.0965 | Ppl: 22.12 | Bits/Tok: 4.467 | Time: 2523s
+INN | Step 2400 | Loss: 3.1147 | Ppl: 22.53 | Bits/Tok: 4.494 | Time: 2534s
+INN | Step 2410 | Loss: 3.2261 | Ppl: 25.18 | Bits/Tok: 4.654 | Time: 2544s
+INN | Step 2420 | Loss: 3.2090 | Ppl: 24.75 | Bits/Tok: 4.630 | Time: 2555s
+INN | Step 2430 | Loss: 3.0180 | Ppl: 20.45 | Bits/Tok: 4.354 | Time: 2566s
+INN | Step 2440 | Loss: 3.0109 | Ppl: 20.31 | Bits/Tok: 4.344 | Time: 2576s
+INN | Step 2450 | Loss: 3.1657 | Ppl: 23.70 | Bits/Tok: 4.567 | Time: 2587s
+INN | Step 2460 | Loss: 3.1363 | Ppl: 23.02 | Bits/Tok: 4.525 | Time: 2597s
+INN | Step 2470 | Loss: 3.1194 | Ppl: 22.63 | Bits/Tok: 4.500 | Time: 2608s
+INN | Step 2480 | Loss: 3.0863 | Ppl: 21.90 | Bits/Tok: 4.453 | Time: 2618s
+INN | Step 2490 | Loss: 3.1473 | Ppl: 23.27 | Bits/Tok: 4.541 | Time: 2629s
+INN | Step 2500 | Loss: 2.9617 | Ppl: 19.33 | Bits/Tok: 4.273 | Time: 2639s
+INN | Step 2510 | Loss: 3.0913 | Ppl: 22.01 | Bits/Tok: 4.460 | Time: 2650s
+INN | Step 2520 | Loss: 3.1046 | Ppl: 22.30 | Bits/Tok: 4.479 | Time: 2660s
+INN | Step 2530 | Loss: 3.0836 | Ppl: 21.84 | Bits/Tok: 4.449 | Time: 2671s
+INN | Step 2540 | Loss: 3.0989 | Ppl: 22.17 | Bits/Tok: 4.471 | Time: 2682s
+INN | Step 2550 | Loss: 3.1088 | Ppl: 22.40 | Bits/Tok: 4.485 | Time: 2692s
+INN | Step 2560 | Loss: 3.1448 | Ppl: 23.21 | Bits/Tok: 4.537 | Time: 2703s
+INN | Step 2570 | Loss: 3.0245 | Ppl: 20.58 | Bits/Tok: 4.363 | Time: 2713s
+INN | Step 2580 | Loss: 3.0409 | Ppl: 20.92 | Bits/Tok: 4.387 | Time: 2724s
+INN | Step 2590 | Loss: 3.1763 | Ppl: 23.96 | Bits/Tok: 4.582 | Time: 2734s
+INN | Step 2600 | Loss: 3.0528 | Ppl: 21.17 | Bits/Tok: 4.404 | Time: 2745s
+INN | Step 2610 | Loss: 3.0018 | Ppl: 20.12 | Bits/Tok: 4.331 | Time: 2756s
+INN | Step 2620 | Loss: 3.0489 | Ppl: 21.09 | Bits/Tok: 4.399 | Time: 2766s
+INN | Step 2630 | Loss: 3.1899 | Ppl: 24.29 | Bits/Tok: 4.602 | Time: 2777s
+INN | Step 2640 | Loss: 3.0197 | Ppl: 20.49 | Bits/Tok: 4.357 | Time: 2787s
+INN | Step 2650 | Loss: 3.0594 | Ppl: 21.31 | Bits/Tok: 4.414 | Time: 2798s
+INN | Step 2660 | Loss: 3.1133 | Ppl: 22.50 | Bits/Tok: 4.492 | Time: 2808s
+INN | Step 2670 | Loss: 3.1534 | Ppl: 23.42 | Bits/Tok: 4.549 | Time: 2819s
+INN | Step 2680 | Loss: 3.0965 | Ppl: 22.12 | Bits/Tok: 4.467 | Time: 2829s
+INN | Step 2690 | Loss: 2.8453 | Ppl: 17.21 | Bits/Tok: 4.105 | Time: 2840s
+INN | Step 2700 | Loss: 3.1089 | Ppl: 22.40 | Bits/Tok: 4.485 | Time: 2850s
+INN | Step 2710 | Loss: 3.0803 | Ppl: 21.76 | Bits/Tok: 4.444 | Time: 2861s
+INN | Step 2720 | Loss: 3.0596 | Ppl: 21.32 | Bits/Tok: 4.414 | Time: 2872s
+INN | Step 2730 | Loss: 3.1185 | Ppl: 22.61 | Bits/Tok: 4.499 | Time: 2882s
+INN | Step 2740 | Loss: 3.1258 | Ppl: 22.78 | Bits/Tok: 4.510 | Time: 2893s
+INN | Step 2750 | Loss: 3.1406 | Ppl: 23.12 | Bits/Tok: 4.531 | Time: 2903s
+INN | Step 2760 | Loss: 3.0813 | Ppl: 21.79 | Bits/Tok: 4.445 | Time: 2914s
+INN | Step 2770 | Loss: 3.1330 | Ppl: 22.94 | Bits/Tok: 4.520 | Time: 2925s
+INN | Step 2780 | Loss: 3.0109 | Ppl: 20.31 | Bits/Tok: 4.344 | Time: 2935s
+INN | Step 2790 | Loss: 3.0408 | Ppl: 20.92 | Bits/Tok: 4.387 | Time: 2946s
+INN | Step 2800 | Loss: 2.9066 | Ppl: 18.29 | Bits/Tok: 4.193 | Time: 2956s
+INN | Step 2810 | Loss: 3.0632 | Ppl: 21.40 | Bits/Tok: 4.419 | Time: 2967s
+INN | Step 2820 | Loss: 3.2362 | Ppl: 25.44 | Bits/Tok: 4.669 | Time: 2977s
+INN | Step 2830 | Loss: 3.0776 | Ppl: 21.71 | Bits/Tok: 4.440 | Time: 2988s
+INN | Step 2840 | Loss: 2.9911 | Ppl: 19.91 | Bits/Tok: 4.315 | Time: 2999s
+INN | Step 2850 | Loss: 3.0425 | Ppl: 20.96 | Bits/Tok: 4.389 | Time: 3009s
+INN | Step 2860 | Loss: 3.0039 | Ppl: 20.16 | Bits/Tok: 4.334 | Time: 3020s
+INN | Step 2870 | Loss: 3.2197 | Ppl: 25.02 | Bits/Tok: 4.645 | Time: 3030s
+INN | Step 2880 | Loss: 3.0829 | Ppl: 21.82 | Bits/Tok: 4.448 | Time: 3041s
+INN | Step 2890 | Loss: 3.0587 | Ppl: 21.30 | Bits/Tok: 4.413 | Time: 3051s
+INN | Step 2900 | Loss: 3.0860 | Ppl: 21.89 | Bits/Tok: 4.452 | Time: 3062s
+INN | Step 2910 | Loss: 3.1262 | Ppl: 22.79 | Bits/Tok: 4.510 | Time: 3073s
+INN | Step 2920 | Loss: 3.1325 | Ppl: 22.93 | Bits/Tok: 4.519 | Time: 3083s
+INN | Step 2930 | Loss: 3.1871 | Ppl: 24.22 | Bits/Tok: 4.598 | Time: 3094s
+INN | Step 2940 | Loss: 3.0027 | Ppl: 20.14 | Bits/Tok: 4.332 | Time: 3104s
+INN | Step 2950 | Loss: 3.1101 | Ppl: 22.42 | Bits/Tok: 4.487 | Time: 3115s
+INN | Step 2960 | Loss: 3.0424 | Ppl: 20.96 | Bits/Tok: 4.389 | Time: 3125s
+INN | Step 2970 | Loss: 3.1944 | Ppl: 24.40 | Bits/Tok: 4.609 | Time: 3136s
+INN | Step 2980 | Loss: 2.8997 | Ppl: 18.17 | Bits/Tok: 4.183 | Time: 3147s
+INN | Step 2990 | Loss: 3.0361 | Ppl: 20.82 | Bits/Tok: 4.380 | Time: 3157s
+INN | Step 3000 | Loss: 3.0660 | Ppl: 21.46 | Bits/Tok: 4.423 | Time: 3168s
+INN | Step 3010 | Loss: 3.1592 | Ppl: 23.55 | Bits/Tok: 4.558 | Time: 3178s
+INN | Step 3020 | Loss: 3.0704 | Ppl: 21.55 | Bits/Tok: 4.430 | Time: 3189s
+INN | Step 3030 | Loss: 3.0752 | Ppl: 21.66 | Bits/Tok: 4.437 | Time: 3200s
+INN | Step 3040 | Loss: 2.9733 | Ppl: 19.56 | Bits/Tok: 4.290 | Time: 3210s
+INN | Step 3050 | Loss: 3.1822 | Ppl: 24.10 | Bits/Tok: 4.591 | Time: 3221s
+INN | Step 3060 | Loss: 3.0299 | Ppl: 20.69 | Bits/Tok: 4.371 | Time: 3231s
+INN | Step 3070 | Loss: 3.1216 | Ppl: 22.68 | Bits/Tok: 4.503 | Time: 3242s
+INN | Step 3080 | Loss: 3.0008 | Ppl: 20.10 | Bits/Tok: 4.329 | Time: 3253s
+INN | Step 3090 | Loss: 2.9463 | Ppl: 19.03 | Bits/Tok: 4.251 | Time: 3263s
+INN | Step 3100 | Loss: 3.0575 | Ppl: 21.28 | Bits/Tok: 4.411 | Time: 3274s
+INN | Step 3110 | Loss: 3.0468 | Ppl: 21.05 | Bits/Tok: 4.396 | Time: 3284s
+INN | Step 3120 | Loss: 3.1714 | Ppl: 23.84 | Bits/Tok: 4.575 | Time: 3295s
+INN | Step 3130 | Loss: 3.0512 | Ppl: 21.14 | Bits/Tok: 4.402 | Time: 3305s
+INN | Step 3140 | Loss: 3.0522 | Ppl: 21.16 | Bits/Tok: 4.403 | Time: 3316s
+INN | Step 3150 | Loss: 3.0643 | Ppl: 21.42 | Bits/Tok: 4.421 | Time: 3326s
+INN | Step 3160 | Loss: 3.1212 | Ppl: 22.67 | Bits/Tok: 4.503 | Time: 3337s
+INN | Step 3170 | Loss: 3.0665 | Ppl: 21.47 | Bits/Tok: 4.424 | Time: 3347s
+INN | Step 3180 | Loss: 3.1039 | Ppl: 22.28 | Bits/Tok: 4.478 | Time: 3358s
+INN | Step 3190 | Loss: 3.1496 | Ppl: 23.33 | Bits/Tok: 4.544 | Time: 3368s
+INN | Step 3200 | Loss: 2.8596 | Ppl: 17.45 | Bits/Tok: 4.125 | Time: 3379s
+INN | Step 3210 | Loss: 3.1187 | Ppl: 22.62 | Bits/Tok: 4.499 | Time: 3390s
+INN | Step 3220 | Loss: 2.9751 | Ppl: 19.59 | Bits/Tok: 4.292 | Time: 3400s
+INN | Step 3230 | Loss: 2.9710 | Ppl: 19.51 | Bits/Tok: 4.286 | Time: 3411s
+INN | Step 3240 | Loss: 3.0367 | Ppl: 20.84 | Bits/Tok: 4.381 | Time: 3421s
+INN | Step 3250 | Loss: 2.9716 | Ppl: 19.52 | Bits/Tok: 4.287 | Time: 3432s
+INN | Step 3260 | Loss: 3.0920 | Ppl: 22.02 | Bits/Tok: 4.461 | Time: 3442s
+INN | Step 3270 | Loss: 3.0150 | Ppl: 20.39 | Bits/Tok: 4.350 | Time: 3453s
+INN | Step 3280 | Loss: 3.2041 | Ppl: 24.63 | Bits/Tok: 4.623 | Time: 3463s
+INN | Step 3290 | Loss: 3.0443 | Ppl: 20.99 | Bits/Tok: 4.392 | Time: 3474s
+INN | Step 3300 | Loss: 3.1442 | Ppl: 23.20 | Bits/Tok: 4.536 | Time: 3485s
+INN | Step 3310 | Loss: 3.1708 | Ppl: 23.83 | Bits/Tok: 4.574 | Time: 3495s
+INN | Step 3320 | Loss: 2.9799 | Ppl: 19.69 | Bits/Tok: 4.299 | Time: 3506s
+INN | Step 3330 | Loss: 3.0727 | Ppl: 21.60 | Bits/Tok: 4.433 | Time: 3516s
+INN | Step 3340 | Loss: 3.0237 | Ppl: 20.57 | Bits/Tok: 4.362 | Time: 3527s
+INN | Step 3350 | Loss: 3.0746 | Ppl: 21.64 | Bits/Tok: 4.436 | Time: 3537s
+INN | Step 3360 | Loss: 2.9876 | Ppl: 19.84 | Bits/Tok: 4.310 | Time: 3548s
+INN | Step 3370 | Loss: 3.0002 | Ppl: 20.09 | Bits/Tok: 4.328 | Time: 3558s
+INN | Step 3380 | Loss: 3.0345 | Ppl: 20.79 | Bits/Tok: 4.378 | Time: 3569s
+INN | Step 3390 | Loss: 3.0072 | Ppl: 20.23 | Bits/Tok: 4.338 | Time: 3579s
+INN | Step 3400 | Loss: 3.0655 | Ppl: 21.45 | Bits/Tok: 4.423 | Time: 3590s
+INN | Step 3410 | Loss: 3.0317 | Ppl: 20.73 | Bits/Tok: 4.374 | Time: 3601s
+INN | Step 3420 | Loss: 3.0320 | Ppl: 20.74 | Bits/Tok: 4.374 | Time: 3611s
+INN | Step 3430 | Loss: 3.0773 | Ppl: 21.70 | Bits/Tok: 4.440 | Time: 3622s
+INN | Step 3440 | Loss: 2.9699 | Ppl: 19.49 | Bits/Tok: 4.285 | Time: 3632s
+INN | Step 3450 | Loss: 3.0859 | Ppl: 21.89 | Bits/Tok: 4.452 | Time: 3643s
+INN | Step 3460 | Loss: 3.0640 | Ppl: 21.41 | Bits/Tok: 4.420 | Time: 3653s
+INN | Step 3470 | Loss: 3.0494 | Ppl: 21.10 | Bits/Tok: 4.399 | Time: 3664s
+INN | Step 3480 | Loss: 3.1586 | Ppl: 23.54 | Bits/Tok: 4.557 | Time: 3674s
+INN | Step 3490 | Loss: 3.1330 | Ppl: 22.94 | Bits/Tok: 4.520 | Time: 3685s
+INN | Step 3500 | Loss: 2.8397 | Ppl: 17.11 | Bits/Tok: 4.097 | Time: 3696s
+INN | Step 3510 | Loss: 3.1616 | Ppl: 23.61 | Bits/Tok: 4.561 | Time: 3706s
+INN | Step 3520 | Loss: 2.9721 | Ppl: 19.53 | Bits/Tok: 4.288 | Time: 3717s
+INN | Step 3530 | Loss: 3.0712 | Ppl: 21.57 | Bits/Tok: 4.431 | Time: 3727s
+INN | Step 3540 | Loss: 2.8658 | Ppl: 17.56 | Bits/Tok: 4.135 | Time: 3738s
+INN | Step 3550 | Loss: 3.0602 | Ppl: 21.33 | Bits/Tok: 4.415 | Time: 3748s
+INN | Step 3560 | Loss: 2.9315 | Ppl: 18.76 | Bits/Tok: 4.229 | Time: 3759s
+INN | Step 3570 | Loss: 3.0270 | Ppl: 20.63 | Bits/Tok: 4.367 | Time: 3769s
+INN | Step 3580 | Loss: 3.0742 | Ppl: 21.63 | Bits/Tok: 4.435 | Time: 3780s
+INN | Step 3590 | Loss: 3.0369 | Ppl: 20.84 | Bits/Tok: 4.381 | Time: 3790s
+INN | Step 3600 | Loss: 2.9357 | Ppl: 18.83 | Bits/Tok: 4.235 | Time: 3801s
+INN | Step 3610 | Loss: 2.9405 | Ppl: 18.93 | Bits/Tok: 4.242 | Time: 3812s
+INN | Step 3620 | Loss: 3.0765 | Ppl: 21.68 | Bits/Tok: 4.438 | Time: 3822s
+INN | Step 3630 | Loss: 2.9860 | Ppl: 19.81 | Bits/Tok: 4.308 | Time: 3833s
+INN | Step 3640 | Loss: 3.0309 | Ppl: 20.72 | Bits/Tok: 4.373 | Time: 3843s
+INN | Step 3650 | Loss: 3.1160 | Ppl: 22.56 | Bits/Tok: 4.495 | Time: 3854s
+INN | Step 3660 | Loss: 2.9380 | Ppl: 18.88 | Bits/Tok: 4.239 | Time: 3865s
+INN | Step 3670 | Loss: 2.9851 | Ppl: 19.79 | Bits/Tok: 4.307 | Time: 3875s
+INN | Step 3680 | Loss: 3.0225 | Ppl: 20.54 | Bits/Tok: 4.361 | Time: 3886s
+INN | Step 3690 | Loss: 2.8845 | Ppl: 17.89 | Bits/Tok: 4.161 | Time: 3896s
+INN | Step 3700 | Loss: 3.2072 | Ppl: 24.71 | Bits/Tok: 4.627 | Time: 3907s
+INN | Step 3710 | Loss: 3.0457 | Ppl: 21.02 | Bits/Tok: 4.394 | Time: 3918s
+INN | Step 3720 | Loss: 3.0738 | Ppl: 21.62 | Bits/Tok: 4.435 | Time: 3928s
+INN | Step 3730 | Loss: 3.0869 | Ppl: 21.91 | Bits/Tok: 4.454 | Time: 3939s
+INN | Step 3740 | Loss: 2.9603 | Ppl: 19.30 | Bits/Tok: 4.271 | Time: 3950s
+INN | Step 3750 | Loss: 3.0413 | Ppl: 20.93 | Bits/Tok: 4.388 | Time: 3960s
+INN | Step 3760 | Loss: 2.9889 | Ppl: 19.86 | Bits/Tok: 4.312 | Time: 3971s
+INN | Step 3770 | Loss: 2.9014 | Ppl: 18.20 | Bits/Tok: 4.186 | Time: 3982s
+INN | Step 3780 | Loss: 2.9305 | Ppl: 18.74 | Bits/Tok: 4.228 | Time: 3992s
+INN | Step 3790 | Loss: 3.0221 | Ppl: 20.53 | Bits/Tok: 4.360 | Time: 4003s
+INN | Step 3800 | Loss: 3.0525 | Ppl: 21.17 | Bits/Tok: 4.404 | Time: 4014s
+INN | Step 3810 | Loss: 3.0209 | Ppl: 20.51 | Bits/Tok: 4.358 | Time: 4024s
+INN | Step 3820 | Loss: 2.9794 | Ppl: 19.68 | Bits/Tok: 4.298 | Time: 4035s
+INN | Step 3830 | Loss: 3.1393 | Ppl: 23.09 | Bits/Tok: 4.529 | Time: 4046s
+INN | Step 3840 | Loss: 3.0485 | Ppl: 21.08 | Bits/Tok: 4.398 | Time: 4056s
+INN | Step 3850 | Loss: 3.0477 | Ppl: 21.07 | Bits/Tok: 4.397 | Time: 4067s
+INN | Step 3860 | Loss: 3.0461 | Ppl: 21.03 | Bits/Tok: 4.395 | Time: 4077s
+INN | Step 3870 | Loss: 2.9885 | Ppl: 19.86 | Bits/Tok: 4.312 | Time: 4088s
+INN | Step 3880 | Loss: 3.0060 | Ppl: 20.21 | Bits/Tok: 4.337 | Time: 4099s
+INN | Step 3890 | Loss: 3.1113 | Ppl: 22.45 | Bits/Tok: 4.489 | Time: 4109s
+INN | Step 3900 | Loss: 3.0365 | Ppl: 20.83 | Bits/Tok: 4.381 | Time: 4120s
+INN | Step 3910 | Loss: 2.9943 | Ppl: 19.97 | Bits/Tok: 4.320 | Time: 4131s
+INN | Step 3920 | Loss: 2.8707 | Ppl: 17.65 | Bits/Tok: 4.142 | Time: 4141s
+INN | Step 3930 | Loss: 2.9815 | Ppl: 19.72 | Bits/Tok: 4.301 | Time: 4152s
+INN | Step 3940 | Loss: 3.0057 | Ppl: 20.20 | Bits/Tok: 4.336 | Time: 4162s
+INN | Step 3950 | Loss: 2.9448 | Ppl: 19.01 | Bits/Tok: 4.248 | Time: 4173s
+INN | Step 3960 | Loss: 3.0372 | Ppl: 20.85 | Bits/Tok: 4.382 | Time: 4183s
+INN | Step 3970 | Loss: 3.0861 | Ppl: 21.89 | Bits/Tok: 4.452 | Time: 4194s
+INN | Step 3980 | Loss: 2.9236 | Ppl: 18.61 | Bits/Tok: 4.218 | Time: 4205s
+INN | Step 3990 | Loss: 2.9925 | Ppl: 19.94 | Bits/Tok: 4.317 | Time: 4215s
+INN | Step 4000 | Loss: 3.1274 | Ppl: 22.81 | Bits/Tok: 4.512 | Time: 4226s
+INN | Step 4010 | Loss: 3.0780 | Ppl: 21.72 | Bits/Tok: 4.441 | Time: 4236s
+INN | Step 4020 | Loss: 2.9865 | Ppl: 19.82 | Bits/Tok: 4.309 | Time: 4247s
+INN | Step 4030 | Loss: 2.9646 | Ppl: 19.39 | Bits/Tok: 4.277 | Time: 4258s
+INN | Step 4040 | Loss: 3.0415 | Ppl: 20.94 | Bits/Tok: 4.388 | Time: 4268s
+INN | Step 4050 | Loss: 2.9900 | Ppl: 19.89 | Bits/Tok: 4.314 | Time: 4279s
+INN | Step 4060 | Loss: 2.9414 | Ppl: 18.94 | Bits/Tok: 4.243 | Time: 4289s
+INN | Step 4070 | Loss: 3.0989 | Ppl: 22.17 | Bits/Tok: 4.471 | Time: 4300s
+INN | Step 4080 | Loss: 2.9761 | Ppl: 19.61 | Bits/Tok: 4.294 | Time: 4310s
+INN | Step 4090 | Loss: 3.0068 | Ppl: 20.22 | Bits/Tok: 4.338 | Time: 4321s
+INN | Step 4100 | Loss: 3.1583 | Ppl: 23.53 | Bits/Tok: 4.557 | Time: 4331s
+INN | Step 4110 | Loss: 3.0134 | Ppl: 20.36 | Bits/Tok: 4.347 | Time: 4342s
+INN | Step 4120 | Loss: 2.9498 | Ppl: 19.10 | Bits/Tok: 4.256 | Time: 4353s
+INN | Step 4130 | Loss: 2.9470 | Ppl: 19.05 | Bits/Tok: 4.252 | Time: 4363s
+INN | Step 4140 | Loss: 3.0463 | Ppl: 21.04 | Bits/Tok: 4.395 | Time: 4374s
+INN | Step 4150 | Loss: 2.8294 | Ppl: 16.93 | Bits/Tok: 4.082 | Time: 4384s
+INN | Step 4160 | Loss: 2.9668 | Ppl: 19.43 | Bits/Tok: 4.280 | Time: 4395s
+INN | Step 4170 | Loss: 3.1161 | Ppl: 22.56 | Bits/Tok: 4.496 | Time: 4405s
+INN | Step 4180 | Loss: 3.0518 | Ppl: 21.15 | Bits/Tok: 4.403 | Time: 4416s
+INN | Step 4190 | Loss: 3.1604 | Ppl: 23.58 | Bits/Tok: 4.559 | Time: 4426s
+INN | Step 4200 | Loss: 2.8521 | Ppl: 17.32 | Bits/Tok: 4.115 | Time: 4437s
+INN | Step 4210 | Loss: 3.0878 | Ppl: 21.93 | Bits/Tok: 4.455 | Time: 4448s
+INN | Step 4220 | Loss: 3.0217 | Ppl: 20.53 | Bits/Tok: 4.359 | Time: 4458s
+INN | Step 4230 | Loss: 3.0316 | Ppl: 20.73 | Bits/Tok: 4.374 | Time: 4469s
+INN | Step 4240 | Loss: 2.9003 | Ppl: 18.18 | Bits/Tok: 4.184 | Time: 4480s
+INN | Step 4250 | Loss: 3.0671 | Ppl: 21.48 | Bits/Tok: 4.425 | Time: 4490s
+INN | Step 4260 | Loss: 3.0132 | Ppl: 20.35 | Bits/Tok: 4.347 | Time: 4501s
+INN | Step 4270 | Loss: 2.9834 | Ppl: 19.75 | Bits/Tok: 4.304 | Time: 4512s
+INN | Step 4280 | Loss: 3.0146 | Ppl: 20.38 | Bits/Tok: 4.349 | Time: 4522s
+INN | Step 4290 | Loss: 3.0132 | Ppl: 20.35 | Bits/Tok: 4.347 | Time: 4533s
+INN | Step 4300 | Loss: 3.0132 | Ppl: 20.35 | Bits/Tok: 4.347 | Time: 4543s
+INN | Step 4310 | Loss: 2.8433 | Ppl: 17.17 | Bits/Tok: 4.102 | Time: 4554s
+INN | Step 4320 | Loss: 3.0585 | Ppl: 21.30 | Bits/Tok: 4.412 | Time: 4564s
+INN | Step 4330 | Loss: 3.0431 | Ppl: 20.97 | Bits/Tok: 4.390 | Time: 4575s
+INN | Step 4340 | Loss: 2.9703 | Ppl: 19.50 | Bits/Tok: 4.285 | Time: 4585s
+INN | Step 4350 | Loss: 3.0008 | Ppl: 20.10 | Bits/Tok: 4.329 | Time: 4596s
+INN | Step 4360 | Loss: 3.1145 | Ppl: 22.52 | Bits/Tok: 4.493 | Time: 4607s
+INN | Step 4370 | Loss: 2.9481 | Ppl: 19.07 | Bits/Tok: 4.253 | Time: 4617s
+INN | Step 4380 | Loss: 3.0527 | Ppl: 21.17 | Bits/Tok: 4.404 | Time: 4628s
+INN | Step 4390 | Loss: 3.0450 | Ppl: 21.01 | Bits/Tok: 4.393 | Time: 4638s
+INN | Step 4400 | Loss: 2.9650 | Ppl: 19.39 | Bits/Tok: 4.278 | Time: 4649s
+INN | Step 4410 | Loss: 3.0458 | Ppl: 21.03 | Bits/Tok: 4.394 | Time: 4659s
+INN | Step 4420 | Loss: 2.9646 | Ppl: 19.39 | Bits/Tok: 4.277 | Time: 4670s
+INN | Step 4430 | Loss: 3.0512 | Ppl: 21.14 | Bits/Tok: 4.402 | Time: 4680s
+INN | Step 4440 | Loss: 3.0514 | Ppl: 21.14 | Bits/Tok: 4.402 | Time: 4691s
+INN | Step 4450 | Loss: 2.9931 | Ppl: 19.95 | Bits/Tok: 4.318 | Time: 4701s
+INN | Step 4460 | Loss: 2.9562 | Ppl: 19.22 | Bits/Tok: 4.265 | Time: 4712s
+
+🥊 STARTING BENCHMARK: WaveNet
+📊 Parameters: 12,418,304
+⚡ Compiling model with torch.compile()...
+WaveNet | Step 10 | Loss: 5.1486 | Ppl: 172.20 | Bits/Tok: 7.428 | Time: 28s
+WaveNet | Step 20 | Loss: 4.6606 | Ppl: 105.70 | Bits/Tok: 6.724 | Time: 35s
+WaveNet | Step 30 | Loss: 4.5626 | Ppl: 95.84 | Bits/Tok: 6.582 | Time: 41s
+WaveNet | Step 40 | Loss: 3.9887 | Ppl: 53.99 | Bits/Tok: 5.754 | Time: 48s
+WaveNet | Step 50 | Loss: 4.1483 | Ppl: 63.33 | Bits/Tok: 5.985 | Time: 55s
+WaveNet | Step 60 | Loss: 3.9518 | Ppl: 52.03 | Bits/Tok: 5.701 | Time: 62s
+WaveNet | Step 70 | Loss: 3.8569 | Ppl: 47.32 | Bits/Tok: 5.564 | Time: 69s
+WaveNet | Step 80 | Loss: 3.9276 | Ppl: 50.79 | Bits/Tok: 5.666 | Time: 75s
+WaveNet | Step 90 | Loss: 3.8768 | Ppl: 48.27 | Bits/Tok: 5.593 | Time: 82s
+WaveNet | Step 100 | Loss: 3.8232 | Ppl: 45.75 | Bits/Tok: 5.516 | Time: 89s
+WaveNet | Step 110 | Loss: 3.6698 | Ppl: 39.24 | Bits/Tok: 5.294 | Time: 96s
+WaveNet | Step 120 | Loss: 3.5845 | Ppl: 36.04 | Bits/Tok: 5.171 | Time: 103s
+WaveNet | Step 130 | Loss: 3.7166 | Ppl: 41.12 | Bits/Tok: 5.362 | Time: 109s
+WaveNet | Step 140 | Loss: 3.5535 | Ppl: 34.93 | Bits/Tok: 5.127 | Time: 116s
+WaveNet | Step 150 | Loss: 3.6895 | Ppl: 40.03 | Bits/Tok: 5.323 | Time: 123s
+WaveNet | Step 160 | Loss: 3.5076 | Ppl: 33.37 | Bits/Tok: 5.060 | Time: 130s
+WaveNet | Step 170 | Loss: 3.5264 | Ppl: 34.00 | Bits/Tok: 5.088 | Time: 137s
+WaveNet | Step 180 | Loss: 3.5358 | Ppl: 34.32 | Bits/Tok: 5.101 | Time: 143s
+WaveNet | Step 190 | Loss: 3.5761 | Ppl: 35.73 | Bits/Tok: 5.159 | Time: 150s
+WaveNet | Step 200 | Loss: 3.4402 | Ppl: 31.19 | Bits/Tok: 4.963 | Time: 157s
+WaveNet | Step 210 | Loss: 3.6041 | Ppl: 36.75 | Bits/Tok: 5.200 | Time: 164s
+WaveNet | Step 220 | Loss: 3.6605 | Ppl: 38.88 | Bits/Tok: 5.281 | Time: 171s
+WaveNet | Step 230 | Loss: 3.5540 | Ppl: 34.95 | Bits/Tok: 5.127 | Time: 178s
+WaveNet | Step 240 | Loss: 3.5286 | Ppl: 34.08 | Bits/Tok: 5.091 | Time: 184s
+WaveNet | Step 250 | Loss: 3.4900 | Ppl: 32.79 | Bits/Tok: 5.035 | Time: 191s
+WaveNet | Step 260 | Loss: 3.4475 | Ppl: 31.42 | Bits/Tok: 4.974 | Time: 198s
+WaveNet | Step 270 | Loss: 3.3672 | Ppl: 29.00 | Bits/Tok: 4.858 | Time: 205s
+WaveNet | Step 280 | Loss: 3.4914 | Ppl: 32.83 | Bits/Tok: 5.037 | Time: 212s
+WaveNet | Step 290 | Loss: 3.3549 | Ppl: 28.64 | Bits/Tok: 4.840 | Time: 218s
+WaveNet | Step 300 | Loss: 3.4441 | Ppl: 31.31 | Bits/Tok: 4.969 | Time: 225s
+WaveNet | Step 310 | Loss: 3.4688 | Ppl: 32.10 | Bits/Tok: 5.004 | Time: 232s
+WaveNet | Step 320 | Loss: 3.3098 | Ppl: 27.38 | Bits/Tok: 4.775 | Time: 239s
+WaveNet | Step 330 | Loss: 3.3811 | Ppl: 29.40 | Bits/Tok: 4.878 | Time: 245s
+WaveNet | Step 340 | Loss: 3.4666 | Ppl: 32.03 | Bits/Tok: 5.001 | Time: 252s
+WaveNet | Step 350 | Loss: 3.3961 | Ppl: 29.85 | Bits/Tok: 4.900 | Time: 259s
+WaveNet | Step 360 | Loss: 3.5138 | Ppl: 33.58 | Bits/Tok: 5.069 | Time: 266s
+WaveNet | Step 370 | Loss: 3.2822 | Ppl: 26.64 | Bits/Tok: 4.735 | Time: 272s
+WaveNet | Step 380 | Loss: 3.4106 | Ppl: 30.28 | Bits/Tok: 4.921 | Time: 279s
+WaveNet | Step 390 | Loss: 3.3050 | Ppl: 27.25 | Bits/Tok: 4.768 | Time: 286s
+WaveNet | Step 400 | Loss: 3.3839 | Ppl: 29.49 | Bits/Tok: 4.882 | Time: 293s
+WaveNet | Step 410 | Loss: 3.4220 | Ppl: 30.63 | Bits/Tok: 4.937 | Time: 299s
+WaveNet | Step 420 | Loss: 3.3884 | Ppl: 29.62 | Bits/Tok: 4.888 | Time: 306s
+WaveNet | Step 430 | Loss: 3.4827 | Ppl: 32.55 | Bits/Tok: 5.024 | Time: 313s
+WaveNet | Step 440 | Loss: 3.3256 | Ppl: 27.82 | Bits/Tok: 4.798 | Time: 320s
+WaveNet | Step 450 | Loss: 3.3710 | Ppl: 29.11 | Bits/Tok: 4.863 | Time: 362s
+WaveNet | Step 460 | Loss: 3.3881 | Ppl: 29.61 | Bits/Tok: 4.888 | Time: 369s
+WaveNet | Step 470 | Loss: 3.4629 | Ppl: 31.91 | Bits/Tok: 4.996 | Time: 376s
+WaveNet | Step 480 | Loss: 3.2644 | Ppl: 26.17 | Bits/Tok: 4.710 | Time: 382s
+WaveNet | Step 490 | Loss: 3.4164 | Ppl: 30.46 | Bits/Tok: 4.929 | Time: 389s
+WaveNet | Step 500 | Loss: 3.3178 | Ppl: 27.60 | Bits/Tok: 4.787 | Time: 396s
+WaveNet | Step 510 | Loss: 3.3879 | Ppl: 29.60 | Bits/Tok: 4.888 | Time: 403s
+WaveNet | Step 520 | Loss: 3.2902 | Ppl: 26.85 | Bits/Tok: 4.747 | Time: 409s
+WaveNet | Step 530 | Loss: 3.4043 | Ppl: 30.09 | Bits/Tok: 4.911 | Time: 416s
+WaveNet | Step 540 | Loss: 3.3906 | Ppl: 29.68 | Bits/Tok: 4.892 | Time: 423s
+WaveNet | Step 550 | Loss: 3.3285 | Ppl: 27.90 | Bits/Tok: 4.802 | Time: 430s
+WaveNet | Step 560 | Loss: 3.3717 | Ppl: 29.13 | Bits/Tok: 4.864 | Time: 437s
+WaveNet | Step 570 | Loss: 3.5044 | Ppl: 33.26 | Bits/Tok: 5.056 | Time: 443s
+WaveNet | Step 580 | Loss: 3.2853 | Ppl: 26.72 | Bits/Tok: 4.740 | Time: 450s
+WaveNet | Step 590 | Loss: 3.4712 | Ppl: 32.17 | Bits/Tok: 5.008 | Time: 457s
+WaveNet | Step 600 | Loss: 3.2948 | Ppl: 26.97 | Bits/Tok: 4.753 | Time: 463s
+WaveNet | Step 610 | Loss: 3.3009 | Ppl: 27.14 | Bits/Tok: 4.762 | Time: 470s
+WaveNet | Step 620 | Loss: 3.3119 | Ppl: 27.44 | Bits/Tok: 4.778 | Time: 477s
+WaveNet | Step 630 | Loss: 3.4439 | Ppl: 31.31 | Bits/Tok: 4.968 | Time: 484s
+WaveNet | Step 640 | Loss: 3.2062 | Ppl: 24.68 | Bits/Tok: 4.626 | Time: 490s
+WaveNet | Step 650 | Loss: 3.1689 | Ppl: 23.78 | Bits/Tok: 4.572 | Time: 497s
+WaveNet | Step 660 | Loss: 3.3678 | Ppl: 29.01 | Bits/Tok: 4.859 | Time: 504s
+WaveNet | Step 670 | Loss: 3.3407 | Ppl: 28.24 | Bits/Tok: 4.820 | Time: 511s
+WaveNet | Step 680 | Loss: 3.3544 | Ppl: 28.63 | Bits/Tok: 4.839 | Time: 517s
+WaveNet | Step 690 | Loss: 3.3110 | Ppl: 27.41 | Bits/Tok: 4.777 | Time: 524s
+WaveNet | Step 700 | Loss: 3.3732 | Ppl: 29.17 | Bits/Tok: 4.866 | Time: 531s
+WaveNet | Step 710 | Loss: 3.3481 | Ppl: 28.45 | Bits/Tok: 4.830 | Time: 537s
+WaveNet | Step 720 | Loss: 3.2154 | Ppl: 24.91 | Bits/Tok: 4.639 | Time: 544s
+WaveNet | Step 730 | Loss: 3.3559 | Ppl: 28.67 | Bits/Tok: 4.842 | Time: 551s
+WaveNet | Step 740 | Loss: 3.2571 | Ppl: 25.97 | Bits/Tok: 4.699 | Time: 558s
+WaveNet | Step 750 | Loss: 3.3611 | Ppl: 28.82 | Bits/Tok: 4.849 | Time: 564s
+WaveNet | Step 760 | Loss: 3.2798 | Ppl: 26.57 | Bits/Tok: 4.732 | Time: 571s
+WaveNet | Step 770 | Loss: 3.2952 | Ppl: 26.98 | Bits/Tok: 4.754 | Time: 578s
+WaveNet | Step 780 | Loss: 3.1323 | Ppl: 22.93 | Bits/Tok: 4.519 | Time: 585s
+WaveNet | Step 790 | Loss: 3.2543 | Ppl: 25.90 | Bits/Tok: 4.695 | Time: 591s
+WaveNet | Step 800 | Loss: 3.3463 | Ppl: 28.40 | Bits/Tok: 4.828 | Time: 598s
+WaveNet | Step 810 | Loss: 3.2155 | Ppl: 24.91 | Bits/Tok: 4.639 | Time: 605s
+WaveNet | Step 820 | Loss: 3.1921 | Ppl: 24.34 | Bits/Tok: 4.605 | Time: 612s
+WaveNet | Step 830 | Loss: 3.3258 | Ppl: 27.82 | Bits/Tok: 4.798 | Time: 618s
+WaveNet | Step 840 | Loss: 3.4370 | Ppl: 31.09 | Bits/Tok: 4.959 | Time: 625s
+WaveNet | Step 850 | Loss: 3.2354 | Ppl: 25.42 | Bits/Tok: 4.668 | Time: 632s
+WaveNet | Step 860 | Loss: 3.2622 | Ppl: 26.11 | Bits/Tok: 4.706 | Time: 639s
+WaveNet | Step 870 | Loss: 3.2027 | Ppl: 24.60 | Bits/Tok: 4.620 | Time: 645s
+WaveNet | Step 880 | Loss: 3.1355 | Ppl: 23.00 | Bits/Tok: 4.524 | Time: 652s
+WaveNet | Step 890 | Loss: 3.4099 | Ppl: 30.26 | Bits/Tok: 4.919 | Time: 659s
+WaveNet | Step 900 | Loss: 3.3001 | Ppl: 27.12 | Bits/Tok: 4.761 | Time: 666s
+WaveNet | Step 910 | Loss: 3.1571 | Ppl: 23.50 | Bits/Tok: 4.555 | Time: 673s
+WaveNet | Step 920 | Loss: 3.3554 | Ppl: 28.66 | Bits/Tok: 4.841 | Time: 679s
+WaveNet | Step 930 | Loss: 3.1758 | Ppl: 23.95 | Bits/Tok: 4.582 | Time: 686s
+WaveNet | Step 940 | Loss: 3.2112 | Ppl: 24.81 | Bits/Tok: 4.633 | Time: 693s
+WaveNet | Step 950 | Loss: 3.2523 | Ppl: 25.85 | Bits/Tok: 4.692 | Time: 699s
+WaveNet | Step 960 | Loss: 3.2580 | Ppl: 26.00 | Bits/Tok: 4.700 | Time: 706s
+WaveNet | Step 970 | Loss: 3.4201 | Ppl: 30.57 | Bits/Tok: 4.934 | Time: 713s
+WaveNet | Step 980 | Loss: 3.3041 | Ppl: 27.22 | Bits/Tok: 4.767 | Time: 720s
+WaveNet | Step 990 | Loss: 3.2010 | Ppl: 24.56 | Bits/Tok: 4.618 | Time: 726s
+WaveNet | Step 1000 | Loss: 3.2563 | Ppl: 25.95 | Bits/Tok: 4.698 | Time: 733s
+WaveNet | Step 1010 | Loss: 3.2325 | Ppl: 25.34 | Bits/Tok: 4.664 | Time: 740s
+WaveNet | Step 1020 | Loss: 3.1365 | Ppl: 23.02 | Bits/Tok: 4.525 | Time: 747s
+WaveNet | Step 1030 | Loss: 3.1057 | Ppl: 22.32 | Bits/Tok: 4.481 | Time: 753s
+WaveNet | Step 1040 | Loss: 3.1831 | Ppl: 24.12 | Bits/Tok: 4.592 | Time: 760s
+WaveNet | Step 1050 | Loss: 3.1167 | Ppl: 22.57 | Bits/Tok: 4.496 | Time: 767s
+WaveNet | Step 1060 | Loss: 3.2744 | Ppl: 26.43 | Bits/Tok: 4.724 | Time: 774s
+WaveNet | Step 1070 | Loss: 3.1139 | Ppl: 22.51 | Bits/Tok: 4.492 | Time: 780s
+WaveNet | Step 1080 | Loss: 3.1419 | Ppl: 23.15 | Bits/Tok: 4.533 | Time: 787s
+WaveNet | Step 1090 | Loss: 3.2085 | Ppl: 24.74 | Bits/Tok: 4.629 | Time: 794s
+WaveNet | Step 1100 | Loss: 3.2103 | Ppl: 24.79 | Bits/Tok: 4.631 | Time: 800s
+WaveNet | Step 1110 | Loss: 3.2985 | Ppl: 27.07 | Bits/Tok: 4.759 | Time: 807s
+WaveNet | Step 1120 | Loss: 3.1791 | Ppl: 24.03 | Bits/Tok: 4.586 | Time: 814s
+WaveNet | Step 1130 | Loss: 3.1576 | Ppl: 23.51 | Bits/Tok: 4.555 | Time: 821s
+WaveNet | Step 1140 | Loss: 3.2853 | Ppl: 26.72 | Bits/Tok: 4.740 | Time: 828s
+WaveNet | Step 1150 | Loss: 3.2671 | Ppl: 26.24 | Bits/Tok: 4.713 | Time: 835s
+WaveNet | Step 1160 | Loss: 3.2408 | Ppl: 25.55 | Bits/Tok: 4.675 | Time: 841s
+WaveNet | Step 1170 | Loss: 3.2770 | Ppl: 26.50 | Bits/Tok: 4.728 | Time: 848s
+WaveNet | Step 1180 | Loss: 3.1951 | Ppl: 24.41 | Bits/Tok: 4.610 | Time: 855s
+WaveNet | Step 1190 | Loss: 3.0509 | Ppl: 21.13 | Bits/Tok: 4.402 | Time: 862s
+WaveNet | Step 1200 | Loss: 3.0716 | Ppl: 21.58 | Bits/Tok: 4.431 | Time: 868s
+WaveNet | Step 1210 | Loss: 3.1092 | Ppl: 22.40 | Bits/Tok: 4.486 | Time: 875s
+WaveNet | Step 1220 | Loss: 3.2614 | Ppl: 26.09 | Bits/Tok: 4.705 | Time: 882s
+WaveNet | Step 1230 | Loss: 3.3564 | Ppl: 28.69 | Bits/Tok: 4.842 | Time: 889s
+WaveNet | Step 1240 | Loss: 3.2934 | Ppl: 26.93 | Bits/Tok: 4.751 | Time: 895s
+WaveNet | Step 1250 | Loss: 3.2240 | Ppl: 25.13 | Bits/Tok: 4.651 | Time: 902s
+WaveNet | Step 1260 | Loss: 3.1908 | Ppl: 24.31 | Bits/Tok: 4.603 | Time: 909s
+WaveNet | Step 1270 | Loss: 3.0938 | Ppl: 22.06 | Bits/Tok: 4.463 | Time: 916s
+WaveNet | Step 1280 | Loss: 3.2726 | Ppl: 26.38 | Bits/Tok: 4.721 | Time: 922s
+WaveNet | Step 1290 | Loss: 3.1895 | Ppl: 24.28 | Bits/Tok: 4.601 | Time: 929s
+WaveNet | Step 1300 | Loss: 3.2041 | Ppl: 24.63 | Bits/Tok: 4.623 | Time: 936s
+WaveNet | Step 1310 | Loss: 3.1010 | Ppl: 22.22 | Bits/Tok: 4.474 | Time: 943s
+WaveNet | Step 1320 | Loss: 3.2459 | Ppl: 25.68 | Bits/Tok: 4.683 | Time: 949s
+WaveNet | Step 1330 | Loss: 3.3215 | Ppl: 27.70 | Bits/Tok: 4.792 | Time: 956s
+WaveNet | Step 1340 | Loss: 2.9689 | Ppl: 19.47 | Bits/Tok: 4.283 | Time: 963s
+WaveNet | Step 1350 | Loss: 3.0884 | Ppl: 21.94 | Bits/Tok: 4.456 | Time: 969s
+WaveNet | Step 1360 | Loss: 3.2410 | Ppl: 25.56 | Bits/Tok: 4.676 | Time: 976s
+WaveNet | Step 1370 | Loss: 3.1306 | Ppl: 22.89 | Bits/Tok: 4.516 | Time: 983s
+WaveNet | Step 1380 | Loss: 3.3067 | Ppl: 27.30 | Bits/Tok: 4.771 | Time: 990s
+WaveNet | Step 1390 | Loss: 3.1031 | Ppl: 22.27 | Bits/Tok: 4.477 | Time: 996s
+WaveNet | Step 1400 | Loss: 3.1263 | Ppl: 22.79 | Bits/Tok: 4.510 | Time: 1003s
+WaveNet | Step 1410 | Loss: 3.2086 | Ppl: 24.74 | Bits/Tok: 4.629 | Time: 1010s
+WaveNet | Step 1420 | Loss: 3.0661 | Ppl: 21.46 | Bits/Tok: 4.423 | Time: 1017s
+WaveNet | Step 1430 | Loss: 3.2024 | Ppl: 24.59 | Bits/Tok: 4.620 | Time: 1024s
+WaveNet | Step 1440 | Loss: 3.1795 | Ppl: 24.03 | Bits/Tok: 4.587 | Time: 1030s
+WaveNet | Step 1450 | Loss: 3.1893 | Ppl: 24.27 | Bits/Tok: 4.601 | Time: 1037s
+WaveNet | Step 1460 | Loss: 3.2323 | Ppl: 25.34 | Bits/Tok: 4.663 | Time: 1044s
+WaveNet | Step 1470 | Loss: 3.0596 | Ppl: 21.32 | Bits/Tok: 4.414 | Time: 1050s
+WaveNet | Step 1480 | Loss: 3.1369 | Ppl: 23.03 | Bits/Tok: 4.526 | Time: 1057s
+WaveNet | Step 1490 | Loss: 2.9507 | Ppl: 19.12 | Bits/Tok: 4.257 | Time: 1064s
+WaveNet | Step 1500 | Loss: 3.3161 | Ppl: 27.55 | Bits/Tok: 4.784 | Time: 1071s
+WaveNet | Step 1510 | Loss: 3.2980 | Ppl: 27.06 | Bits/Tok: 4.758 | Time: 1077s
+WaveNet | Step 1520 | Loss: 3.0147 | Ppl: 20.38 | Bits/Tok: 4.349 | Time: 1084s
+WaveNet | Step 1530 | Loss: 3.1197 | Ppl: 22.64 | Bits/Tok: 4.501 | Time: 1091s
+WaveNet | Step 1540 | Loss: 3.2844 | Ppl: 26.69 | Bits/Tok: 4.738 | Time: 1098s
+WaveNet | Step 1550 | Loss: 3.1167 | Ppl: 22.57 | Bits/Tok: 4.496 | Time: 1104s
+WaveNet | Step 1560 | Loss: 3.2513 | Ppl: 25.82 | Bits/Tok: 4.691 | Time: 1111s
+WaveNet | Step 1570 | Loss: 3.1102 | Ppl: 22.43 | Bits/Tok: 4.487 | Time: 1118s
+WaveNet | Step 1580 | Loss: 3.2228 | Ppl: 25.10 | Bits/Tok: 4.649 | Time: 1125s
+WaveNet | Step 1590 | Loss: 3.0734 | Ppl: 21.62 | Bits/Tok: 4.434 | Time: 1131s
+WaveNet | Step 1600 | Loss: 3.2223 | Ppl: 25.09 | Bits/Tok: 4.649 | Time: 1138s
+WaveNet | Step 1610 | Loss: 3.2477 | Ppl: 25.73 | Bits/Tok: 4.685 | Time: 1145s
+WaveNet | Step 1620 | Loss: 3.1532 | Ppl: 23.41 | Bits/Tok: 4.549 | Time: 1152s
+WaveNet | Step 1630 | Loss: 3.2478 | Ppl: 25.73 | Bits/Tok: 4.686 | Time: 1158s
+WaveNet | Step 1640 | Loss: 3.1517 | Ppl: 23.38 | Bits/Tok: 4.547 | Time: 1165s
+WaveNet | Step 1650 | Loss: 3.2662 | Ppl: 26.21 | Bits/Tok: 4.712 | Time: 1172s
+WaveNet | Step 1660 | Loss: 3.1208 | Ppl: 22.66 | Bits/Tok: 4.502 | Time: 1179s
+WaveNet | Step 1670 | Loss: 3.1614 | Ppl: 23.60 | Bits/Tok: 4.561 | Time: 1186s
+WaveNet | Step 1680 | Loss: 3.0832 | Ppl: 21.83 | Bits/Tok: 4.448 | Time: 1192s
+WaveNet | Step 1690 | Loss: 3.2624 | Ppl: 26.11 | Bits/Tok: 4.707 | Time: 1199s
+WaveNet | Step 1700 | Loss: 3.0965 | Ppl: 22.12 | Bits/Tok: 4.467 | Time: 1206s
+WaveNet | Step 1710 | Loss: 3.2196 | Ppl: 25.02 | Bits/Tok: 4.645 | Time: 1213s
+WaveNet | Step 1720 | Loss: 3.1384 | Ppl: 23.07 | Bits/Tok: 4.528 | Time: 1220s
+WaveNet | Step 1730 | Loss: 3.1930 | Ppl: 24.36 | Bits/Tok: 4.607 | Time: 1226s
+WaveNet | Step 1740 | Loss: 3.2885 | Ppl: 26.80 | Bits/Tok: 4.744 | Time: 1233s
+WaveNet | Step 1750 | Loss: 3.1912 | Ppl: 24.32 | Bits/Tok: 4.604 | Time: 1240s
+WaveNet | Step 1760 | Loss: 3.2522 | Ppl: 25.85 | Bits/Tok: 4.692 | Time: 1247s
+WaveNet | Step 1770 | Loss: 3.0182 | Ppl: 20.46 | Bits/Tok: 4.354 | Time: 1253s
+WaveNet | Step 1780 | Loss: 3.1004 | Ppl: 22.21 | Bits/Tok: 4.473 | Time: 1260s
+WaveNet | Step 1790 | Loss: 3.2512 | Ppl: 25.82 | Bits/Tok: 4.691 | Time: 1267s
+WaveNet | Step 1800 | Loss: 3.0521 | Ppl: 21.16 | Bits/Tok: 4.403 | Time: 1273s
+WaveNet | Step 1810 | Loss: 3.0704 | Ppl: 21.55 | Bits/Tok: 4.430 | Time: 1280s
+WaveNet | Step 1820 | Loss: 3.1175 | Ppl: 22.59 | Bits/Tok: 4.498 | Time: 1287s
+WaveNet | Step 1830 | Loss: 3.1103 | Ppl: 22.43 | Bits/Tok: 4.487 | Time: 1294s
+WaveNet | Step 1840 | Loss: 3.2059 | Ppl: 24.68 | Bits/Tok: 4.625 | Time: 1300s
+WaveNet | Step 1850 | Loss: 3.1865 | Ppl: 24.20 | Bits/Tok: 4.597 | Time: 1307s
+WaveNet | Step 1860 | Loss: 3.0644 | Ppl: 21.42 | Bits/Tok: 4.421 | Time: 1314s
+WaveNet | Step 1870 | Loss: 3.2219 | Ppl: 25.08 | Bits/Tok: 4.648 | Time: 1321s
+WaveNet | Step 1880 | Loss: 3.1104 | Ppl: 22.43 | Bits/Tok: 4.487 | Time: 1327s
+WaveNet | Step 1890 | Loss: 2.9814 | Ppl: 19.72 | Bits/Tok: 4.301 | Time: 1334s
+WaveNet | Step 1900 | Loss: 3.1776 | Ppl: 23.99 | Bits/Tok: 4.584 | Time: 1341s
+WaveNet | Step 1910 | Loss: 3.1037 | Ppl: 22.28 | Bits/Tok: 4.478 | Time: 1347s
+WaveNet | Step 1920 | Loss: 3.1308 | Ppl: 22.89 | Bits/Tok: 4.517 | Time: 1354s
+WaveNet | Step 1930 | Loss: 3.1195 | Ppl: 22.63 | Bits/Tok: 4.500 | Time: 1361s
+WaveNet | Step 1940 | Loss: 2.9949 | Ppl: 19.98 | Bits/Tok: 4.321 | Time: 1368s
+WaveNet | Step 1950 | Loss: 3.0198 | Ppl: 20.49 | Bits/Tok: 4.357 | Time: 1374s
+WaveNet | Step 1960 | Loss: 3.2293 | Ppl: 25.26 | Bits/Tok: 4.659 | Time: 1381s
+WaveNet | Step 1970 | Loss: 3.1699 | Ppl: 23.81 | Bits/Tok: 4.573 | Time: 1388s
+WaveNet | Step 1980 | Loss: 3.0147 | Ppl: 20.38 | Bits/Tok: 4.349 | Time: 1394s
+WaveNet | Step 1990 | Loss: 3.0849 | Ppl: 21.87 | Bits/Tok: 4.451 | Time: 1401s
+WaveNet | Step 2000 | Loss: 2.9984 | Ppl: 20.05 | Bits/Tok: 4.326 | Time: 1408s
+WaveNet | Step 2010 | Loss: 3.1608 | Ppl: 23.59 | Bits/Tok: 4.560 | Time: 1414s
+WaveNet | Step 2020 | Loss: 3.1671 | Ppl: 23.74 | Bits/Tok: 4.569 | Time: 1421s
+WaveNet | Step 2030 | Loss: 3.2245 | Ppl: 25.14 | Bits/Tok: 4.652 | Time: 1428s
+WaveNet | Step 2040 | Loss: 3.1427 | Ppl: 23.17 | Bits/Tok: 4.534 | Time: 1435s
+WaveNet | Step 2050 | Loss: 3.1432 | Ppl: 23.18 | Bits/Tok: 4.535 | Time: 1441s
+WaveNet | Step 2060 | Loss: 3.0797 | Ppl: 21.75 | Bits/Tok: 4.443 | Time: 1448s
+WaveNet | Step 2070 | Loss: 3.1908 | Ppl: 24.31 | Bits/Tok: 4.603 | Time: 1455s
+WaveNet | Step 2080 | Loss: 3.0129 | Ppl: 20.35 | Bits/Tok: 4.347 | Time: 1462s
+WaveNet | Step 2090 | Loss: 3.2334 | Ppl: 25.37 | Bits/Tok: 4.665 | Time: 1468s
+WaveNet | Step 2100 | Loss: 3.0411 | Ppl: 20.93 | Bits/Tok: 4.387 | Time: 1475s
+WaveNet | Step 2110 | Loss: 3.1165 | Ppl: 22.57 | Bits/Tok: 4.496 | Time: 1482s
+WaveNet | Step 2120 | Loss: 3.1507 | Ppl: 23.35 | Bits/Tok: 4.545 | Time: 1488s
+WaveNet | Step 2130 | Loss: 2.9669 | Ppl: 19.43 | Bits/Tok: 4.280 | Time: 1495s
+WaveNet | Step 2140 | Loss: 3.1183 | Ppl: 22.61 | Bits/Tok: 4.499 | Time: 1502s
+WaveNet | Step 2150 | Loss: 3.0489 | Ppl: 21.09 | Bits/Tok: 4.399 | Time: 1509s
+WaveNet | Step 2160 | Loss: 3.0025 | Ppl: 20.14 | Bits/Tok: 4.332 | Time: 1515s
+WaveNet | Step 2170 | Loss: 3.1850 | Ppl: 24.17 | Bits/Tok: 4.595 | Time: 1522s
+WaveNet | Step 2180 | Loss: 3.1989 | Ppl: 24.51 | Bits/Tok: 4.615 | Time: 1529s
+WaveNet | Step 2190 | Loss: 3.1886 | Ppl: 24.25 | Bits/Tok: 4.600 | Time: 1536s
+WaveNet | Step 2200 | Loss: 3.2325 | Ppl: 25.34 | Bits/Tok: 4.663 | Time: 1543s
+WaveNet | Step 2210 | Loss: 2.8662 | Ppl: 17.57 | Bits/Tok: 4.135 | Time: 1549s
+WaveNet | Step 2220 | Loss: 3.0521 | Ppl: 21.16 | Bits/Tok: 4.403 | Time: 1556s
+WaveNet | Step 2230 | Loss: 3.0933 | Ppl: 22.05 | Bits/Tok: 4.463 | Time: 1563s
+WaveNet | Step 2240 | Loss: 3.1876 | Ppl: 24.23 | Bits/Tok: 4.599 | Time: 1569s
+WaveNet | Step 2250 | Loss: 3.0560 | Ppl: 21.24 | Bits/Tok: 4.409 | Time: 1576s
+WaveNet | Step 2260 | Loss: 3.1056 | Ppl: 22.32 | Bits/Tok: 4.480 | Time: 1583s
+WaveNet | Step 2270 | Loss: 3.0432 | Ppl: 20.97 | Bits/Tok: 4.390 | Time: 1590s
+WaveNet | Step 2280 | Loss: 3.0986 | Ppl: 22.17 | Bits/Tok: 4.470 | Time: 1597s
+WaveNet | Step 2290 | Loss: 2.9748 | Ppl: 19.59 | Bits/Tok: 4.292 | Time: 1604s
+WaveNet | Step 2300 | Loss: 3.0609 | Ppl: 21.35 | Bits/Tok: 4.416 | Time: 1610s
+WaveNet | Step 2310 | Loss: 3.1832 | Ppl: 24.12 | Bits/Tok: 4.592 | Time: 1617s
+WaveNet | Step 2320 | Loss: 3.1863 | Ppl: 24.20 | Bits/Tok: 4.597 | Time: 1624s
+WaveNet | Step 2330 | Loss: 3.1431 | Ppl: 23.18 | Bits/Tok: 4.535 | Time: 1630s
+WaveNet | Step 2340 | Loss: 3.0851 | Ppl: 21.87 | Bits/Tok: 4.451 | Time: 1637s
+WaveNet | Step 2350 | Loss: 2.8302 | Ppl: 16.95 | Bits/Tok: 4.083 | Time: 1644s
+WaveNet | Step 2360 | Loss: 3.0864 | Ppl: 21.90 | Bits/Tok: 4.453 | Time: 1650s
+WaveNet | Step 2370 | Loss: 3.1973 | Ppl: 24.47 | Bits/Tok: 4.613 | Time: 1657s
+WaveNet | Step 2380 | Loss: 3.0813 | Ppl: 21.79 | Bits/Tok: 4.445 | Time: 1664s
+WaveNet | Step 2390 | Loss: 3.0484 | Ppl: 21.08 | Bits/Tok: 4.398 | Time: 1671s
+WaveNet | Step 2400 | Loss: 3.0760 | Ppl: 21.67 | Bits/Tok: 4.438 | Time: 1677s
+WaveNet | Step 2410 | Loss: 3.2185 | Ppl: 24.99 | Bits/Tok: 4.643 | Time: 1684s
+WaveNet | Step 2420 | Loss: 3.2166 | Ppl: 24.94 | Bits/Tok: 4.641 | Time: 1691s
+WaveNet | Step 2430 | Loss: 2.8962 | Ppl: 18.11 | Bits/Tok: 4.178 | Time: 1698s
+WaveNet | Step 2440 | Loss: 3.1185 | Ppl: 22.61 | Bits/Tok: 4.499 | Time: 1704s
+WaveNet | Step 2450 | Loss: 3.1274 | Ppl: 22.82 | Bits/Tok: 4.512 | Time: 1711s
+WaveNet | Step 2460 | Loss: 3.1348 | Ppl: 22.98 | Bits/Tok: 4.523 | Time: 1718s
+WaveNet | Step 2470 | Loss: 2.9843 | Ppl: 19.77 | Bits/Tok: 4.305 | Time: 1724s
+WaveNet | Step 2480 | Loss: 3.0440 | Ppl: 20.99 | Bits/Tok: 4.392 | Time: 1731s
+WaveNet | Step 2490 | Loss: 3.1123 | Ppl: 22.47 | Bits/Tok: 4.490 | Time: 1738s
+WaveNet | Step 2500 | Loss: 3.0432 | Ppl: 20.97 | Bits/Tok: 4.390 | Time: 1745s
+WaveNet | Step 2510 | Loss: 3.1209 | Ppl: 22.67 | Bits/Tok: 4.503 | Time: 1751s
+WaveNet | Step 2520 | Loss: 3.1531 | Ppl: 23.41 | Bits/Tok: 4.549 | Time: 1758s
+WaveNet | Step 2530 | Loss: 3.0490 | Ppl: 21.09 | Bits/Tok: 4.399 | Time: 1765s
+WaveNet | Step 2540 | Loss: 3.1001 | Ppl: 22.20 | Bits/Tok: 4.473 | Time: 1771s
+WaveNet | Step 2550 | Loss: 3.1449 | Ppl: 23.22 | Bits/Tok: 4.537 | Time: 1778s
+WaveNet | Step 2560 | Loss: 3.1243 | Ppl: 22.74 | Bits/Tok: 4.507 | Time: 1785s
+WaveNet | Step 2570 | Loss: 3.0837 | Ppl: 21.84 | Bits/Tok: 4.449 | Time: 1791s
+WaveNet | Step 2580 | Loss: 3.1404 | Ppl: 23.11 | Bits/Tok: 4.531 | Time: 1798s
+WaveNet | Step 2590 | Loss: 3.0774 | Ppl: 21.70 | Bits/Tok: 4.440 | Time: 1805s
+WaveNet | Step 2600 | Loss: 3.1431 | Ppl: 23.18 | Bits/Tok: 4.535 | Time: 1812s
+WaveNet | Step 2610 | Loss: 3.0454 | Ppl: 21.02 | Bits/Tok: 4.394 | Time: 1818s
+WaveNet | Step 2620 | Loss: 2.9529 | Ppl: 19.16 | Bits/Tok: 4.260 | Time: 1825s
+WaveNet | Step 2630 | Loss: 3.0448 | Ppl: 21.01 | Bits/Tok: 4.393 | Time: 1832s
+WaveNet | Step 2640 | Loss: 2.9249 | Ppl: 18.63 | Bits/Tok: 4.220 | Time: 1838s
+WaveNet | Step 2650 | Loss: 3.1406 | Ppl: 23.12 | Bits/Tok: 4.531 | Time: 1845s
+WaveNet | Step 2660 | Loss: 3.0831 | Ppl: 21.83 | Bits/Tok: 4.448 | Time: 1852s
+WaveNet | Step 2670 | Loss: 3.0050 | Ppl: 20.19 | Bits/Tok: 4.335 | Time: 1859s
+WaveNet | Step 2680 | Loss: 2.9892 | Ppl: 19.87 | Bits/Tok: 4.312 | Time: 1865s
+WaveNet | Step 2690 | Loss: 3.0678 | Ppl: 21.49 | Bits/Tok: 4.426 | Time: 1872s
+WaveNet | Step 2700 | Loss: 3.2088 | Ppl: 24.75 | Bits/Tok: 4.629 | Time: 1879s
+WaveNet | Step 2710 | Loss: 3.0698 | Ppl: 21.54 | Bits/Tok: 4.429 | Time: 1885s
+WaveNet | Step 2720 | Loss: 3.0749 | Ppl: 21.65 | Bits/Tok: 4.436 | Time: 1892s
+WaveNet | Step 2730 | Loss: 2.9917 | Ppl: 19.92 | Bits/Tok: 4.316 | Time: 1899s
+WaveNet | Step 2740 | Loss: 2.9820 | Ppl: 19.73 | Bits/Tok: 4.302 | Time: 1906s
+WaveNet | Step 2750 | Loss: 3.0619 | Ppl: 21.37 | Bits/Tok: 4.417 | Time: 1912s
+WaveNet | Step 2760 | Loss: 3.1103 | Ppl: 22.43 | Bits/Tok: 4.487 | Time: 1919s
+WaveNet | Step 2770 | Loss: 3.0397 | Ppl: 20.90 | Bits/Tok: 4.385 | Time: 1926s
+WaveNet | Step 2780 | Loss: 3.0008 | Ppl: 20.10 | Bits/Tok: 4.329 | Time: 1932s
+WaveNet | Step 2790 | Loss: 3.1135 | Ppl: 22.50 | Bits/Tok: 4.492 | Time: 1939s
+WaveNet | Step 2800 | Loss: 2.9707 | Ppl: 19.51 | Bits/Tok: 4.286 | Time: 1946s
+WaveNet | Step 2810 | Loss: 3.0673 | Ppl: 21.48 | Bits/Tok: 4.425 | Time: 1953s
+WaveNet | Step 2820 | Loss: 3.0832 | Ppl: 21.83 | Bits/Tok: 4.448 | Time: 1959s
+WaveNet | Step 2830 | Loss: 2.9848 | Ppl: 19.78 | Bits/Tok: 4.306 | Time: 1966s
+WaveNet | Step 2840 | Loss: 3.1153 | Ppl: 22.54 | Bits/Tok: 4.494 | Time: 1973s
+WaveNet | Step 2850 | Loss: 2.9701 | Ppl: 19.49 | Bits/Tok: 4.285 | Time: 1979s
+WaveNet | Step 2860 | Loss: 3.0772 | Ppl: 21.70 | Bits/Tok: 4.440 | Time: 1986s
+WaveNet | Step 2870 | Loss: 2.9183 | Ppl: 18.51 | Bits/Tok: 4.210 | Time: 1993s
+WaveNet | Step 2880 | Loss: 3.1021 | Ppl: 22.25 | Bits/Tok: 4.475 | Time: 2000s
+WaveNet | Step 2890 | Loss: 3.0527 | Ppl: 21.17 | Bits/Tok: 4.404 | Time: 2006s
+WaveNet | Step 2900 | Loss: 2.9416 | Ppl: 18.95 | Bits/Tok: 4.244 | Time: 2013s
+WaveNet | Step 2910 | Loss: 3.1151 | Ppl: 22.54 | Bits/Tok: 4.494 | Time: 2020s
+WaveNet | Step 2920 | Loss: 3.0898 | Ppl: 21.97 | Bits/Tok: 4.458 | Time: 2027s
+WaveNet | Step 2930 | Loss: 3.1556 | Ppl: 23.47 | Bits/Tok: 4.553 | Time: 2033s
+WaveNet | Step 2940 | Loss: 2.9245 | Ppl: 18.62 | Bits/Tok: 4.219 | Time: 2040s
+WaveNet | Step 2950 | Loss: 3.2095 | Ppl: 24.77 | Bits/Tok: 4.630 | Time: 2047s
+WaveNet | Step 2960 | Loss: 3.1245 | Ppl: 22.75 | Bits/Tok: 4.508 | Time: 2054s
+WaveNet | Step 2970 | Loss: 3.0761 | Ppl: 21.67 | Bits/Tok: 4.438 | Time: 2060s
+WaveNet | Step 2980 | Loss: 2.9081 | Ppl: 18.32 | Bits/Tok: 4.195 | Time: 2067s
+WaveNet | Step 2990 | Loss: 3.0650 | Ppl: 21.43 | Bits/Tok: 4.422 | Time: 2074s
+WaveNet | Step 3000 | Loss: 3.0605 | Ppl: 21.34 | Bits/Tok: 4.415 | Time: 2080s
+WaveNet | Step 3010 | Loss: 3.0913 | Ppl: 22.01 | Bits/Tok: 4.460 | Time: 2087s
+WaveNet | Step 3020 | Loss: 3.0694 | Ppl: 21.53 | Bits/Tok: 4.428 | Time: 2094s
+WaveNet | Step 3030 | Loss: 3.0488 | Ppl: 21.09 | Bits/Tok: 4.399 | Time: 2101s
+WaveNet | Step 3040 | Loss: 2.9741 | Ppl: 19.57 | Bits/Tok: 4.291 | Time: 2107s
+WaveNet | Step 3050 | Loss: 3.0865 | Ppl: 21.90 | Bits/Tok: 4.453 | Time: 2114s
+WaveNet | Step 3060 | Loss: 3.0333 | Ppl: 20.77 | Bits/Tok: 4.376 | Time: 2121s
+WaveNet | Step 3070 | Loss: 3.0515 | Ppl: 21.15 | Bits/Tok: 4.402 | Time: 2127s
+WaveNet | Step 3080 | Loss: 2.9697 | Ppl: 19.49 | Bits/Tok: 4.284 | Time: 2134s
+WaveNet | Step 3090 | Loss: 3.0106 | Ppl: 20.30 | Bits/Tok: 4.343 | Time: 2141s
+WaveNet | Step 3100 | Loss: 3.2014 | Ppl: 24.57 | Bits/Tok: 4.619 | Time: 2147s
+WaveNet | Step 3110 | Loss: 2.9601 | Ppl: 19.30 | Bits/Tok: 4.270 | Time: 2154s
+WaveNet | Step 3120 | Loss: 3.0091 | Ppl: 20.27 | Bits/Tok: 4.341 | Time: 2161s
+WaveNet | Step 3130 | Loss: 3.0274 | Ppl: 20.64 | Bits/Tok: 4.368 | Time: 2167s
+WaveNet | Step 3140 | Loss: 2.8945 | Ppl: 18.08 | Bits/Tok: 4.176 | Time: 2174s
+WaveNet | Step 3150 | Loss: 3.0587 | Ppl: 21.30 | Bits/Tok: 4.413 | Time: 2181s
+WaveNet | Step 3160 | Loss: 3.0649 | Ppl: 21.43 | Bits/Tok: 4.422 | Time: 2187s
+WaveNet | Step 3170 | Loss: 3.0683 | Ppl: 21.51 | Bits/Tok: 4.427 | Time: 2194s
+WaveNet | Step 3180 | Loss: 3.0033 | Ppl: 20.15 | Bits/Tok: 4.333 | Time: 2201s
+WaveNet | Step 3190 | Loss: 2.9648 | Ppl: 19.39 | Bits/Tok: 4.277 | Time: 2207s
+WaveNet | Step 3200 | Loss: 3.1450 | Ppl: 23.22 | Bits/Tok: 4.537 | Time: 2214s
+WaveNet | Step 3210 | Loss: 3.1758 | Ppl: 23.94 | Bits/Tok: 4.582 | Time: 2221s
+WaveNet | Step 3220 | Loss: 3.0672 | Ppl: 21.48 | Bits/Tok: 4.425 | Time: 2228s
+WaveNet | Step 3230 | Loss: 2.9668 | Ppl: 19.43 | Bits/Tok: 4.280 | Time: 2234s
+WaveNet | Step 3240 | Loss: 3.0170 | Ppl: 20.43 | Bits/Tok: 4.353 | Time: 2241s
+WaveNet | Step 3250 | Loss: 2.8104 | Ppl: 16.62 | Bits/Tok: 4.055 | Time: 2248s
+WaveNet | Step 3260 | Loss: 3.0686 | Ppl: 21.51 | Bits/Tok: 4.427 | Time: 2255s
+WaveNet | Step 3270 | Loss: 3.2125 | Ppl: 24.84 | Bits/Tok: 4.635 | Time: 2262s
+WaveNet | Step 3280 | Loss: 3.1989 | Ppl: 24.50 | Bits/Tok: 4.615 | Time: 2268s
+WaveNet | Step 3290 | Loss: 3.0132 | Ppl: 20.35 | Bits/Tok: 4.347 | Time: 2275s
+WaveNet | Step 3300 | Loss: 3.1393 | Ppl: 23.09 | Bits/Tok: 4.529 | Time: 2282s
+WaveNet | Step 3310 | Loss: 2.8987 | Ppl: 18.15 | Bits/Tok: 4.182 | Time: 2289s
+WaveNet | Step 3320 | Loss: 3.0554 | Ppl: 21.23 | Bits/Tok: 4.408 | Time: 2296s
+WaveNet | Step 3330 | Loss: 3.0895 | Ppl: 21.97 | Bits/Tok: 4.457 | Time: 2302s
+WaveNet | Step 3340 | Loss: 3.0227 | Ppl: 20.55 | Bits/Tok: 4.361 | Time: 2309s
+WaveNet | Step 3350 | Loss: 3.1220 | Ppl: 22.69 | Bits/Tok: 4.504 | Time: 2316s
+WaveNet | Step 3360 | Loss: 3.1188 | Ppl: 22.62 | Bits/Tok: 4.499 | Time: 2323s
+WaveNet | Step 3370 | Loss: 3.0659 | Ppl: 21.45 | Bits/Tok: 4.423 | Time: 2330s
+WaveNet | Step 3380 | Loss: 3.0248 | Ppl: 20.59 | Bits/Tok: 4.364 | Time: 2336s
+WaveNet | Step 3390 | Loss: 2.9397 | Ppl: 18.91 | Bits/Tok: 4.241 | Time: 2343s
+WaveNet | Step 3400 | Loss: 2.9348 | Ppl: 18.82 | Bits/Tok: 4.234 | Time: 2350s
+WaveNet | Step 3410 | Loss: 2.9569 | Ppl: 19.24 | Bits/Tok: 4.266 | Time: 2356s
+WaveNet | Step 3420 | Loss: 3.2295 | Ppl: 25.27 | Bits/Tok: 4.659 | Time: 2363s
+WaveNet | Step 3430 | Loss: 2.9726 | Ppl: 19.54 | Bits/Tok: 4.289 | Time: 2370s
+WaveNet | Step 3440 | Loss: 3.0763 | Ppl: 21.68 | Bits/Tok: 4.438 | Time: 2377s
+WaveNet | Step 3450 | Loss: 3.0475 | Ppl: 21.06 | Bits/Tok: 4.397 | Time: 2383s
+WaveNet | Step 3460 | Loss: 3.0373 | Ppl: 20.85 | Bits/Tok: 4.382 | Time: 2390s
+WaveNet | Step 3470 | Loss: 3.0619 | Ppl: 21.37 | Bits/Tok: 4.417 | Time: 2397s
+WaveNet | Step 3480 | Loss: 3.0998 | Ppl: 22.19 | Bits/Tok: 4.472 | Time: 2403s
+WaveNet | Step 3490 | Loss: 2.9760 | Ppl: 19.61 | Bits/Tok: 4.294 | Time: 2410s
+WaveNet | Step 3500 | Loss: 2.9594 | Ppl: 19.29 | Bits/Tok: 4.270 | Time: 2417s
+WaveNet | Step 3510 | Loss: 3.0060 | Ppl: 20.21 | Bits/Tok: 4.337 | Time: 2424s
+WaveNet | Step 3520 | Loss: 2.9881 | Ppl: 19.85 | Bits/Tok: 4.311 | Time: 2430s
+WaveNet | Step 3530 | Loss: 2.9674 | Ppl: 19.44 | Bits/Tok: 4.281 | Time: 2437s
+WaveNet | Step 3540 | Loss: 3.0094 | Ppl: 20.27 | Bits/Tok: 4.342 | Time: 2444s
+WaveNet | Step 3550 | Loss: 3.0411 | Ppl: 20.93 | Bits/Tok: 4.387 | Time: 2451s
+WaveNet | Step 3560 | Loss: 3.0295 | Ppl: 20.69 | Bits/Tok: 4.371 | Time: 2457s
+WaveNet | Step 3570 | Loss: 3.1667 | Ppl: 23.73 | Bits/Tok: 4.569 | Time: 2464s
+WaveNet | Step 3580 | Loss: 2.9603 | Ppl: 19.30 | Bits/Tok: 4.271 | Time: 2471s
+WaveNet | Step 3590 | Loss: 3.0442 | Ppl: 20.99 | Bits/Tok: 4.392 | Time: 2478s
+WaveNet | Step 3600 | Loss: 2.9958 | Ppl: 20.00 | Bits/Tok: 4.322 | Time: 2484s
+WaveNet | Step 3610 | Loss: 3.0279 | Ppl: 20.65 | Bits/Tok: 4.368 | Time: 2491s
+WaveNet | Step 3620 | Loss: 2.9697 | Ppl: 19.49 | Bits/Tok: 4.284 | Time: 2498s
+WaveNet | Step 3630 | Loss: 3.0264 | Ppl: 20.62 | Bits/Tok: 4.366 | Time: 2504s
+WaveNet | Step 3640 | Loss: 3.0472 | Ppl: 21.06 | Bits/Tok: 4.396 | Time: 2511s
+WaveNet | Step 3650 | Loss: 2.9641 | Ppl: 19.38 | Bits/Tok: 4.276 | Time: 2518s
+WaveNet | Step 3660 | Loss: 2.9481 | Ppl: 19.07 | Bits/Tok: 4.253 | Time: 2525s
+WaveNet | Step 3670 | Loss: 3.0062 | Ppl: 20.21 | Bits/Tok: 4.337 | Time: 2531s
+WaveNet | Step 3680 | Loss: 2.9014 | Ppl: 18.20 | Bits/Tok: 4.186 | Time: 2538s
+WaveNet | Step 3690 | Loss: 3.0759 | Ppl: 21.67 | Bits/Tok: 4.438 | Time: 2545s
+WaveNet | Step 3700 | Loss: 2.9877 | Ppl: 19.84 | Bits/Tok: 4.310 | Time: 2552s
+WaveNet | Step 3710 | Loss: 2.9659 | Ppl: 19.41 | Bits/Tok: 4.279 | Time: 2558s
+WaveNet | Step 3720 | Loss: 2.9403 | Ppl: 18.92 | Bits/Tok: 4.242 | Time: 2565s
+WaveNet | Step 3730 | Loss: 2.9613 | Ppl: 19.32 | Bits/Tok: 4.272 | Time: 2572s
+WaveNet | Step 3740 | Loss: 3.0197 | Ppl: 20.48 | Bits/Tok: 4.356 | Time: 2579s
+WaveNet | Step 3750 | Loss: 2.9970 | Ppl: 20.03 | Bits/Tok: 4.324 | Time: 2586s
+WaveNet | Step 3760 | Loss: 3.0689 | Ppl: 21.52 | Bits/Tok: 4.428 | Time: 2592s
+WaveNet | Step 3770 | Loss: 3.0986 | Ppl: 22.17 | Bits/Tok: 4.470 | Time: 2599s
+WaveNet | Step 3780 | Loss: 2.9528 | Ppl: 19.16 | Bits/Tok: 4.260 | Time: 2606s
+WaveNet | Step 3790 | Loss: 3.1459 | Ppl: 23.24 | Bits/Tok: 4.539 | Time: 2613s
+WaveNet | Step 3800 | Loss: 2.9631 | Ppl: 19.36 | Bits/Tok: 4.275 | Time: 2619s
+WaveNet | Step 3810 | Loss: 2.9656 | Ppl: 19.41 | Bits/Tok: 4.278 | Time: 2626s
+WaveNet | Step 3820 | Loss: 3.1028 | Ppl: 22.26 | Bits/Tok: 4.476 | Time: 2633s
+WaveNet | Step 3830 | Loss: 2.9815 | Ppl: 19.72 | Bits/Tok: 4.301 | Time: 2639s
+WaveNet | Step 3840 | Loss: 3.0219 | Ppl: 20.53 | Bits/Tok: 4.360 | Time: 2646s
+WaveNet | Step 3850 | Loss: 2.9341 | Ppl: 18.81 | Bits/Tok: 4.233 | Time: 2653s
+WaveNet | Step 3860 | Loss: 3.0003 | Ppl: 20.09 | Bits/Tok: 4.329 | Time: 2659s
+WaveNet | Step 3870 | Loss: 3.1311 | Ppl: 22.90 | Bits/Tok: 4.517 | Time: 2666s
+WaveNet | Step 3880 | Loss: 2.9303 | Ppl: 18.73 | Bits/Tok: 4.227 | Time: 2673s
+WaveNet | Step 3890 | Loss: 3.0656 | Ppl: 21.45 | Bits/Tok: 4.423 | Time: 2679s
+WaveNet | Step 3900 | Loss: 3.0842 | Ppl: 21.85 | Bits/Tok: 4.450 | Time: 2686s
+WaveNet | Step 3910 | Loss: 2.9886 | Ppl: 19.86 | Bits/Tok: 4.312 | Time: 2693s
+WaveNet | Step 3920 | Loss: 2.9894 | Ppl: 19.87 | Bits/Tok: 4.313 | Time: 2699s
+WaveNet | Step 3930 | Loss: 3.0606 | Ppl: 21.34 | Bits/Tok: 4.416 | Time: 2706s
+WaveNet | Step 3940 | Loss: 2.9945 | Ppl: 19.98 | Bits/Tok: 4.320 | Time: 2713s
+WaveNet | Step 3950 | Loss: 2.9820 | Ppl: 19.73 | Bits/Tok: 4.302 | Time: 2720s
+WaveNet | Step 3960 | Loss: 3.1013 | Ppl: 22.23 | Bits/Tok: 4.474 | Time: 2727s
+WaveNet | Step 3970 | Loss: 2.9967 | Ppl: 20.02 | Bits/Tok: 4.323 | Time: 2733s
+WaveNet | Step 3980 | Loss: 2.9161 | Ppl: 18.47 | Bits/Tok: 4.207 | Time: 2740s
+WaveNet | Step 3990 | Loss: 3.0887 | Ppl: 21.95 | Bits/Tok: 4.456 | Time: 2747s
+WaveNet | Step 4000 | Loss: 3.0484 | Ppl: 21.08 | Bits/Tok: 4.398 | Time: 2753s
+WaveNet | Step 4010 | Loss: 3.0609 | Ppl: 21.35 | Bits/Tok: 4.416 | Time: 2760s
+WaveNet | Step 4020 | Loss: 3.0981 | Ppl: 22.16 | Bits/Tok: 4.470 | Time: 2767s
+WaveNet | Step 4030 | Loss: 3.0304 | Ppl: 20.71 | Bits/Tok: 4.372 | Time: 2774s
+WaveNet | Step 4040 | Loss: 2.9360 | Ppl: 18.84 | Bits/Tok: 4.236 | Time: 2781s
+WaveNet | Step 4050 | Loss: 3.0477 | Ppl: 21.07 | Bits/Tok: 4.397 | Time: 2787s
+WaveNet | Step 4060 | Loss: 2.8228 | Ppl: 16.82 | Bits/Tok: 4.072 | Time: 2794s
+WaveNet | Step 4070 | Loss: 2.8175 | Ppl: 16.74 | Bits/Tok: 4.065 | Time: 2801s
+WaveNet | Step 4080 | Loss: 2.9460 | Ppl: 19.03 | Bits/Tok: 4.250 | Time: 2808s
+WaveNet | Step 4090 | Loss: 3.0503 | Ppl: 21.12 | Bits/Tok: 4.401 | Time: 2814s
+WaveNet | Step 4100 | Loss: 3.0025 | Ppl: 20.13 | Bits/Tok: 4.332 | Time: 2821s
+WaveNet | Step 4110 | Loss: 2.9965 | Ppl: 20.02 | Bits/Tok: 4.323 | Time: 2828s
+WaveNet | Step 4120 | Loss: 2.9778 | Ppl: 19.64 | Bits/Tok: 4.296 | Time: 2835s
+WaveNet | Step 4130 | Loss: 2.9496 | Ppl: 19.10 | Bits/Tok: 4.255 | Time: 2841s
+WaveNet | Step 4140 | Loss: 2.9719 | Ppl: 19.53 | Bits/Tok: 4.287 | Time: 2848s
+WaveNet | Step 4150 | Loss: 2.7590 | Ppl: 15.78 | Bits/Tok: 3.980 | Time: 2855s
+WaveNet | Step 4160 | Loss: 3.0428 | Ppl: 20.96 | Bits/Tok: 4.390 | Time: 2861s
+WaveNet | Step 4170 | Loss: 3.0800 | Ppl: 21.76 | Bits/Tok: 4.443 | Time: 2868s
+WaveNet | Step 4180 | Loss: 2.9663 | Ppl: 19.42 | Bits/Tok: 4.279 | Time: 2875s
+WaveNet | Step 4190 | Loss: 3.0168 | Ppl: 20.43 | Bits/Tok: 4.352 | Time: 2882s
+WaveNet | Step 4200 | Loss: 3.0530 | Ppl: 21.18 | Bits/Tok: 4.405 | Time: 2888s
+WaveNet | Step 4210 | Loss: 2.9028 | Ppl: 18.23 | Bits/Tok: 4.188 | Time: 2895s
+WaveNet | Step 4220 | Loss: 3.0544 | Ppl: 21.21 | Bits/Tok: 4.407 | Time: 2902s
+WaveNet | Step 4230 | Loss: 2.9936 | Ppl: 19.96 | Bits/Tok: 4.319 | Time: 2909s
+WaveNet | Step 4240 | Loss: 3.0193 | Ppl: 20.48 | Bits/Tok: 4.356 | Time: 2915s
+WaveNet | Step 4250 | Loss: 3.0965 | Ppl: 22.12 | Bits/Tok: 4.467 | Time: 2922s
+WaveNet | Step 4260 | Loss: 3.0784 | Ppl: 21.72 | Bits/Tok: 4.441 | Time: 2929s
+WaveNet | Step 4270 | Loss: 3.1148 | Ppl: 22.53 | Bits/Tok: 4.494 | Time: 2936s
+WaveNet | Step 4280 | Loss: 2.9960 | Ppl: 20.01 | Bits/Tok: 4.322 | Time: 2942s
+WaveNet | Step 4290 | Loss: 2.8949 | Ppl: 18.08 | Bits/Tok: 4.176 | Time: 2949s
+WaveNet | Step 4300 | Loss: 2.9487 | Ppl: 19.08 | Bits/Tok: 4.254 | Time: 2956s
+WaveNet | Step 4310 | Loss: 3.0080 | Ppl: 20.25 | Bits/Tok: 4.340 | Time: 2962s
+WaveNet | Step 4320 | Loss: 3.1316 | Ppl: 22.91 | Bits/Tok: 4.518 | Time: 2969s
+WaveNet | Step 4330 | Loss: 3.0139 | Ppl: 20.37 | Bits/Tok: 4.348 | Time: 2976s
+WaveNet | Step 4340 | Loss: 3.0767 | Ppl: 21.69 | Bits/Tok: 4.439 | Time: 2983s
+WaveNet | Step 4350 | Loss: 2.8833 | Ppl: 17.87 | Bits/Tok: 4.160 | Time: 2990s
+WaveNet | Step 4360 | Loss: 3.0314 | Ppl: 20.73 | Bits/Tok: 4.373 | Time: 2996s
+WaveNet | Step 4370 | Loss: 2.9869 | Ppl: 19.82 | Bits/Tok: 4.309 | Time: 3003s
+WaveNet | Step 4380 | Loss: 2.9515 | Ppl: 19.13 | Bits/Tok: 4.258 | Time: 3010s
+WaveNet | Step 4390 | Loss: 2.9738 | Ppl: 19.57 | Bits/Tok: 4.290 | Time: 3016s
+WaveNet | Step 4400 | Loss: 3.0252 | Ppl: 20.60 | Bits/Tok: 4.364 | Time: 3023s
+WaveNet | Step 4410 | Loss: 2.9640 | Ppl: 19.38 | Bits/Tok: 4.276 | Time: 3030s
+WaveNet | Step 4420 | Loss: 3.0138 | Ppl: 20.36 | Bits/Tok: 4.348 | Time: 3037s
+WaveNet | Step 4430 | Loss: 2.8947 | Ppl: 18.08 | Bits/Tok: 4.176 | Time: 3044s
+WaveNet | Step 4440 | Loss: 2.9523 | Ppl: 19.15 | Bits/Tok: 4.259 | Time: 3050s
+WaveNet | Step 4450 | Loss: 3.0879 | Ppl: 21.93 | Bits/Tok: 4.455 | Time: 3057s
+WaveNet | Step 4460 | Loss: 2.9727 | Ppl: 19.55 | Bits/Tok: 4.289 | Time: 3064s
+
+🥊 STARTING BENCHMARK: Transformer
+📊 Parameters: 14,707,712
+⚡ Compiling model with torch.compile()...
+Transformer | Step 10 | Loss: 5.0227 | Ppl: 151.82 | Bits/Tok: 7.246 | Time: 22s
+Transformer | Step 20 | Loss: 4.2972 | Ppl: 73.49 | Bits/Tok: 6.199 | Time: 29s
+Transformer | Step 30 | Loss: 4.0883 | Ppl: 59.64 | Bits/Tok: 5.898 | Time: 35s
+Transformer | Step 40 | Loss: 3.9237 | Ppl: 50.59 | Bits/Tok: 5.661 | Time: 42s
+Transformer | Step 50 | Loss: 3.7470 | Ppl: 42.39 | Bits/Tok: 5.406 | Time: 49s
+Transformer | Step 60 | Loss: 3.7689 | Ppl: 43.33 | Bits/Tok: 5.437 | Time: 55s
+Transformer | Step 70 | Loss: 3.7051 | Ppl: 40.65 | Bits/Tok: 5.345 | Time: 62s
+Transformer | Step 80 | Loss: 3.5177 | Ppl: 33.71 | Bits/Tok: 5.075 | Time: 69s
+Transformer | Step 90 | Loss: 3.5362 | Ppl: 34.34 | Bits/Tok: 5.102 | Time: 75s
+Transformer | Step 100 | Loss: 3.6470 | Ppl: 38.36 | Bits/Tok: 5.262 | Time: 82s
+Transformer | Step 110 | Loss: 3.4845 | Ppl: 32.61 | Bits/Tok: 5.027 | Time: 88s
+Transformer | Step 120 | Loss: 3.6434 | Ppl: 38.22 | Bits/Tok: 5.256 | Time: 95s
+Transformer | Step 130 | Loss: 3.5908 | Ppl: 36.26 | Bits/Tok: 5.180 | Time: 102s
+Transformer | Step 140 | Loss: 3.5623 | Ppl: 35.24 | Bits/Tok: 5.139 | Time: 108s
+Transformer | Step 150 | Loss: 3.5708 | Ppl: 35.55 | Bits/Tok: 5.152 | Time: 115s
+Transformer | Step 160 | Loss: 3.6724 | Ppl: 39.35 | Bits/Tok: 5.298 | Time: 122s
+Transformer | Step 170 | Loss: 3.7011 | Ppl: 40.49 | Bits/Tok: 5.340 | Time: 128s
+Transformer | Step 180 | Loss: 3.4861 | Ppl: 32.66 | Bits/Tok: 5.029 | Time: 135s
+Transformer | Step 190 | Loss: 3.5761 | Ppl: 35.73 | Bits/Tok: 5.159 | Time: 142s
+Transformer | Step 200 | Loss: 3.4999 | Ppl: 33.11 | Bits/Tok: 5.049 | Time: 149s
+Transformer | Step 210 | Loss: 3.4877 | Ppl: 32.71 | Bits/Tok: 5.032 | Time: 155s
+Transformer | Step 220 | Loss: 3.6307 | Ppl: 37.74 | Bits/Tok: 5.238 | Time: 162s
+Transformer | Step 230 | Loss: 3.6157 | Ppl: 37.18 | Bits/Tok: 5.216 | Time: 169s
+Transformer | Step 240 | Loss: 3.5794 | Ppl: 35.85 | Bits/Tok: 5.164 | Time: 175s
+Transformer | Step 250 | Loss: 3.5447 | Ppl: 34.63 | Bits/Tok: 5.114 | Time: 182s
+Transformer | Step 260 | Loss: 3.5133 | Ppl: 33.56 | Bits/Tok: 5.069 | Time: 188s
+Transformer | Step 270 | Loss: 3.4743 | Ppl: 32.28 | Bits/Tok: 5.012 | Time: 195s
+Transformer | Step 280 | Loss: 3.4576 | Ppl: 31.74 | Bits/Tok: 4.988 | Time: 202s
+Transformer | Step 290 | Loss: 3.6022 | Ppl: 36.68 | Bits/Tok: 5.197 | Time: 208s
+Transformer | Step 300 | Loss: 3.5580 | Ppl: 35.09 | Bits/Tok: 5.133 | Time: 215s
+Transformer | Step 310 | Loss: 3.6502 | Ppl: 38.48 | Bits/Tok: 5.266 | Time: 221s
+Transformer | Step 320 | Loss: 3.4943 | Ppl: 32.93 | Bits/Tok: 5.041 | Time: 228s
+Transformer | Step 330 | Loss: 3.5863 | Ppl: 36.10 | Bits/Tok: 5.174 | Time: 234s
+Transformer | Step 340 | Loss: 3.4541 | Ppl: 31.63 | Bits/Tok: 4.983 | Time: 241s
+Transformer | Step 350 | Loss: 3.4239 | Ppl: 30.69 | Bits/Tok: 4.940 | Time: 248s
+Transformer | Step 360 | Loss: 3.4213 | Ppl: 30.61 | Bits/Tok: 4.936 | Time: 254s
+Transformer | Step 370 | Loss: 3.5194 | Ppl: 33.77 | Bits/Tok: 5.077 | Time: 261s
+Transformer | Step 380 | Loss: 3.5124 | Ppl: 33.53 | Bits/Tok: 5.067 | Time: 268s
+Transformer | Step 390 | Loss: 3.3082 | Ppl: 27.34 | Bits/Tok: 4.773 | Time: 274s
+Transformer | Step 400 | Loss: 3.4321 | Ppl: 30.94 | Bits/Tok: 4.951 | Time: 281s
+Transformer | Step 410 | Loss: 3.2733 | Ppl: 26.40 | Bits/Tok: 4.722 | Time: 287s
+Transformer | Step 420 | Loss: 3.4442 | Ppl: 31.32 | Bits/Tok: 4.969 | Time: 294s
+Transformer | Step 430 | Loss: 3.2919 | Ppl: 26.89 | Bits/Tok: 4.749 | Time: 300s
+Transformer | Step 440 | Loss: 3.2166 | Ppl: 24.94 | Bits/Tok: 4.641 | Time: 307s
+Transformer | Step 450 | Loss: 3.5325 | Ppl: 34.21 | Bits/Tok: 5.096 | Time: 333s
+Transformer | Step 460 | Loss: 3.3949 | Ppl: 29.81 | Bits/Tok: 4.898 | Time: 340s
+Transformer | Step 470 | Loss: 3.2561 | Ppl: 25.95 | Bits/Tok: 4.698 | Time: 347s
+Transformer | Step 480 | Loss: 3.3566 | Ppl: 28.69 | Bits/Tok: 4.843 | Time: 353s
+Transformer | Step 490 | Loss: 3.2954 | Ppl: 26.99 | Bits/Tok: 4.754 | Time: 360s
+Transformer | Step 500 | Loss: 3.3806 | Ppl: 29.39 | Bits/Tok: 4.877 | Time: 366s
+Transformer | Step 510 | Loss: 3.3562 | Ppl: 28.68 | Bits/Tok: 4.842 | Time: 373s
+Transformer | Step 520 | Loss: 3.3588 | Ppl: 28.76 | Bits/Tok: 4.846 | Time: 380s
+Transformer | Step 530 | Loss: 3.3912 | Ppl: 29.70 | Bits/Tok: 4.892 | Time: 386s
+Transformer | Step 540 | Loss: 3.3612 | Ppl: 28.82 | Bits/Tok: 4.849 | Time: 393s
+Transformer | Step 550 | Loss: 3.3866 | Ppl: 29.57 | Bits/Tok: 4.886 | Time: 399s
+Transformer | Step 560 | Loss: 3.3824 | Ppl: 29.44 | Bits/Tok: 4.880 | Time: 406s
+Transformer | Step 570 | Loss: 3.3318 | Ppl: 27.99 | Bits/Tok: 4.807 | Time: 413s
+Transformer | Step 580 | Loss: 3.3194 | Ppl: 27.64 | Bits/Tok: 4.789 | Time: 419s
+Transformer | Step 590 | Loss: 3.3012 | Ppl: 27.15 | Bits/Tok: 4.763 | Time: 426s
+Transformer | Step 600 | Loss: 3.4739 | Ppl: 32.26 | Bits/Tok: 5.012 | Time: 433s
+Transformer | Step 610 | Loss: 3.1960 | Ppl: 24.43 | Bits/Tok: 4.611 | Time: 439s
+Transformer | Step 620 | Loss: 3.2702 | Ppl: 26.32 | Bits/Tok: 4.718 | Time: 446s
+Transformer | Step 630 | Loss: 3.3951 | Ppl: 29.82 | Bits/Tok: 4.898 | Time: 452s
+Transformer | Step 640 | Loss: 3.3301 | Ppl: 27.94 | Bits/Tok: 4.804 | Time: 459s
+Transformer | Step 650 | Loss: 3.4230 | Ppl: 30.66 | Bits/Tok: 4.938 | Time: 466s
+Transformer | Step 660 | Loss: 3.3532 | Ppl: 28.59 | Bits/Tok: 4.838 | Time: 472s
+Transformer | Step 670 | Loss: 3.2819 | Ppl: 26.63 | Bits/Tok: 4.735 | Time: 479s
+Transformer | Step 680 | Loss: 3.3327 | Ppl: 28.01 | Bits/Tok: 4.808 | Time: 486s
+Transformer | Step 690 | Loss: 3.3357 | Ppl: 28.10 | Bits/Tok: 4.812 | Time: 493s
+Transformer | Step 700 | Loss: 3.3844 | Ppl: 29.50 | Bits/Tok: 4.883 | Time: 499s
+Transformer | Step 710 | Loss: 3.3219 | Ppl: 27.71 | Bits/Tok: 4.792 | Time: 506s
+Transformer | Step 720 | Loss: 3.1515 | Ppl: 23.37 | Bits/Tok: 4.547 | Time: 513s
+Transformer | Step 730 | Loss: 3.2888 | Ppl: 26.81 | Bits/Tok: 4.745 | Time: 519s
+Transformer | Step 740 | Loss: 3.3356 | Ppl: 28.10 | Bits/Tok: 4.812 | Time: 526s
+Transformer | Step 750 | Loss: 3.2438 | Ppl: 25.63 | Bits/Tok: 4.680 | Time: 532s
+Transformer | Step 760 | Loss: 3.3298 | Ppl: 27.93 | Bits/Tok: 4.804 | Time: 539s
+Transformer | Step 770 | Loss: 3.3411 | Ppl: 28.25 | Bits/Tok: 4.820 | Time: 546s
+Transformer | Step 780 | Loss: 3.3559 | Ppl: 28.67 | Bits/Tok: 4.842 | Time: 553s
+Transformer | Step 790 | Loss: 3.4142 | Ppl: 30.39 | Bits/Tok: 4.926 | Time: 559s
+Transformer | Step 800 | Loss: 3.3627 | Ppl: 28.87 | Bits/Tok: 4.851 | Time: 566s
+Transformer | Step 810 | Loss: 3.2751 | Ppl: 26.45 | Bits/Tok: 4.725 | Time: 572s
+Transformer | Step 820 | Loss: 3.2609 | Ppl: 26.07 | Bits/Tok: 4.704 | Time: 579s
+Transformer | Step 830 | Loss: 3.3421 | Ppl: 28.28 | Bits/Tok: 4.822 | Time: 586s
+Transformer | Step 840 | Loss: 3.3286 | Ppl: 27.90 | Bits/Tok: 4.802 | Time: 592s
+Transformer | Step 850 | Loss: 3.2113 | Ppl: 24.81 | Bits/Tok: 4.633 | Time: 599s
+Transformer | Step 860 | Loss: 3.2427 | Ppl: 25.60 | Bits/Tok: 4.678 | Time: 606s
+Transformer | Step 870 | Loss: 3.4518 | Ppl: 31.56 | Bits/Tok: 4.980 | Time: 612s
+Transformer | Step 880 | Loss: 3.4103 | Ppl: 30.28 | Bits/Tok: 4.920 | Time: 619s
+Transformer | Step 890 | Loss: 3.2235 | Ppl: 25.12 | Bits/Tok: 4.650 | Time: 625s
+Transformer | Step 900 | Loss: 3.2776 | Ppl: 26.51 | Bits/Tok: 4.729 | Time: 632s
+Transformer | Step 910 | Loss: 3.1402 | Ppl: 23.11 | Bits/Tok: 4.530 | Time: 639s
+Transformer | Step 920 | Loss: 3.2952 | Ppl: 26.98 | Bits/Tok: 4.754 | Time: 646s
+Transformer | Step 930 | Loss: 3.1875 | Ppl: 24.23 | Bits/Tok: 4.599 | Time: 652s
+Transformer | Step 940 | Loss: 3.2631 | Ppl: 26.13 | Bits/Tok: 4.708 | Time: 659s
+Transformer | Step 950 | Loss: 3.3297 | Ppl: 27.93 | Bits/Tok: 4.804 | Time: 665s
+Transformer | Step 960 | Loss: 3.2675 | Ppl: 26.24 | Bits/Tok: 4.714 | Time: 672s
+Transformer | Step 970 | Loss: 3.2740 | Ppl: 26.42 | Bits/Tok: 4.723 | Time: 679s
+Transformer | Step 980 | Loss: 3.2927 | Ppl: 26.91 | Bits/Tok: 4.750 | Time: 685s
+Transformer | Step 990 | Loss: 3.2926 | Ppl: 26.91 | Bits/Tok: 4.750 | Time: 692s
+Transformer | Step 1000 | Loss: 3.2816 | Ppl: 26.62 | Bits/Tok: 4.734 | Time: 699s
+Transformer | Step 1010 | Loss: 3.3167 | Ppl: 27.57 | Bits/Tok: 4.785 | Time: 705s
+Transformer | Step 1020 | Loss: 3.2554 | Ppl: 25.93 | Bits/Tok: 4.696 | Time: 712s
+Transformer | Step 1030 | Loss: 3.1461 | Ppl: 23.24 | Bits/Tok: 4.539 | Time: 718s
+Transformer | Step 1040 | Loss: 3.2510 | Ppl: 25.82 | Bits/Tok: 4.690 | Time: 725s
+Transformer | Step 1050 | Loss: 3.4016 | Ppl: 30.01 | Bits/Tok: 4.907 | Time: 732s
+Transformer | Step 1060 | Loss: 3.2839 | Ppl: 26.68 | Bits/Tok: 4.738 | Time: 739s
+Transformer | Step 1070 | Loss: 3.3209 | Ppl: 27.68 | Bits/Tok: 4.791 | Time: 745s
+Transformer | Step 1080 | Loss: 3.1981 | Ppl: 24.49 | Bits/Tok: 4.614 | Time: 752s
+Transformer | Step 1090 | Loss: 3.2933 | Ppl: 26.93 | Bits/Tok: 4.751 | Time: 759s
+Transformer | Step 1100 | Loss: 3.2681 | Ppl: 26.26 | Bits/Tok: 4.715 | Time: 765s
+Transformer | Step 1110 | Loss: 3.2938 | Ppl: 26.94 | Bits/Tok: 4.752 | Time: 772s
+Transformer | Step 1120 | Loss: 3.2755 | Ppl: 26.46 | Bits/Tok: 4.726 | Time: 779s
+Transformer | Step 1130 | Loss: 3.4430 | Ppl: 31.28 | Bits/Tok: 4.967 | Time: 785s
+Transformer | Step 1140 | Loss: 3.2986 | Ppl: 27.08 | Bits/Tok: 4.759 | Time: 792s
+Transformer | Step 1150 | Loss: 3.3139 | Ppl: 27.49 | Bits/Tok: 4.781 | Time: 799s
+Transformer | Step 1160 | Loss: 3.2507 | Ppl: 25.81 | Bits/Tok: 4.690 | Time: 805s
+Transformer | Step 1170 | Loss: 3.0319 | Ppl: 20.74 | Bits/Tok: 4.374 | Time: 812s
+Transformer | Step 1180 | Loss: 3.2885 | Ppl: 26.80 | Bits/Tok: 4.744 | Time: 819s
+Transformer | Step 1190 | Loss: 3.3364 | Ppl: 28.12 | Bits/Tok: 4.813 | Time: 825s
+Transformer | Step 1200 | Loss: 3.3800 | Ppl: 29.37 | Bits/Tok: 4.876 | Time: 832s
+Transformer | Step 1210 | Loss: 3.4442 | Ppl: 31.32 | Bits/Tok: 4.969 | Time: 839s
+Transformer | Step 1220 | Loss: 3.2911 | Ppl: 26.87 | Bits/Tok: 4.748 | Time: 845s
+Transformer | Step 1230 | Loss: 3.1945 | Ppl: 24.40 | Bits/Tok: 4.609 | Time: 852s
+Transformer | Step 1240 | Loss: 3.3475 | Ppl: 28.43 | Bits/Tok: 4.829 | Time: 859s
+Transformer | Step 1250 | Loss: 3.2642 | Ppl: 26.16 | Bits/Tok: 4.709 | Time: 865s
+Transformer | Step 1260 | Loss: 3.1784 | Ppl: 24.01 | Bits/Tok: 4.586 | Time: 872s
+Transformer | Step 1270 | Loss: 3.2243 | Ppl: 25.14 | Bits/Tok: 4.652 | Time: 879s
+Transformer | Step 1280 | Loss: 3.3781 | Ppl: 29.31 | Bits/Tok: 4.874 | Time: 885s
+Transformer | Step 1290 | Loss: 3.1798 | Ppl: 24.04 | Bits/Tok: 4.588 | Time: 892s
+Transformer | Step 1300 | Loss: 3.3434 | Ppl: 28.32 | Bits/Tok: 4.824 | Time: 899s
+Transformer | Step 1310 | Loss: 3.2657 | Ppl: 26.20 | Bits/Tok: 4.711 | Time: 905s
+Transformer | Step 1320 | Loss: 3.2128 | Ppl: 24.85 | Bits/Tok: 4.635 | Time: 912s
+Transformer | Step 1330 | Loss: 3.3242 | Ppl: 27.78 | Bits/Tok: 4.796 | Time: 919s
+Transformer | Step 1340 | Loss: 3.1512 | Ppl: 23.36 | Bits/Tok: 4.546 | Time: 925s
+Transformer | Step 1350 | Loss: 3.2711 | Ppl: 26.34 | Bits/Tok: 4.719 | Time: 932s
+Transformer | Step 1360 | Loss: 3.1288 | Ppl: 22.85 | Bits/Tok: 4.514 | Time: 938s
+Transformer | Step 1370 | Loss: 3.2040 | Ppl: 24.63 | Bits/Tok: 4.622 | Time: 945s
+Transformer | Step 1380 | Loss: 3.1155 | Ppl: 22.55 | Bits/Tok: 4.495 | Time: 952s
+Transformer | Step 1390 | Loss: 3.2008 | Ppl: 24.55 | Bits/Tok: 4.618 | Time: 958s
+Transformer | Step 1400 | Loss: 3.1425 | Ppl: 23.16 | Bits/Tok: 4.534 | Time: 965s
+Transformer | Step 1410 | Loss: 3.1553 | Ppl: 23.46 | Bits/Tok: 4.552 | Time: 971s
+Transformer | Step 1420 | Loss: 3.3793 | Ppl: 29.35 | Bits/Tok: 4.875 | Time: 978s
+Transformer | Step 1430 | Loss: 3.0911 | Ppl: 22.00 | Bits/Tok: 4.460 | Time: 985s
+Transformer | Step 1440 | Loss: 3.2835 | Ppl: 26.67 | Bits/Tok: 4.737 | Time: 991s
+Transformer | Step 1450 | Loss: 3.1314 | Ppl: 22.91 | Bits/Tok: 4.518 | Time: 998s
+Transformer | Step 1460 | Loss: 3.2068 | Ppl: 24.70 | Bits/Tok: 4.626 | Time: 1005s
+Transformer | Step 1470 | Loss: 3.2857 | Ppl: 26.73 | Bits/Tok: 4.740 | Time: 1011s
+Transformer | Step 1480 | Loss: 3.2080 | Ppl: 24.73 | Bits/Tok: 4.628 | Time: 1018s
+Transformer | Step 1490 | Loss: 3.2771 | Ppl: 26.50 | Bits/Tok: 4.728 | Time: 1025s
+Transformer | Step 1500 | Loss: 3.3728 | Ppl: 29.16 | Bits/Tok: 4.866 | Time: 1031s
+Transformer | Step 1510 | Loss: 3.2745 | Ppl: 26.43 | Bits/Tok: 4.724 | Time: 1038s
+Transformer | Step 1520 | Loss: 3.2494 | Ppl: 25.78 | Bits/Tok: 4.688 | Time: 1044s
+Transformer | Step 1530 | Loss: 3.3192 | Ppl: 27.64 | Bits/Tok: 4.789 | Time: 1051s
+Transformer | Step 1540 | Loss: 3.2658 | Ppl: 26.20 | Bits/Tok: 4.712 | Time: 1058s
+Transformer | Step 1550 | Loss: 3.1401 | Ppl: 23.11 | Bits/Tok: 4.530 | Time: 1064s
+Transformer | Step 1560 | Loss: 3.2313 | Ppl: 25.31 | Bits/Tok: 4.662 | Time: 1071s
+Transformer | Step 1570 | Loss: 3.2110 | Ppl: 24.80 | Bits/Tok: 4.633 | Time: 1078s
+Transformer | Step 1580 | Loss: 3.1294 | Ppl: 22.86 | Bits/Tok: 4.515 | Time: 1084s
+Transformer | Step 1590 | Loss: 3.1710 | Ppl: 23.83 | Bits/Tok: 4.575 | Time: 1091s
+Transformer | Step 1600 | Loss: 3.3658 | Ppl: 28.96 | Bits/Tok: 4.856 | Time: 1098s
+Transformer | Step 1610 | Loss: 3.2174 | Ppl: 24.96 | Bits/Tok: 4.642 | Time: 1104s
+Transformer | Step 1620 | Loss: 3.1705 | Ppl: 23.82 | Bits/Tok: 4.574 | Time: 1111s
+Transformer | Step 1630 | Loss: 3.2072 | Ppl: 24.71 | Bits/Tok: 4.627 | Time: 1118s
+Transformer | Step 1640 | Loss: 3.1163 | Ppl: 22.56 | Bits/Tok: 4.496 | Time: 1124s
+Transformer | Step 1650 | Loss: 3.0843 | Ppl: 21.85 | Bits/Tok: 4.450 | Time: 1131s
+Transformer | Step 1660 | Loss: 3.2482 | Ppl: 25.74 | Bits/Tok: 4.686 | Time: 1138s
+Transformer | Step 1670 | Loss: 3.1202 | Ppl: 22.65 | Bits/Tok: 4.501 | Time: 1144s
+Transformer | Step 1680 | Loss: 3.1349 | Ppl: 22.99 | Bits/Tok: 4.523 | Time: 1151s
+Transformer | Step 1690 | Loss: 3.3448 | Ppl: 28.36 | Bits/Tok: 4.826 | Time: 1158s
+Transformer | Step 1700 | Loss: 3.2006 | Ppl: 24.55 | Bits/Tok: 4.617 | Time: 1164s
+Transformer | Step 1710 | Loss: 3.0531 | Ppl: 21.18 | Bits/Tok: 4.405 | Time: 1171s
+Transformer | Step 1720 | Loss: 3.1792 | Ppl: 24.03 | Bits/Tok: 4.587 | Time: 1177s
+Transformer | Step 1730 | Loss: 3.1110 | Ppl: 22.44 | Bits/Tok: 4.488 | Time: 1184s
+Transformer | Step 1740 | Loss: 3.2555 | Ppl: 25.93 | Bits/Tok: 4.697 | Time: 1191s
+Transformer | Step 1750 | Loss: 3.3077 | Ppl: 27.32 | Bits/Tok: 4.772 | Time: 1198s
+Transformer | Step 1760 | Loss: 3.1986 | Ppl: 24.50 | Bits/Tok: 4.615 | Time: 1204s
+Transformer | Step 1770 | Loss: 3.1596 | Ppl: 23.56 | Bits/Tok: 4.558 | Time: 1211s
+Transformer | Step 1780 | Loss: 3.1693 | Ppl: 23.79 | Bits/Tok: 4.572 | Time: 1218s
+Transformer | Step 1790 | Loss: 3.2389 | Ppl: 25.51 | Bits/Tok: 4.673 | Time: 1225s
+Transformer | Step 1800 | Loss: 3.2004 | Ppl: 24.54 | Bits/Tok: 4.617 | Time: 1231s
+Transformer | Step 1810 | Loss: 3.1374 | Ppl: 23.04 | Bits/Tok: 4.526 | Time: 1238s
+Transformer | Step 1820 | Loss: 3.1901 | Ppl: 24.29 | Bits/Tok: 4.602 | Time: 1245s
+Transformer | Step 1830 | Loss: 3.0077 | Ppl: 20.24 | Bits/Tok: 4.339 | Time: 1251s
+Transformer | Step 1840 | Loss: 3.2921 | Ppl: 26.90 | Bits/Tok: 4.749 | Time: 1258s
+Transformer | Step 1850 | Loss: 3.3274 | Ppl: 27.87 | Bits/Tok: 4.800 | Time: 1265s
+Transformer | Step 1860 | Loss: 3.2595 | Ppl: 26.04 | Bits/Tok: 4.702 | Time: 1271s
+Transformer | Step 1870 | Loss: 3.3725 | Ppl: 29.15 | Bits/Tok: 4.865 | Time: 1278s
+Transformer | Step 1880 | Loss: 3.2628 | Ppl: 26.12 | Bits/Tok: 4.707 | Time: 1285s
+Transformer | Step 1890 | Loss: 3.1053 | Ppl: 22.32 | Bits/Tok: 4.480 | Time: 1291s
+Transformer | Step 1900 | Loss: 3.1262 | Ppl: 22.79 | Bits/Tok: 4.510 | Time: 1298s
+Transformer | Step 1910 | Loss: 3.3196 | Ppl: 27.65 | Bits/Tok: 4.789 | Time: 1305s
+Transformer | Step 1920 | Loss: 3.1016 | Ppl: 22.23 | Bits/Tok: 4.475 | Time: 1312s
+Transformer | Step 1930 | Loss: 3.1826 | Ppl: 24.11 | Bits/Tok: 4.591 | Time: 1318s
+Transformer | Step 1940 | Loss: 3.1815 | Ppl: 24.08 | Bits/Tok: 4.590 | Time: 1325s
+Transformer | Step 1950 | Loss: 3.3266 | Ppl: 27.84 | Bits/Tok: 4.799 | Time: 1332s
+Transformer | Step 1960 | Loss: 3.0388 | Ppl: 20.88 | Bits/Tok: 4.384 | Time: 1338s
+Transformer | Step 1970 | Loss: 3.2187 | Ppl: 25.00 | Bits/Tok: 4.644 | Time: 1345s
+Transformer | Step 1980 | Loss: 3.1775 | Ppl: 23.99 | Bits/Tok: 4.584 | Time: 1352s
+Transformer | Step 1990 | Loss: 3.2005 | Ppl: 24.54 | Bits/Tok: 4.617 | Time: 1359s
+Transformer | Step 2000 | Loss: 3.2319 | Ppl: 25.33 | Bits/Tok: 4.663 | Time: 1365s
+Transformer | Step 2010 | Loss: 3.1959 | Ppl: 24.43 | Bits/Tok: 4.611 | Time: 1372s
+Transformer | Step 2020 | Loss: 3.3219 | Ppl: 27.71 | Bits/Tok: 4.792 | Time: 1379s
+Transformer | Step 2030 | Loss: 3.2208 | Ppl: 25.05 | Bits/Tok: 4.647 | Time: 1385s
+Transformer | Step 2040 | Loss: 3.0739 | Ppl: 21.63 | Bits/Tok: 4.435 | Time: 1392s
+Transformer | Step 2050 | Loss: 3.1457 | Ppl: 23.24 | Bits/Tok: 4.538 | Time: 1398s
+Transformer | Step 2060 | Loss: 3.0524 | Ppl: 21.17 | Bits/Tok: 4.404 | Time: 1405s
+Transformer | Step 2070 | Loss: 3.0800 | Ppl: 21.76 | Bits/Tok: 4.443 | Time: 1412s
+Transformer | Step 2080 | Loss: 3.2774 | Ppl: 26.51 | Bits/Tok: 4.728 | Time: 1418s
+Transformer | Step 2090 | Loss: 3.0077 | Ppl: 20.24 | Bits/Tok: 4.339 | Time: 1425s
+Transformer | Step 2100 | Loss: 3.1188 | Ppl: 22.62 | Bits/Tok: 4.499 | Time: 1432s
+Transformer | Step 2110 | Loss: 3.1636 | Ppl: 23.66 | Bits/Tok: 4.564 | Time: 1438s
+Transformer | Step 2120 | Loss: 3.0911 | Ppl: 22.00 | Bits/Tok: 4.460 | Time: 1445s
+Transformer | Step 2130 | Loss: 3.2180 | Ppl: 24.98 | Bits/Tok: 4.643 | Time: 1452s
+Transformer | Step 2140 | Loss: 3.0681 | Ppl: 21.50 | Bits/Tok: 4.426 | Time: 1459s
+Transformer | Step 2150 | Loss: 3.0934 | Ppl: 22.05 | Bits/Tok: 4.463 | Time: 1465s
+Transformer | Step 2160 | Loss: 3.1657 | Ppl: 23.71 | Bits/Tok: 4.567 | Time: 1472s
+Transformer | Step 2170 | Loss: 3.2504 | Ppl: 25.80 | Bits/Tok: 4.689 | Time: 1479s
+Transformer | Step 2180 | Loss: 3.0385 | Ppl: 20.87 | Bits/Tok: 4.384 | Time: 1485s
+Transformer | Step 2190 | Loss: 3.0873 | Ppl: 21.92 | Bits/Tok: 4.454 | Time: 1492s
+Transformer | Step 2200 | Loss: 3.0976 | Ppl: 22.14 | Bits/Tok: 4.469 | Time: 1498s
+Transformer | Step 2210 | Loss: 3.2435 | Ppl: 25.62 | Bits/Tok: 4.679 | Time: 1505s
+Transformer | Step 2220 | Loss: 3.1913 | Ppl: 24.32 | Bits/Tok: 4.604 | Time: 1512s
+Transformer | Step 2230 | Loss: 3.2614 | Ppl: 26.09 | Bits/Tok: 4.705 | Time: 1518s
+Transformer | Step 2240 | Loss: 3.2279 | Ppl: 25.23 | Bits/Tok: 4.657 | Time: 1525s
+Transformer | Step 2250 | Loss: 3.1833 | Ppl: 24.13 | Bits/Tok: 4.592 | Time: 1531s
+Transformer | Step 2260 | Loss: 3.1313 | Ppl: 22.90 | Bits/Tok: 4.517 | Time: 1538s
+Transformer | Step 2270 | Loss: 3.0289 | Ppl: 20.67 | Bits/Tok: 4.370 | Time: 1545s
+Transformer | Step 2280 | Loss: 3.1964 | Ppl: 24.45 | Bits/Tok: 4.611 | Time: 1551s
+Transformer | Step 2290 | Loss: 3.1543 | Ppl: 23.44 | Bits/Tok: 4.551 | Time: 1558s
+Transformer | Step 2300 | Loss: 3.2739 | Ppl: 26.41 | Bits/Tok: 4.723 | Time: 1565s
+Transformer | Step 2310 | Loss: 3.0962 | Ppl: 22.11 | Bits/Tok: 4.467 | Time: 1571s
+Transformer | Step 2320 | Loss: 3.1022 | Ppl: 22.25 | Bits/Tok: 4.476 | Time: 1578s
+Transformer | Step 2330 | Loss: 3.1090 | Ppl: 22.40 | Bits/Tok: 4.485 | Time: 1585s
+Transformer | Step 2340 | Loss: 3.0858 | Ppl: 21.89 | Bits/Tok: 4.452 | Time: 1591s
+Transformer | Step 2350 | Loss: 3.0731 | Ppl: 21.61 | Bits/Tok: 4.434 | Time: 1598s
+Transformer | Step 2360 | Loss: 3.0849 | Ppl: 21.87 | Bits/Tok: 4.451 | Time: 1605s
+Transformer | Step 2370 | Loss: 3.1432 | Ppl: 23.18 | Bits/Tok: 4.535 | Time: 1611s
+Transformer | Step 2380 | Loss: 3.1175 | Ppl: 22.59 | Bits/Tok: 4.498 | Time: 1618s
+Transformer | Step 2390 | Loss: 3.1637 | Ppl: 23.66 | Bits/Tok: 4.564 | Time: 1625s
+Transformer | Step 2400 | Loss: 3.2692 | Ppl: 26.29 | Bits/Tok: 4.716 | Time: 1631s
+Transformer | Step 2410 | Loss: 3.0665 | Ppl: 21.47 | Bits/Tok: 4.424 | Time: 1638s
+Transformer | Step 2420 | Loss: 3.1478 | Ppl: 23.28 | Bits/Tok: 4.541 | Time: 1644s
+Transformer | Step 2430 | Loss: 3.1152 | Ppl: 22.54 | Bits/Tok: 4.494 | Time: 1651s
+Transformer | Step 2440 | Loss: 3.1719 | Ppl: 23.85 | Bits/Tok: 4.576 | Time: 1658s
+Transformer | Step 2450 | Loss: 3.1960 | Ppl: 24.43 | Bits/Tok: 4.611 | Time: 1664s
+Transformer | Step 2460 | Loss: 3.2616 | Ppl: 26.09 | Bits/Tok: 4.705 | Time: 1671s
+Transformer | Step 2470 | Loss: 3.1461 | Ppl: 23.24 | Bits/Tok: 4.539 | Time: 1678s
+Transformer | Step 2480 | Loss: 3.2481 | Ppl: 25.74 | Bits/Tok: 4.686 | Time: 1685s
+Transformer | Step 2490 | Loss: 3.1400 | Ppl: 23.10 | Bits/Tok: 4.530 | Time: 1691s
+Transformer | Step 2500 | Loss: 2.9965 | Ppl: 20.01 | Bits/Tok: 4.323 | Time: 1698s
+Transformer | Step 2510 | Loss: 2.9928 | Ppl: 19.94 | Bits/Tok: 4.318 | Time: 1705s
+Transformer | Step 2520 | Loss: 3.2510 | Ppl: 25.82 | Bits/Tok: 4.690 | Time: 1712s
+Transformer | Step 2530 | Loss: 3.2080 | Ppl: 24.73 | Bits/Tok: 4.628 | Time: 1718s
+Transformer | Step 2540 | Loss: 3.0509 | Ppl: 21.13 | Bits/Tok: 4.402 | Time: 1725s
+Transformer | Step 2550 | Loss: 3.1173 | Ppl: 22.58 | Bits/Tok: 4.497 | Time: 1732s
+Transformer | Step 2560 | Loss: 3.2013 | Ppl: 24.56 | Bits/Tok: 4.619 | Time: 1739s
+Transformer | Step 2570 | Loss: 3.1261 | Ppl: 22.79 | Bits/Tok: 4.510 | Time: 1745s
+Transformer | Step 2580 | Loss: 3.0478 | Ppl: 21.07 | Bits/Tok: 4.397 | Time: 1752s
+Transformer | Step 2590 | Loss: 3.1351 | Ppl: 22.99 | Bits/Tok: 4.523 | Time: 1759s
+Transformer | Step 2600 | Loss: 3.2121 | Ppl: 24.83 | Bits/Tok: 4.634 | Time: 1765s
+Transformer | Step 2610 | Loss: 3.2443 | Ppl: 25.64 | Bits/Tok: 4.680 | Time: 1772s
+Transformer | Step 2620 | Loss: 3.1349 | Ppl: 22.99 | Bits/Tok: 4.523 | Time: 1779s
+Transformer | Step 2630 | Loss: 3.1248 | Ppl: 22.75 | Bits/Tok: 4.508 | Time: 1786s
+Transformer | Step 2640 | Loss: 3.2078 | Ppl: 24.73 | Bits/Tok: 4.628 | Time: 1792s
+Transformer | Step 2650 | Loss: 3.1406 | Ppl: 23.12 | Bits/Tok: 4.531 | Time: 1799s
+Transformer | Step 2660 | Loss: 3.1446 | Ppl: 23.21 | Bits/Tok: 4.537 | Time: 1806s
+Transformer | Step 2670 | Loss: 3.1040 | Ppl: 22.29 | Bits/Tok: 4.478 | Time: 1812s
+Transformer | Step 2680 | Loss: 3.0895 | Ppl: 21.97 | Bits/Tok: 4.457 | Time: 1819s
+Transformer | Step 2690 | Loss: 3.1982 | Ppl: 24.49 | Bits/Tok: 4.614 | Time: 1826s
+Transformer | Step 2700 | Loss: 3.0554 | Ppl: 21.23 | Bits/Tok: 4.408 | Time: 1832s
+Transformer | Step 2710 | Loss: 3.1582 | Ppl: 23.53 | Bits/Tok: 4.556 | Time: 1839s
+Transformer | Step 2720 | Loss: 3.0431 | Ppl: 20.97 | Bits/Tok: 4.390 | Time: 1846s
+Transformer | Step 2730 | Loss: 3.1885 | Ppl: 24.25 | Bits/Tok: 4.600 | Time: 1852s
+Transformer | Step 2740 | Loss: 3.2110 | Ppl: 24.80 | Bits/Tok: 4.633 | Time: 1859s
+Transformer | Step 2750 | Loss: 3.1859 | Ppl: 24.19 | Bits/Tok: 4.596 | Time: 1867s
+Transformer | Step 2760 | Loss: 3.2037 | Ppl: 24.62 | Bits/Tok: 4.622 | Time: 1874s
+Transformer | Step 2770 | Loss: 3.1252 | Ppl: 22.76 | Bits/Tok: 4.509 | Time: 1881s
+Transformer | Step 2780 | Loss: 3.0645 | Ppl: 21.42 | Bits/Tok: 4.421 | Time: 1888s
+Transformer | Step 2790 | Loss: 3.1857 | Ppl: 24.18 | Bits/Tok: 4.596 | Time: 1894s
+Transformer | Step 2800 | Loss: 3.1213 | Ppl: 22.68 | Bits/Tok: 4.503 | Time: 1902s
+Transformer | Step 2810 | Loss: 3.1852 | Ppl: 24.17 | Bits/Tok: 4.595 | Time: 1909s
+Transformer | Step 2820 | Loss: 3.0689 | Ppl: 21.52 | Bits/Tok: 4.427 | Time: 1916s
+Transformer | Step 2830 | Loss: 3.0864 | Ppl: 21.90 | Bits/Tok: 4.453 | Time: 1923s
+Transformer | Step 2840 | Loss: 3.1032 | Ppl: 22.27 | Bits/Tok: 4.477 | Time: 1931s
+Transformer | Step 2850 | Loss: 3.1565 | Ppl: 23.49 | Bits/Tok: 4.554 | Time: 1938s
+Transformer | Step 2860 | Loss: 3.2483 | Ppl: 25.75 | Bits/Tok: 4.686 | Time: 1945s
+Transformer | Step 2870 | Loss: 3.1626 | Ppl: 23.63 | Bits/Tok: 4.563 | Time: 1953s
+Transformer | Step 2880 | Loss: 2.9871 | Ppl: 19.83 | Bits/Tok: 4.309 | Time: 1960s
+Transformer | Step 2890 | Loss: 3.0565 | Ppl: 21.25 | Bits/Tok: 4.410 | Time: 1967s
+Transformer | Step 2900 | Loss: 3.2303 | Ppl: 25.29 | Bits/Tok: 4.660 | Time: 1974s
+Transformer | Step 2910 | Loss: 3.1190 | Ppl: 22.62 | Bits/Tok: 4.500 | Time: 1982s
+Transformer | Step 2920 | Loss: 3.0971 | Ppl: 22.13 | Bits/Tok: 4.468 | Time: 1989s
+Transformer | Step 2930 | Loss: 3.1130 | Ppl: 22.49 | Bits/Tok: 4.491 | Time: 1996s
+Transformer | Step 2940 | Loss: 3.1848 | Ppl: 24.16 | Bits/Tok: 4.595 | Time: 2003s
+Transformer | Step 2950 | Loss: 2.9806 | Ppl: 19.70 | Bits/Tok: 4.300 | Time: 2010s
+Transformer | Step 2960 | Loss: 3.1629 | Ppl: 23.64 | Bits/Tok: 4.563 | Time: 2018s
+Transformer | Step 2970 | Loss: 3.0803 | Ppl: 21.77 | Bits/Tok: 4.444 | Time: 2025s
+Transformer | Step 2980 | Loss: 3.1647 | Ppl: 23.68 | Bits/Tok: 4.566 | Time: 2032s
+Transformer | Step 2990 | Loss: 3.2330 | Ppl: 25.36 | Bits/Tok: 4.664 | Time: 2039s
+Transformer | Step 3000 | Loss: 3.0824 | Ppl: 21.81 | Bits/Tok: 4.447 | Time: 2046s
+Transformer | Step 3010 | Loss: 3.2526 | Ppl: 25.86 | Bits/Tok: 4.692 | Time: 2054s
+Transformer | Step 3020 | Loss: 2.9786 | Ppl: 19.66 | Bits/Tok: 4.297 | Time: 2061s
+Transformer | Step 3030 | Loss: 3.1464 | Ppl: 23.25 | Bits/Tok: 4.539 | Time: 2068s
+Transformer | Step 3040 | Loss: 3.1194 | Ppl: 22.63 | Bits/Tok: 4.500 | Time: 2075s
+Transformer | Step 3050 | Loss: 3.1666 | Ppl: 23.73 | Bits/Tok: 4.568 | Time: 2083s
+Transformer | Step 3060 | Loss: 3.1109 | Ppl: 22.44 | Bits/Tok: 4.488 | Time: 2090s
+Transformer | Step 3070 | Loss: 3.0966 | Ppl: 22.12 | Bits/Tok: 4.467 | Time: 2097s
+Transformer | Step 3080 | Loss: 3.0651 | Ppl: 21.44 | Bits/Tok: 4.422 | Time: 2104s
+Transformer | Step 3090 | Loss: 3.1646 | Ppl: 23.68 | Bits/Tok: 4.566 | Time: 2111s
+Transformer | Step 3100 | Loss: 3.2880 | Ppl: 26.79 | Bits/Tok: 4.744 | Time: 2119s
+Transformer | Step 3110 | Loss: 3.0324 | Ppl: 20.75 | Bits/Tok: 4.375 | Time: 2126s
+Transformer | Step 3120 | Loss: 3.0398 | Ppl: 20.90 | Bits/Tok: 4.386 | Time: 2133s
+Transformer | Step 3130 | Loss: 3.0152 | Ppl: 20.39 | Bits/Tok: 4.350 | Time: 2140s
+Transformer | Step 3140 | Loss: 3.1085 | Ppl: 22.39 | Bits/Tok: 4.485 | Time: 2147s
+Transformer | Step 3150 | Loss: 3.0745 | Ppl: 21.64 | Bits/Tok: 4.436 | Time: 2153s
+Transformer | Step 3160 | Loss: 3.0986 | Ppl: 22.17 | Bits/Tok: 4.470 | Time: 2160s
+Transformer | Step 3170 | Loss: 3.1000 | Ppl: 22.20 | Bits/Tok: 4.472 | Time: 2167s
+Transformer | Step 3180 | Loss: 3.0539 | Ppl: 21.20 | Bits/Tok: 4.406 | Time: 2174s
+Transformer | Step 3190 | Loss: 3.1446 | Ppl: 23.21 | Bits/Tok: 4.537 | Time: 2181s
+Transformer | Step 3200 | Loss: 3.1948 | Ppl: 24.40 | Bits/Tok: 4.609 | Time: 2188s
+Transformer | Step 3210 | Loss: 2.9929 | Ppl: 19.94 | Bits/Tok: 4.318 | Time: 2195s
+Transformer | Step 3220 | Loss: 3.0255 | Ppl: 20.60 | Bits/Tok: 4.365 | Time: 2201s
+Transformer | Step 3230 | Loss: 3.0928 | Ppl: 22.04 | Bits/Tok: 4.462 | Time: 2208s
+Transformer | Step 3240 | Loss: 3.0507 | Ppl: 21.13 | Bits/Tok: 4.401 | Time: 2215s
+Transformer | Step 3250 | Loss: 3.0569 | Ppl: 21.26 | Bits/Tok: 4.410 | Time: 2223s
+Transformer | Step 3260 | Loss: 2.9067 | Ppl: 18.30 | Bits/Tok: 4.193 | Time: 2230s
+Transformer | Step 3270 | Loss: 3.2003 | Ppl: 24.54 | Bits/Tok: 4.617 | Time: 2237s
+Transformer | Step 3280 | Loss: 2.9646 | Ppl: 19.39 | Bits/Tok: 4.277 | Time: 2244s
+Transformer | Step 3290 | Loss: 3.0544 | Ppl: 21.21 | Bits/Tok: 4.407 | Time: 2252s
+Transformer | Step 3300 | Loss: 3.1320 | Ppl: 22.92 | Bits/Tok: 4.519 | Time: 2259s
+Transformer | Step 3310 | Loss: 3.0405 | Ppl: 20.92 | Bits/Tok: 4.387 | Time: 2266s
+Transformer | Step 3320 | Loss: 3.2385 | Ppl: 25.50 | Bits/Tok: 4.672 | Time: 2273s
+Transformer | Step 3330 | Loss: 2.9887 | Ppl: 19.86 | Bits/Tok: 4.312 | Time: 2281s
+Transformer | Step 3340 | Loss: 3.1445 | Ppl: 23.21 | Bits/Tok: 4.537 | Time: 2288s
+Transformer | Step 3350 | Loss: 3.0886 | Ppl: 21.95 | Bits/Tok: 4.456 | Time: 2295s
+Transformer | Step 3360 | Loss: 3.1263 | Ppl: 22.79 | Bits/Tok: 4.510 | Time: 2302s
+Transformer | Step 3370 | Loss: 3.0817 | Ppl: 21.79 | Bits/Tok: 4.446 | Time: 2309s
+Transformer | Step 3380 | Loss: 3.0898 | Ppl: 21.97 | Bits/Tok: 4.458 | Time: 2317s
+Transformer | Step 3390 | Loss: 3.1059 | Ppl: 22.33 | Bits/Tok: 4.481 | Time: 2324s
+Transformer | Step 3400 | Loss: 3.0915 | Ppl: 22.01 | Bits/Tok: 4.460 | Time: 2331s
+Transformer | Step 3410 | Loss: 3.1873 | Ppl: 24.22 | Bits/Tok: 4.598 | Time: 2338s
+Transformer | Step 3420 | Loss: 3.0034 | Ppl: 20.15 | Bits/Tok: 4.333 | Time: 2346s
+Transformer | Step 3430 | Loss: 3.1154 | Ppl: 22.54 | Bits/Tok: 4.495 | Time: 2353s
+Transformer | Step 3440 | Loss: 3.0582 | Ppl: 21.29 | Bits/Tok: 4.412 | Time: 2360s
+Transformer | Step 3450 | Loss: 2.9676 | Ppl: 19.45 | Bits/Tok: 4.281 | Time: 2367s
+Transformer | Step 3460 | Loss: 3.2190 | Ppl: 25.00 | Bits/Tok: 4.644 | Time: 2375s
+Transformer | Step 3470 | Loss: 3.1533 | Ppl: 23.41 | Bits/Tok: 4.549 | Time: 2382s
+Transformer | Step 3480 | Loss: 3.0889 | Ppl: 21.95 | Bits/Tok: 4.456 | Time: 2389s
+Transformer | Step 3490 | Loss: 3.0271 | Ppl: 20.64 | Bits/Tok: 4.367 | Time: 2396s
+Transformer | Step 3500 | Loss: 3.1585 | Ppl: 23.54 | Bits/Tok: 4.557 | Time: 2403s
+Transformer | Step 3510 | Loss: 3.0464 | Ppl: 21.04 | Bits/Tok: 4.395 | Time: 2411s
+Transformer | Step 3520 | Loss: 3.2251 | Ppl: 25.16 | Bits/Tok: 4.653 | Time: 2418s
+Transformer | Step 3530 | Loss: 3.1941 | Ppl: 24.39 | Bits/Tok: 4.608 | Time: 2425s
+Transformer | Step 3540 | Loss: 3.2549 | Ppl: 25.92 | Bits/Tok: 4.696 | Time: 2433s
+Transformer | Step 3550 | Loss: 3.1804 | Ppl: 24.06 | Bits/Tok: 4.588 | Time: 2440s
+Transformer | Step 3560 | Loss: 3.0978 | Ppl: 22.15 | Bits/Tok: 4.469 | Time: 2447s
+Transformer | Step 3570 | Loss: 3.2144 | Ppl: 24.89 | Bits/Tok: 4.637 | Time: 2454s
+Transformer | Step 3580 | Loss: 3.1536 | Ppl: 23.42 | Bits/Tok: 4.550 | Time: 2461s
+Transformer | Step 3590 | Loss: 3.0872 | Ppl: 21.92 | Bits/Tok: 4.454 | Time: 2467s
+Transformer | Step 3600 | Loss: 3.0295 | Ppl: 20.69 | Bits/Tok: 4.371 | Time: 2474s
+Transformer | Step 3610 | Loss: 3.0895 | Ppl: 21.97 | Bits/Tok: 4.457 | Time: 2481s
+Transformer | Step 3620 | Loss: 3.1803 | Ppl: 24.05 | Bits/Tok: 4.588 | Time: 2488s
+Transformer | Step 3630 | Loss: 3.0778 | Ppl: 21.71 | Bits/Tok: 4.440 | Time: 2495s
+Transformer | Step 3640 | Loss: 3.1741 | Ppl: 23.90 | Bits/Tok: 4.579 | Time: 2502s
+Transformer | Step 3650 | Loss: 3.1202 | Ppl: 22.65 | Bits/Tok: 4.502 | Time: 2509s
+Transformer | Step 3660 | Loss: 3.1290 | Ppl: 22.85 | Bits/Tok: 4.514 | Time: 2516s
+Transformer | Step 3670 | Loss: 3.1427 | Ppl: 23.17 | Bits/Tok: 4.534 | Time: 2523s
+Transformer | Step 3680 | Loss: 3.1638 | Ppl: 23.66 | Bits/Tok: 4.564 | Time: 2531s
+Transformer | Step 3690 | Loss: 3.1716 | Ppl: 23.85 | Bits/Tok: 4.576 | Time: 2538s
+Transformer | Step 3700 | Loss: 3.2054 | Ppl: 24.67 | Bits/Tok: 4.624 | Time: 2545s
+Transformer | Step 3710 | Loss: 3.1508 | Ppl: 23.35 | Bits/Tok: 4.546 | Time: 2552s
+Transformer | Step 3720 | Loss: 3.0322 | Ppl: 20.74 | Bits/Tok: 4.374 | Time: 2560s
+Transformer | Step 3730 | Loss: 3.0439 | Ppl: 20.99 | Bits/Tok: 4.391 | Time: 2567s
+Transformer | Step 3740 | Loss: 3.0461 | Ppl: 21.03 | Bits/Tok: 4.395 | Time: 2574s
+Transformer | Step 3750 | Loss: 3.0089 | Ppl: 20.27 | Bits/Tok: 4.341 | Time: 2581s
+Transformer | Step 3760 | Loss: 3.0485 | Ppl: 21.08 | Bits/Tok: 4.398 | Time: 2588s
+Transformer | Step 3770 | Loss: 3.1550 | Ppl: 23.45 | Bits/Tok: 4.552 | Time: 2596s
+Transformer | Step 3780 | Loss: 3.0502 | Ppl: 21.12 | Bits/Tok: 4.401 | Time: 2603s
+Transformer | Step 3790 | Loss: 3.1583 | Ppl: 23.53 | Bits/Tok: 4.557 | Time: 2610s
+Transformer | Step 3800 | Loss: 3.1243 | Ppl: 22.74 | Bits/Tok: 4.507 | Time: 2617s
+Transformer | Step 3810 | Loss: 2.9015 | Ppl: 18.20 | Bits/Tok: 4.186 | Time: 2625s
+Transformer | Step 3820 | Loss: 3.0192 | Ppl: 20.48 | Bits/Tok: 4.356 | Time: 2632s
+Transformer | Step 3830 | Loss: 3.0290 | Ppl: 20.68 | Bits/Tok: 4.370 | Time: 2639s
+Transformer | Step 3840 | Loss: 3.0609 | Ppl: 21.35 | Bits/Tok: 4.416 | Time: 2646s
+Transformer | Step 3850 | Loss: 3.0340 | Ppl: 20.78 | Bits/Tok: 4.377 | Time: 2653s
+Transformer | Step 3860 | Loss: 3.0685 | Ppl: 21.51 | Bits/Tok: 4.427 | Time: 2661s
+Transformer | Step 3870 | Loss: 3.0241 | Ppl: 20.58 | Bits/Tok: 4.363 | Time: 2668s
+Transformer | Step 3880 | Loss: 2.9791 | Ppl: 19.67 | Bits/Tok: 4.298 | Time: 2675s
+Transformer | Step 3890 | Loss: 3.0993 | Ppl: 22.18 | Bits/Tok: 4.471 | Time: 2682s
+Transformer | Step 3900 | Loss: 3.1258 | Ppl: 22.78 | Bits/Tok: 4.510 | Time: 2689s
+Transformer | Step 3910 | Loss: 2.9532 | Ppl: 19.17 | Bits/Tok: 4.261 | Time: 2696s
+Transformer | Step 3920 | Loss: 2.9533 | Ppl: 19.17 | Bits/Tok: 4.261 | Time: 2704s
+Transformer | Step 3930 | Loss: 3.0694 | Ppl: 21.53 | Bits/Tok: 4.428 | Time: 2711s
+Transformer | Step 3940 | Loss: 3.0845 | Ppl: 21.86 | Bits/Tok: 4.450 | Time: 2718s
+Transformer | Step 3950 | Loss: 3.0664 | Ppl: 21.46 | Bits/Tok: 4.424 | Time: 2726s
+Transformer | Step 3960 | Loss: 3.1421 | Ppl: 23.15 | Bits/Tok: 4.533 | Time: 2733s
+Transformer | Step 3970 | Loss: 3.1801 | Ppl: 24.05 | Bits/Tok: 4.588 | Time: 2740s
+Transformer | Step 3980 | Loss: 3.1493 | Ppl: 23.32 | Bits/Tok: 4.543 | Time: 2747s
+Transformer | Step 3990 | Loss: 3.0767 | Ppl: 21.69 | Bits/Tok: 4.439 | Time: 2754s
+Transformer | Step 4000 | Loss: 3.0043 | Ppl: 20.17 | Bits/Tok: 4.334 | Time: 2760s
+Transformer | Step 4010 | Loss: 2.9508 | Ppl: 19.12 | Bits/Tok: 4.257 | Time: 2767s
+Transformer | Step 4020 | Loss: 3.0766 | Ppl: 21.68 | Bits/Tok: 4.439 | Time: 2774s
+Transformer | Step 4030 | Loss: 3.0652 | Ppl: 21.44 | Bits/Tok: 4.422 | Time: 2781s
+Transformer | Step 4040 | Loss: 3.0680 | Ppl: 21.50 | Bits/Tok: 4.426 | Time: 2788s
+Transformer | Step 4050 | Loss: 3.0796 | Ppl: 21.75 | Bits/Tok: 4.443 | Time: 2795s
+Transformer | Step 4060 | Loss: 3.0628 | Ppl: 21.39 | Bits/Tok: 4.419 | Time: 2802s
+Transformer | Step 4070 | Loss: 3.0667 | Ppl: 21.47 | Bits/Tok: 4.424 | Time: 2809s
+Transformer | Step 4080 | Loss: 3.1155 | Ppl: 22.54 | Bits/Tok: 4.495 | Time: 2817s
+Transformer | Step 4090 | Loss: 3.2304 | Ppl: 25.29 | Bits/Tok: 4.660 | Time: 2824s
+Transformer | Step 4100 | Loss: 3.0967 | Ppl: 22.12 | Bits/Tok: 4.468 | Time: 2831s
+Transformer | Step 4110 | Loss: 3.0540 | Ppl: 21.20 | Bits/Tok: 4.406 | Time: 2838s
+Transformer | Step 4120 | Loss: 3.0883 | Ppl: 21.94 | Bits/Tok: 4.456 | Time: 2846s
+Transformer | Step 4130 | Loss: 3.0987 | Ppl: 22.17 | Bits/Tok: 4.470 | Time: 2853s
+Transformer | Step 4140 | Loss: 2.9886 | Ppl: 19.86 | Bits/Tok: 4.312 | Time: 2860s
+Transformer | Step 4150 | Loss: 3.1573 | Ppl: 23.51 | Bits/Tok: 4.555 | Time: 2867s
+Transformer | Step 4160 | Loss: 3.1904 | Ppl: 24.30 | Bits/Tok: 4.603 | Time: 2874s
+Transformer | Step 4170 | Loss: 3.1391 | Ppl: 23.08 | Bits/Tok: 4.529 | Time: 2882s
+Transformer | Step 4180 | Loss: 3.1192 | Ppl: 22.63 | Bits/Tok: 4.500 | Time: 2889s
+Transformer | Step 4190 | Loss: 3.1121 | Ppl: 22.47 | Bits/Tok: 4.490 | Time: 2896s
+Transformer | Step 4200 | Loss: 3.1745 | Ppl: 23.91 | Bits/Tok: 4.580 | Time: 2904s
+Transformer | Step 4210 | Loss: 3.1275 | Ppl: 22.82 | Bits/Tok: 4.512 | Time: 2911s
+Transformer | Step 4220 | Loss: 3.1615 | Ppl: 23.61 | Bits/Tok: 4.561 | Time: 2918s
+Transformer | Step 4230 | Loss: 3.0388 | Ppl: 20.88 | Bits/Tok: 4.384 | Time: 2925s
+Transformer | Step 4240 | Loss: 3.0828 | Ppl: 21.82 | Bits/Tok: 4.448 | Time: 2933s
+Transformer | Step 4250 | Loss: 3.0664 | Ppl: 21.47 | Bits/Tok: 4.424 | Time: 2940s
+Transformer | Step 4260 | Loss: 3.1646 | Ppl: 23.68 | Bits/Tok: 4.566 | Time: 2947s
+Transformer | Step 4270 | Loss: 2.9920 | Ppl: 19.93 | Bits/Tok: 4.317 | Time: 2954s
+Transformer | Step 4280 | Loss: 3.1119 | Ppl: 22.46 | Bits/Tok: 4.490 | Time: 2962s
+Transformer | Step 4290 | Loss: 2.9673 | Ppl: 19.44 | Bits/Tok: 4.281 | Time: 2969s
+Transformer | Step 4300 | Loss: 3.0976 | Ppl: 22.14 | Bits/Tok: 4.469 | Time: 2976s
+Transformer | Step 4310 | Loss: 3.0086 | Ppl: 20.26 | Bits/Tok: 4.341 | Time: 2983s
+Transformer | Step 4320 | Loss: 3.1758 | Ppl: 23.95 | Bits/Tok: 4.582 | Time: 2991s
+Transformer | Step 4330 | Loss: 3.1503 | Ppl: 23.34 | Bits/Tok: 4.545 | Time: 2998s
+Transformer | Step 4340 | Loss: 3.0301 | Ppl: 20.70 | Bits/Tok: 4.372 | Time: 3005s
+Transformer | Step 4350 | Loss: 3.1085 | Ppl: 22.39 | Bits/Tok: 4.485 | Time: 3012s
+Transformer | Step 4360 | Loss: 3.0769 | Ppl: 21.69 | Bits/Tok: 4.439 | Time: 3019s
+Transformer | Step 4370 | Loss: 3.1822 | Ppl: 24.10 | Bits/Tok: 4.591 | Time: 3027s
+Transformer | Step 4380 | Loss: 3.0261 | Ppl: 20.62 | Bits/Tok: 4.366 | Time: 3034s
+Transformer | Step 4390 | Loss: 3.0840 | Ppl: 21.85 | Bits/Tok: 4.449 | Time: 3041s
+Transformer | Step 4400 | Loss: 3.0707 | Ppl: 21.56 | Bits/Tok: 4.430 | Time: 3048s
+Transformer | Step 4410 | Loss: 3.1676 | Ppl: 23.75 | Bits/Tok: 4.570 | Time: 3055s
+Transformer | Step 4420 | Loss: 2.9210 | Ppl: 18.56 | Bits/Tok: 4.214 | Time: 3061s
+Transformer | Step 4430 | Loss: 3.0028 | Ppl: 20.14 | Bits/Tok: 4.332 | Time: 3068s
+Transformer | Step 4440 | Loss: 3.0646 | Ppl: 21.43 | Bits/Tok: 4.421 | Time: 3075s
+Transformer | Step 4450 | Loss: 3.0702 | Ppl: 21.55 | Bits/Tok: 4.429 | Time: 3082s
+Transformer | Step 4460 | Loss: 2.9150 | Ppl: 18.45 | Bits/Tok: 4.205 | Time: 3089s
+
+✅ Benchmark Complete. Results saved to benchmark_results.csv

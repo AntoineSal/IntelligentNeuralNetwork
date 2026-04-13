@@ -1,0 +1,146 @@
+🔬 BENCHMARK: Lifecycle Tasks on cuda
+======================================================================
+BENCHMARK: Lifecycle Tasks - INN vs Baselines
+======================================================================
+
+======================================================================
+EXPERIMENT 1: KEY-VALUE STORAGE (V5 Protocol)
+======================================================================
+
+--- MODEL 1: INN V5 (Orthogonal Neurons) ---
+  Trainable parameters: 1,447,780
+🏋️ Training INN on Exp1 (Key-Value Storage)...
+  Step 0 | Loss: 4.5466
+  Step 100 | Loss: 2.2409
+  Step 200 | Loss: 2.1910
+  Step 300 | Loss: 2.2428
+  Step 400 | Loss: 2.1539
+  Step 500 | Loss: 2.2682
+  Step 600 | Loss: 2.2241
+  Step 700 | Loss: 2.1274
+  Step 800 | Loss: 1.9880
+  Step 900 | Loss: 2.0685
+  Step 1000 | Loss: 1.8368
+  Step 1100 | Loss: 1.2454
+  Step 1200 | Loss: 0.0122
+  Step 1300 | Loss: 0.0035
+  ✅ Converged.
+
+🧐 Testing INN on Exp1...
+  H=  2000 | ✅ | Conf: 99.0%
+  H=  5000 | ✅ | Conf: 96.9%
+  H= 10000 | ✅ | Conf: 84.4%
+
+--- MODEL 2: LSTM Baseline ---
+  Trainable parameters: 157,796
+🏋️ Training LSTM on Exp1 (Key-Value Storage)...
+  Step 0 | Loss: 4.6147
+  Step 100 | Loss: 2.2329
+  Step 200 | Loss: 2.1602
+  Step 300 | Loss: 2.2289
+  Step 400 | Loss: 2.1274
+  Step 500 | Loss: 2.2637
+  Step 600 | Loss: 2.1575
+  Step 700 | Loss: 2.2191
+  Step 800 | Loss: 2.2294
+  Step 900 | Loss: 2.1982
+  Step 1000 | Loss: 2.2202
+  Step 1100 | Loss: 2.2263
+  Step 1200 | Loss: 2.1994
+  Step 1300 | Loss: 2.1594
+  Step 1400 | Loss: 2.2095
+  Step 1500 | Loss: 2.1823
+
+🧐 Testing LSTM on Exp1...
+  H=  2000 | ❌ (5) | Conf: 14.2%
+  H=  5000 | ❌ (5) | Conf: 14.2%
+  H= 10000 | ❌ (5) | Conf: 14.2%
+
+--- MODEL 3: Transformer Baseline ---
+  Trainable parameters: 298,468
+🏋️ Training Transformer on Exp1 (Key-Value Storage)...
+  Step 0 | Loss: 4.6267
+  Step 100 | Loss: 1.4382
+  Step 200 | Loss: 0.3862
+  Step 300 | Loss: 0.1521
+  Step 400 | Loss: 0.0335
+  Step 500 | Loss: 0.1641
+  Step 600 | Loss: 0.0782
+  Step 700 | Loss: 0.1350
+  Step 800 | Loss: 0.0126
+  Step 900 | Loss: 0.2101
+  Step 1000 | Loss: 0.1893
+  Step 1100 | Loss: 0.0508
+  Step 1200 | Loss: 0.0033
+  ✅ Converged.
+
+🧐 Testing Transformer on Exp1...
+  H=  2000 | ❌ (9) | Conf: 88.1%
+  H=  5000 | ❌ (9) | Conf: 80.2%
+  H= 10000 | ❌ (9) | Conf: 72.7%
+
+======================================================================
+EXPERIMENT 2: RECURSIVE CALCULATION (V10.1 Protocol)
+======================================================================
+
+--- MODEL 1: INN V10.1 (Locked Vault) ---
+  Trainable parameters: 1,086,052
+🏋️ Training INN on Exp2 (A+B Calculation)...
+  Step 0 | Loss: 4.7733
+  Step 200 | Loss: 0.6023
+  Step 400 | Loss: 0.0751
+  Step 600 | Loss: 0.1115
+  ✅ Converged at step 603 with loss 0.0448
+
+🧐 Testing INN on Exp2...
+  H=  2000 | ❌ (6) | Conf: 91.0%
+  H=  5000 | ❌ (12) | Conf: 64.6%
+  H= 10000 | ❌ (11) | Conf: 95.1%
+
+--- MODEL 2: LSTM Baseline ---
+  Trainable parameters: 157,796
+🏋️ Training LSTM on Exp2 (A+B Calculation)...
+  Step 0 | Loss: 4.6273
+  Step 200 | Loss: 2.8719
+  Step 400 | Loss: 2.8825
+  Step 600 | Loss: 2.7393
+  Step 800 | Loss: 2.8410
+  Step 1000 | Loss: 2.6214
+
+🧐 Testing LSTM on Exp2...
+  H=  2000 | ❌ (9) | Conf: 10.4%
+  H=  5000 | ❌ (9) | Conf: 10.4%
+  H= 10000 | ❌ (9) | Conf: 10.4%
+
+--- MODEL 3: Transformer Baseline ---
+  Trainable parameters: 298,468
+🏋️ Training Transformer on Exp2 (A+B Calculation)...
+  Step 0 | Loss: 4.5853
+  Step 200 | Loss: 2.7293
+  Step 400 | Loss: 2.6570
+  Step 600 | Loss: 2.7665
+  Step 800 | Loss: 2.8126
+  Step 1000 | Loss: 2.8330
+
+🧐 Testing Transformer on Exp2...
+  H=  2000 | ❌ (12) | Conf: 11.1%
+  H=  5000 | ❌ (12) | Conf: 11.1%
+  H= 10000 | ❌ (12) | Conf: 11.1%
+
+======================================================================
+SUMMARY TABLE
+======================================================================
+
+Exp1 (Key-Value Storage):
+Horizon    | INN    | LSTM   | Transformer 
+----------------------------------------------------------------------
+     2000  | ✅      | ❌      | ❌           
+     5000  | ✅      | ❌      | ❌           
+    10000  | ✅      | ❌      | ❌           
+
+Exp2 (A+B Calculation):
+Horizon    | INN    | LSTM   | Transformer 
+----------------------------------------------------------------------
+     2000  | ❌      | ❌      | ❌           
+     5000  | ❌      | ❌      | ❌           
+    10000  | ❌      | ❌      | ❌           

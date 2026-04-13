@@ -1,6 +1,6 @@
 # INN Research Paper: Project Dashboard
 
-## Title: "Implicit Neural Networks for Language Modeling: An Analysis of Capabilities and Limitations"
+## Title: "Intelligent Neural Networks for Language Modeling: An Analysis of Capabilities and Limitations"
 
 ### 1. Abstract
 - **Goal**: Evaluate a biologically-inspired architecture (INNv2) where neurons are independent agents communicating via attention.

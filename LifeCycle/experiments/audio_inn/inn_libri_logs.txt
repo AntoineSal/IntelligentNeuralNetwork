@@ -1,0 +1,929 @@
+
+"""
+INN Audio Benchmark - LibriSpeech -> EnCodec -> INN -> Audio
+============================================================
+Ce script implémente une pipeline complète pour entraîner un Intelligent Neural Network (INN)
+sur de la génération audio (Speech Modeling).
+
+Architecture :
+1. Input Audio (WAV) -> Neural Audio Codec (EnCodec by Meta) -> Tokens Discrets (Integers)
+2. INN Model -> Prédit le prochain Token
+3. Output Tokens -> Neural Audio Decoder -> Audio (WAV)
+
+Auteur : INN Team
+"""
+
+import os
+import time
+import math
+import random
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import torchaudio
+import numpy as np
+from torch.utils.data import DataLoader, Dataset
+from transformers import EncodecModel, AutoProcessor
+
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+CONFIG = {
+    "exp_name": "INN_Audio_LibriSpeech_A100",
+    "seed": 42,
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "sample_rate": 24000,   # Standard EnCodec 24khz
+    "vocab_size": 1024,     # EnCodec codebook size
+    "seq_len": 600,         # ~8 secondes d'audio (Contexte long pour A100)
+    "batch_size": 64,       # A100 Power (Stabilité du gradient)
+    "epochs": 20,           # Plus d'epochs car plus rapide
+    "lr": 5e-4,             # LR un peu plus agressif au début
+    "save_every": 500,      # Steps
+    
+    # INN Architecture Params (Scaled Up)
+    "n_neurons": 12,        # Doublé pour capacité cognitive
+    "d_model": 512,         # Dimension interne
+    "d_rnn": 512,           # Taille LSTM interne
+    "n_heads": 8,           # Plus de têtes d'attention
+}
+
+# ==============================================================================
+# 0. INSTALLATION & UTILS (Colab Friendly)
+# ==============================================================================
+def install_dependencies():
+    """Installe les dépendances si non présentes (pour Colab)."""
+    import subprocess
+    import sys
+    try:
+        import transformers
+        import torchaudio
+        import soundfile
+    except ImportError:
+        print("🔧 Installation des dépendances Audio (Transformers, Torchaudio, SoundFile)...")
+        # Installation système de libsndfile1 pour soundfile
+        subprocess.run(["apt-get", "install", "-y", "libsndfile1"], check=False)
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "transformers", "torchaudio", "accelerate", "soundfile"])
+
+# ==============================================================================
+# 1. DATASET & TOKENIZATION
+# ==============================================================================
+class AudioTokenizer:
+    """Wrapper autour de Meta EnCodec pour transformer Audio <-> Tokens."""
+    def __init__(self, device):
+        print("🔊 Chargement du Neural Codec (EnCodec)...")
+        self.device = device
+        # Utilisation de la version HF officielle
+        self.model = EncodecModel.from_pretrained("facebook/encodec_24khz").to(device)
+        self.processor = AutoProcessor.from_pretrained("facebook/encodec_24khz")
+        self.model.eval()
+        
+    @torch.no_grad()
+    def encode(self, waveform):
+        """Audio (batch, 1, samples) -> Tokens (batch, seq_len)"""
+        # Conversion du batch tensor en LISTE de numpy arrays (Mono)
+        # Cela force le processeur à traiter chaque exemple indépendamment
+        # waveform est (batch, 1, samples)
+        raw_audio = [w.squeeze(0).cpu().numpy() for w in waveform]
+        
+        inputs = self.processor(raw_audio=raw_audio, 
+                                sampling_rate=CONFIG["sample_rate"], 
+                                return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        outputs = self.model.encode(**inputs)
+        
+        # codes shape logic:
+        # outputs.audio_codes est un tuple/list (souvent len=1 pour 1 stream)
+        # Le contenu est un tensor (batch, n_codebooks, seq_len) OU (1, batch, n_codebooks, seq_len)
+        raw_codes = outputs.audio_codes[0] # Tensor
+        
+        # On s'assure d'avoir (batch, n_codebooks, seq_len)
+        if raw_codes.ndim == 4:
+            raw_codes = raw_codes.squeeze(0)
+            
+        # On extrait le codebook 0 : (batch, seq_len)
+        codes = raw_codes[:, 0, :] 
+        return codes
+
+    @torch.no_grad()
+    def decode(self, tokens):
+        """Tokens (batch, seq_len) -> Audio (batch, 1, samples)"""
+        # EnCodec (24khz) attend souvent au moins 2 codebooks.
+        # Shape attendue par HF decode: (batch, n_codebooks, seq_len)
+        
+        batch_size, seq_len = tokens.shape
+        # On crée un tenseur avec 2 codebooks (le min souvent pour 24khz)
+        # Codebook 0 = nos prédictions
+        # Codebook 1 = zéros (silence/bruit)
+        
+        codes = torch.zeros(batch_size, 2, seq_len, dtype=torch.long, device=self.device)
+        codes[:, 0, :] = tokens # Fill first codebook
+        
+        # Decode
+        # HF EncodecModel.decode returns [audio_values]
+        audio_values = self.model.decode(codes, [None]) 
+        return audio_values[0]
+
+def keep_colab_alive():
+    """Fonction pour simuler une activité et empêcher le timeout Colab."""
+    pass # Placeholder, généralement géré par le user via JS console ou clicker
+
+
+class LibriSpeechTokenized(Dataset):
+    """Dataset robuste qui scanne les fichiers FLAC et utilise SoundFile directement."""
+    def __init__(self, root, url="dev-clean", tokenizer=None, seq_len=300):
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        
+        # 1. Trigger Download via Torchaudio (juste pour récupérer les fichiers)
+        print(f"📚 Vérification/Téléchargement de LibriSpeech ({url})...")
+        if not os.path.exists(root):
+            os.makedirs(root)
+        try:
+            # On laisse torchaudio gérer le download/extract
+            torchaudio.datasets.LIBRISPEECH(root=root, url=url, download=True)
+        except Exception as e:
+            print(f"Note: Download warning (peut-être déjà présent): {e}")
+
+        # 2. Scan manuel des fichiers FLAC (Bypass du loader Torchaudio buggé)
+        import glob
+        search_path = os.path.join(root, "LibriSpeech", url, "**", "*.flac")
+        self.files = sorted(glob.glob(search_path, recursive=True))
+        print(f"📂 Trouvé {len(self.files)} fichiers audio dans {search_path}")
+        
+        if len(self.files) == 0:
+            raise RuntimeError("Aucun fichier FLAC trouvé ! Vérifiez le téléchargement.")
+
+        # Resampler
+        self.resampler = torchaudio.transforms.Resample(orig_freq=16000, new_freq=CONFIG["sample_rate"])
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        path = self.files[idx]
+        try:
+            # Chargement robuste avec SoundFile
+            import soundfile as sf
+            wav_numpy, sr = sf.read(path)
+            # Soundfile retourne (samples, channels) ou (samples,)
+            waveform = torch.from_numpy(wav_numpy).float()
+            
+            # Ensure (1, samples)
+            if waveform.ndim == 1:
+                waveform = waveform.unsqueeze(0)
+            else:
+                waveform = waveform.t() # (channels, samples)
+            
+            # Resample 16k -> 24k
+            waveform = self.resampler(waveform)
+            
+            return waveform
+            
+        except Exception as e:
+            print(f"⚠️ Erreur fichier {path}: {e}")
+            return torch.zeros(1, CONFIG["sample_rate"])
+
+
+def audio_collate_fn(batch):
+    """Tokenisation par batch pour efficacité GPU."""
+    # Batch est une liste de waveforms
+    # On pad les waveforms pour en faire un tenseur
+    max_len = max([w.size(-1) for w in batch])
+    # Cap max len pour éviter OOM
+    max_len = min(max_len, CONFIG["sample_rate"] * 5) 
+    
+    padded_waves = torch.zeros(len(batch), 1, max_len)
+    for i, w in enumerate(batch):
+        sl = min(w.size(-1), max_len)
+        padded_waves[i, :, :sl] = w[:, :sl]
+        
+    return padded_waves
+
+# ==============================================================================
+# 2. INN ARCHITECTURE (Clean Implementation for Sequence Modeling)
+# ==============================================================================
+class INN_Neuron(nn.Module):
+    """
+    Un neurone intelligent spécialisé :
+    - Possède son propre état récurrent (LSTM)
+    - Possède un mécanisme d'attention (MultiHead)
+    - Lit le contexte global, met à jour son état, propose une sortie
+    """
+    def __init__(self, d_model, d_rnn, n_heads):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        
+        self.norm2 = nn.LayerNorm(d_model)
+        self.lstm = nn.LSTMCell(d_model, d_rnn)
+        
+        self.out_proj = nn.Linear(d_rnn, d_model)
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, x, hidden_state):
+        """
+        x: (batch, d_model) - Input courant (embedding du token)
+        hidden_state: (hx, cx) tuple pour LSTM
+        """
+        # 1. Self-Attention "Instantannée" ou sur le contexte passé ?
+        # Dans cette version simplifiée INN, le neurone regarde l'input x
+        # En réalité, dans un transformer complet, il regarderait la séquence.
+        # Ici, on traite token par token (RNN style).
+        
+        # On triche un peu : on utilise l'attention pour "processer" l'input x
+        # x_unsq = x.unsqueeze(1) # (batch, 1, d_model)
+        # attn_out, _ = self.attn(x_unsq, x_unsq, x_unsq)
+        # x = x + attn_out.squeeze(1)
+        # x = self.norm1(x)
+        
+        # Simplification RNN pur pour stabilité initiale :
+        hx, cx = hidden_state
+        hx_new, cx_new = self.lstm(x, (hx, cx))
+        
+        output = self.out_proj(hx_new)
+        return output, (hx_new, cx_new)
+
+class INN_Brain(nn.Module):
+    """
+    Le cerveau qui connecte les neurones.
+    Architecture :
+    - Embedding Layer (Token -> Vector)
+    - N Neurones Indépendants qui traitent l'info en parallèle
+    - Mixing Layer (Attention "All-to-All" implicite ou Aggregation)
+    - Projection Layer (Vector -> Logits)
+    """
+    def __init__(self, vocab_size, d_model, n_neurons, d_rnn, n_heads):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.neurons = nn.ModuleList([
+            INN_Neuron(d_model, d_rnn, n_heads) for _ in range(n_neurons)
+        ])
+        
+        # Le "Global Workspace" via Attention
+        # Au lieu d'un Linear simple, on utilise une Attention pour mixer les avis des neurones
+        # Query = Input context, Key/Value = Neurons Outputs
+        self.mixer_attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.norm_mix = nn.LayerNorm(d_model)
+        
+        self.head = nn.Linear(d_model, vocab_size)
+        
+        self.n_neurons = n_neurons
+        self.d_rnn = d_rnn
+        self.d_model = d_model
+
+    def init_states(self, batch_size, device):
+        states = []
+        for _ in range(self.n_neurons):
+            hx = torch.zeros(batch_size, self.d_rnn, device=device)
+            cx = torch.zeros(batch_size, self.d_rnn, device=device)
+            states.append((hx, cx))
+        return states
+
+    def forward(self, x, states):
+        """
+        x: (batch, seq_len) - indices
+        states: list of states per neuron
+        """
+        batch_size, seq_len = x.size()
+        x_emb = self.embedding(x) # (batch, seq_len, d_model)
+        
+        # On doit boucler sur le temps car c'est un RNN
+        # Pour optimiser, on pourrait utiliser nn.LSTM standard si les neurones n'étaient pas séparés
+        # Ici, on fait une boucle manuelle (unroll) ou on utilise TorchScript.
+        # Pour la lisibilité Python :
+        
+        logits_seq = []
+        
+        # Transpose pour iterer sur seq
+        x_emb = x_emb.transpose(0, 1) # (seq_len, batch, d_model)
+        
+        for t in range(seq_len):
+            xt = x_emb[t]
+            
+            # 1. Chaque neurone traite l'input
+            neuron_outputs = []
+            new_states = []
+            
+            for i, neuron in enumerate(self.neurons):
+                out, state = neuron(xt, states[i])
+                neuron_outputs.append(out)
+                new_states.append(state)
+            
+            states = new_states # Update states
+            
+            # 2. Aggregation (Le "Conseil des Neurones" avec Attention)
+            # neuron_outputs: liste de (batch, d_model) -> Stack -> (batch, n_neurons, d_model)
+            neuron_stack = torch.stack(neuron_outputs, dim=1)
+            
+            # Attention Mixing :
+            # Query : L'input courant xt (context) -> (batch, 1, d_model)
+            # Key/Value : Les sorties des neurones -> (batch, n_neurons, d_model)
+            # Le système demande : "Quel neurone a la meilleure info pour compléter ce contexte xt ?"
+            query = xt.unsqueeze(1)
+            attn_out, _ = self.mixer_attn(query, neuron_stack, neuron_stack)
+            
+            # attn_out est (batch, 1, d_model)
+            mixed = attn_out.squeeze(1)
+            
+            mixed = self.norm_mix(mixed + xt) # Residual connection avec l'input
+            
+            # 3. Prediction
+            logit = self.head(mixed)
+            logits_seq.append(logit)
+            
+        # Stack outputs
+        logits = torch.stack(logits_seq, dim=1) # (batch, seq_len, vocab_size)
+        return logits, states
+
+# ==============================================================================
+# 3. TRAINING LOOP
+# ==============================================================================
+def train():
+    install_dependencies()
+    
+    print(f"🚀 Initialisation INN Audio sur {CONFIG['device']}")
+    
+    # 1. Init Utils
+    tokenizer = AudioTokenizer(CONFIG["device"])
+    
+    # 2. Dataset
+    # On utilise un dataset custom qui wrap LibriSpeech
+    # num_workers=0 est CRUCIAL dans Colab pour éviter les erreurs d'import dans les sous-processus
+    ds = LibriSpeechTokenized(root="./librispeech_data", tokenizer=tokenizer)
+    dl = DataLoader(ds, batch_size=CONFIG["batch_size"], shuffle=True, 
+                    collate_fn=audio_collate_fn, num_workers=0)
+    
+    # 3. Model
+    model = INN_Brain(
+        vocab_size=CONFIG["vocab_size"],
+        d_model=CONFIG["d_model"],
+        n_neurons=CONFIG["n_neurons"],
+        d_rnn=CONFIG["d_rnn"],
+        n_heads=CONFIG["n_heads"]
+    ).to(CONFIG["device"])
+    
+    optimizer = optim.AdamW(model.parameters(), lr=CONFIG["lr"])
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG["epochs"] * len(dl))
+    criterion = nn.CrossEntropyLoss()
+    
+    print(f"🧠 Modèle INN créé avec {CONFIG['n_neurons']} neurones intelligents.")
+    print(f"🚀 A100 Mode Activated: Batch {CONFIG['batch_size']}, Seq {CONFIG['seq_len']}")
+    print(f"📂 Dataset LibriSpeech prêt. Training starts...")
+    
+    step = 0
+    model.train()
+    
+    for epoch in range(CONFIG["epochs"]):
+        print(f"\n🏁 Epoch {epoch+1}/{CONFIG['epochs']}")
+        
+        for batch_waves in dl:
+            # 1. Tokenization à la volée (Audio -> Codes)
+            batch_waves = batch_waves.to(CONFIG["device"])
+            with torch.no_grad():
+                # encode retourne (batch, seq_len)
+                tokens = tokenizer.encode(batch_waves)
+                
+            # Limiter la séquence pour le training (BPTT limit)
+            if tokens.size(1) > CONFIG["seq_len"]:
+                # Random crop
+                start = random.randint(0, tokens.size(1) - CONFIG["seq_len"])
+                tokens = tokens[:, start:start+CONFIG["seq_len"]]
+            
+            # Input = tokens[:-1], Target = tokens[1:]
+            inputs = tokens[:, :-1]
+            targets = tokens[:, 1:]
+            
+            if inputs.size(1) < 10: continue # Skip trop court
+            
+            # 2. Forward INN
+            states = model.init_states(inputs.size(0), CONFIG["device"])
+            logits, _ = model(inputs, states)
+            
+            # 3. Loss
+            # Flatten pour CrossEntropy: (batch*seq, vocab)
+            loss = criterion(logits.reshape(-1, CONFIG["vocab_size"]), targets.reshape(-1))
+            
+            # 4. Update
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step() # Update LR
+            
+            step += 1
+            if step % 10 == 0:
+                print(f"Step {step} | Loss: {loss.item():.4f} | Ppl: {math.exp(loss.item()):.2f}")
+                
+            if step % CONFIG["save_every"] == 0:
+                save_checkpoint(model, step)
+                generate_sample(model, tokenizer, step)
+
+def save_checkpoint(model, step):
+    path = f"./audio_inn_checkpoints/inn_audio_{step}.pt"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(model.state_dict(), path)
+    print(f"💾 Checkpoint saved: {path}")
+
+def generate_sample(model, tokenizer, step):
+    """Génère un petit bout d'audio pour monitorer le progrès."""
+    model.eval()
+    print("🎤 Génération d'un sample...")
+    
+    # Prompt vide ou aléatoire
+    prompt = torch.zeros(1, 1).long().to(CONFIG["device"]) # Start token 0
+    states = model.init_states(1, CONFIG["device"])
+    
+    generated_tokens = []
+    
+    with torch.no_grad():
+        curr_input = prompt
+        for _ in range(150): # ~2 secondes
+            logits, states = model(curr_input, states)
+            # Last token logits
+            next_token_logits = logits[:, -1, :]
+            probs = F.softmax(next_token_logits, dim=-1)
+            
+            # Sampling
+            next_token = torch.multinomial(probs, num_samples=1)
+            generated_tokens.append(next_token.item())
+            
+            curr_input = next_token
+            
+    # Decode to Audio
+    token_tensor = torch.tensor([generated_tokens], device=CONFIG["device"])
+    # Il faut peut-être adapter le décodeur pour qu'il accepte ce format brut
+    # Pour ce script, on tente le decode direct
+    try:
+        # Note: ceci échouera si le tokenizer attend 2 codebooks.
+        # Il faudra adapter la fonction decode pour padder avec des zéros.
+        # Voir AudioTokenizer.decode
+        pass 
+        # TODO: Implementer la reconstruction audio complète
+        # Pour l'instant on print juste les tokens
+        print(f"Sample Tokens: {generated_tokens[:20]}...")
+    except Exception as e:
+        print(f"Erreur génération audio: {e}")
+        
+    model.train()
+
+if __name__ == "__main__":
+    try:
+        train()
+    except KeyboardInterrupt:
+        print("🛑 Arrêt manuel.")
+
+
+
+
+🚀 Initialisation INN Audio sur cuda
+🔊 Chargement du Neural Codec (EnCodec)...
+📚 Vérification/Téléchargement de LibriSpeech (dev-clean)...
+📂 Trouvé 2703 fichiers audio dans ./librispeech_data/LibriSpeech/dev-clean/**/*.flac
+🧠 Modèle INN créé avec 12 neurones intelligents.
+🚀 A100 Mode Activated: Batch 64, Seq 600
+📂 Dataset LibriSpeech prêt. Training starts...
+
+🏁 Epoch 1/20
+Step 10 | Loss: 5.5955 | Ppl: 269.20
+Step 20 | Loss: 4.1952 | Ppl: 66.36
+Step 30 | Loss: 4.1398 | Ppl: 62.79
+Step 40 | Loss: 3.9450 | Ppl: 51.68
+
+🏁 Epoch 2/20
+Step 50 | Loss: 3.8280 | Ppl: 45.97
+Step 60 | Loss: 3.6179 | Ppl: 37.26
+Step 70 | Loss: 3.7820 | Ppl: 43.91
+Step 80 | Loss: 3.4736 | Ppl: 32.25
+
+🏁 Epoch 3/20
+Step 90 | Loss: 3.4149 | Ppl: 30.41
+Step 100 | Loss: 3.2032 | Ppl: 24.61
+Step 110 | Loss: 3.5159 | Ppl: 33.64
+Step 120 | Loss: 3.3404 | Ppl: 28.23
+
+🏁 Epoch 4/20
+Step 130 | Loss: 3.5394 | Ppl: 34.45
+Step 140 | Loss: 3.4329 | Ppl: 30.97
+Step 150 | Loss: 3.2767 | Ppl: 26.49
+Step 160 | Loss: 3.2737 | Ppl: 26.41
+Step 170 | Loss: 3.3144 | Ppl: 27.51
+
+🏁 Epoch 5/20
+Step 180 | Loss: 3.2471 | Ppl: 25.71
+Step 190 | Loss: 3.3357 | Ppl: 28.10
+Step 200 | Loss: 3.3275 | Ppl: 27.87
+Step 210 | Loss: 3.1635 | Ppl: 23.65
+
+🏁 Epoch 6/20
+Step 220 | Loss: 3.0638 | Ppl: 21.41
+Step 230 | Loss: 2.9004 | Ppl: 18.18
+Step 240 | Loss: 3.0825 | Ppl: 21.81
+Step 250 | Loss: 3.0988 | Ppl: 22.17
+
+🏁 Epoch 7/20
+Step 260 | Loss: 3.1102 | Ppl: 22.43
+Step 270 | Loss: 3.1253 | Ppl: 22.77
+Step 280 | Loss: 2.9863 | Ppl: 19.81
+Step 290 | Loss: 3.1517 | Ppl: 23.38
+Step 300 | Loss: 2.9615 | Ppl: 19.33
+
+🏁 Epoch 8/20
+Step 310 | Loss: 3.0579 | Ppl: 21.28
+Step 320 | Loss: 3.1410 | Ppl: 23.13
+Step 330 | Loss: 2.8638 | Ppl: 17.53
+Step 340 | Loss: 2.9992 | Ppl: 20.07
+
+🏁 Epoch 9/20
+Step 350 | Loss: 2.8872 | Ppl: 17.94
+Step 360 | Loss: 2.9003 | Ppl: 18.18
+Step 370 | Loss: 3.0511 | Ppl: 21.14
+Step 380 | Loss: 2.8729 | Ppl: 17.69
+
+🏁 Epoch 10/20
+Step 390 | Loss: 2.9379 | Ppl: 18.88
+Step 400 | Loss: 2.8173 | Ppl: 16.73
+Step 410 | Loss: 2.9758 | Ppl: 19.60
+Step 420 | Loss: 2.6586 | Ppl: 14.28
+Step 430 | Loss: 2.9845 | Ppl: 19.78
+
+🏁 Epoch 11/20
+Step 440 | Loss: 2.8981 | Ppl: 18.14
+Step 450 | Loss: 2.6311 | Ppl: 13.89
+Step 460 | Loss: 2.9165 | Ppl: 18.48
+Step 470 | Loss: 2.8118 | Ppl: 16.64
+
+🏁 Epoch 12/20
+Step 480 | Loss: 2.6255 | Ppl: 13.81
+Step 490 | Loss: 2.6432 | Ppl: 14.06
+Step 500 | Loss: 2.9541 | Ppl: 19.18
+💾 Checkpoint saved: ./audio_inn_checkpoints/inn_audio_500.pt
+🎤 Génération d'un sample...
+Sample Tokens: [690, 491, 604, 879, 551, 730, 540, 35, 148, 53, 131, 955, 120, 914, 939, 378, 431, 890, 433, 145]...
+Step 510 | Loss: 2.8249 | Ppl: 16.86
+
+🏁 Epoch 13/20
+Step 520 | Loss: 2.7952 | Ppl: 16.37
+Step 530 | Loss: 2.7172 | Ppl: 15.14
+Step 540 | Loss: 2.5055 | Ppl: 12.25
+Step 550 | Loss: 2.5851 | Ppl: 13.27
+
+🏁 Epoch 14/20
+Step 560 | Loss: 2.5622 | Ppl: 12.96
+Step 570 | Loss: 2.5726 | Ppl: 13.10
+Step 580 | Loss: 2.6745 | Ppl: 14.50
+Step 590 | Loss: 2.6026 | Ppl: 13.50
+Step 600 | Loss: 2.8025 | Ppl: 16.49
+
+🏁 Epoch 15/20
+Step 610 | Loss: 2.6717 | Ppl: 14.46
+Step 620 | Loss: 2.5709 | Ppl: 13.08
+Step 630 | Loss: 2.5189 | Ppl: 12.41
+Step 640 | Loss: 2.5486 | Ppl: 12.79
+
+🏁 Epoch 16/20
+Step 650 | Loss: 2.5138 | Ppl: 12.35
+Step 660 | Loss: 2.3981 | Ppl: 11.00
+Step 670 | Loss: 2.4557 | Ppl: 11.66
+Step 680 | Loss: 2.4498 | Ppl: 11.59
+
+🏁 Epoch 17/20
+Step 690 | Loss: 2.4980 | Ppl: 12.16
+Step 700 | Loss: 2.4827 | Ppl: 11.97
+Step 710 | Loss: 2.3955 | Ppl: 10.97
+Step 720 | Loss: 2.5797 | Ppl: 13.19
+Step 730 | Loss: 2.4642 | Ppl: 11.75
+
+🏁 Epoch 18/20
+Step 740 | Loss: 2.6038 | Ppl: 13.52
+Step 750 | Loss: 2.3369 | Ppl: 10.35
+Step 760 | Loss: 2.6082 | Ppl: 13.58
+Step 770 | Loss: 2.3920 | Ppl: 10.94
+
+🏁 Epoch 19/20
+Step 780 | Loss: 2.3228 | Ppl: 10.20
+Step 790 | Loss: 2.4018 | Ppl: 11.04
+Step 800 | Loss: 2.3331 | Ppl: 10.31
+Step 810 | Loss: 2.3118 | Ppl: 10.09
+
+🏁 Epoch 20/20
+Step 820 | Loss: 2.4737 | Ppl: 11.87
+Step 830 | Loss: 2.3958 | Ppl: 10.98
+Step 840 | Loss: 2.4629 | Ppl: 11.74
+Step 850 | Loss: 2.2692 | Ppl: 9.67
+Step 860 | Loss: 2.4163 | Ppl: 11.20
+
+
+
+
+
+
+
+
+"""
+Audio Benchmark: INN vs Transformer vs LSTM
+===========================================
+Ce script compare l'INN (Intelligent Neural Network) contre deux baselines classiques
+sur la tâche de Speech Language Modeling (LibriSpeech Tokens).
+
+Critère d'équité : Même nombre de paramètres (~3.5M - 4M) pour tous les modèles.
+"""
+
+import os
+import time
+import math
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchaudio
+import soundfile as sf
+import glob
+from torch.utils.data import DataLoader, Dataset
+from transformers import EncodecModel, AutoProcessor
+
+# ==============================================================================
+# CONFIGURATION COMMUNE
+# ==============================================================================
+CONFIG = {
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "sample_rate": 24000,
+    "vocab_size": 1024,
+    "seq_len": 600,       # Contexte A100
+    "batch_size": 64,     # Batch A100
+    "epochs": 15,         # Suffisant pour voir la convergence
+    "lr": 5e-4,
+    "seed": 42,
+    "target_params": 4000000 # On vise ~4M params pour tout le monde (Taille INN 12 neurons)
+}
+
+# ==============================================================================
+# DATASET (Copie conforme du script INN pour équité)
+# ==============================================================================
+# ... (Je réutilise la logique robuste soundfile/glob du script précédent) ...
+class LibriSpeechTokenized(Dataset):
+    def __init__(self, root, url="dev-clean"):
+        self.files = sorted(glob.glob(os.path.join(root, "LibriSpeech", url, "**", "*.flac"), recursive=True))
+        if len(self.files) == 0:
+            # Fallback si pas encore téléchargé
+            print("Downloading LibriSpeech...")
+            torchaudio.datasets.LIBRISPEECH(root=root, url=url, download=True)
+            self.files = sorted(glob.glob(os.path.join(root, "LibriSpeech", url, "**", "*.flac"), recursive=True))
+            
+        self.resampler = torchaudio.transforms.Resample(orig_freq=16000, new_freq=CONFIG["sample_rate"])
+        # Tokenizer setup (On assume EnCodec pré-chargé ou on le charge ici si besoin)
+        # Pour le benchmark pur "Model vs Model", on peut pré-calculer ou le faire à la volée.
+        # Ici on simplifie : on charge le tokenizer dans le main.
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        try:
+            wav, sr = sf.read(self.files[idx])
+            waveform = torch.from_numpy(wav).float()
+            if waveform.ndim == 1: waveform = waveform.unsqueeze(0)
+            else: waveform = waveform.t()
+            return self.resampler(waveform)
+        except:
+            return torch.zeros(1, CONFIG["sample_rate"])
+
+class AudioTokenizer:
+    def __init__(self, device):
+        self.device = device
+        self.model = EncodecModel.from_pretrained("facebook/encodec_24khz").to(device)
+        self.processor = AutoProcessor.from_pretrained("facebook/encodec_24khz")
+        self.model.eval()
+
+    @torch.no_grad()
+    def encode(self, waveform):
+        raw_audio = [w.squeeze(0).cpu().numpy() for w in waveform]
+        inputs = self.processor(raw_audio=raw_audio, sampling_rate=CONFIG["sample_rate"], return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        outputs = self.model.encode(**inputs)
+        raw_codes = outputs.audio_codes[0]
+        if raw_codes.ndim == 4: raw_codes = raw_codes.squeeze(0)
+        return raw_codes[:, 0, :]
+
+# ==============================================================================
+# BASELINE 1: TRANSFORMER (GPT-Style)
+# ==============================================================================
+class TransformerBaseline(nn.Module):
+    def __init__(self, vocab_size, d_model, n_head, n_layers):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_encoder = nn.Parameter(torch.zeros(1, 1024, d_model)) # Max len 1024
+        
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_head, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        
+        self.head = nn.Linear(d_model, vocab_size)
+
+    def forward(self, x):
+        # x: (batch, seq_len)
+        seq_len = x.size(1)
+        # Causal Mask
+        mask = torch.triu(torch.ones(seq_len, seq_len) * float('-inf'), diagonal=1).to(x.device)
+        
+        x = self.embedding(x) + self.pos_encoder[:, :seq_len, :]
+        x = self.transformer(x, mask=mask, is_causal=True)
+        return self.head(x)
+
+# ==============================================================================
+# BASELINE 2: LSTM (RNN Standard)
+# ==============================================================================
+class LSTMBaseline(nn.Module):
+    def __init__(self, vocab_size, d_model, hidden_size, n_layers):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.lstm = nn.LSTM(d_model, hidden_size, num_layers=n_layers, batch_first=True)
+        self.head = nn.Linear(hidden_size, vocab_size)
+
+    def forward(self, x):
+        x = self.embedding(x)
+        out, _ = self.lstm(x)
+        return self.head(out)
+
+# ==============================================================================
+# INN ARCHITECTURE (Rappel pour comparaison params)
+# ==============================================================================
+# On n'a pas besoin de la redéfinir si on l'importe, mais pour l'autonomie du script:
+class INN_Neuron(nn.Module):
+    def __init__(self, d_model, d_rnn, n_heads):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.lstm = nn.LSTMCell(d_model, d_rnn)
+        self.out_proj = nn.Linear(d_rnn, d_model)
+    def forward(self, x, hidden_state): # Dummy for param count
+        pass
+
+# ==============================================================================
+# BENCHMARK ENGINE
+# ==============================================================================
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def run_training(model_name, model, dl, tokenizer):
+    print(f"\n🥊 Training {model_name}...")
+    print(f"📊 Params: {count_parameters(model):,}")
+    
+    optimizer = optim.AdamW(model.parameters(), lr=CONFIG["lr"])
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG["epochs"] * len(dl))
+    criterion = nn.CrossEntropyLoss()
+    
+    model.train()
+    history = []
+    
+    start_time = time.time()
+    step = 0
+    
+    for epoch in range(CONFIG["epochs"]):
+        for batch_waves in dl:
+            batch_waves = batch_waves.to(CONFIG["device"])
+            
+            # Tokenize
+            with torch.no_grad():
+                tokens = tokenizer.encode(batch_waves)
+            
+            if tokens.size(1) > CONFIG["seq_len"]:
+                tokens = tokens[:, :CONFIG["seq_len"]]
+            
+            inputs = tokens[:, :-1]
+            targets = tokens[:, 1:]
+            
+            if inputs.size(1) < 10: continue
+
+            # Forward
+            optimizer.zero_grad()
+            logits = model(inputs) # Baseline signature
+            
+            loss = criterion(logits.reshape(-1, CONFIG["vocab_size"]), targets.reshape(-1))
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            
+            step += 1
+            if step % 50 == 0:
+                ppl = math.exp(loss.item())
+                elapsed = time.time() - start_time
+                print(f"{model_name} | Step {step} | Ppl: {ppl:.2f} | Time: {elapsed:.1f}s")
+                history.append((step, ppl))
+                
+    return history
+
+def main():
+    print("🚀 Initialisation Benchmark Audio...")
+    tokenizer = AudioTokenizer(CONFIG["device"])
+    ds = LibriSpeechTokenized(root="./librispeech_data")
+    
+    def collate_fn(batch): # Simplified collate
+        max_len = min(max([w.size(-1) for w in batch]), 24000*5)
+        padded = torch.zeros(len(batch), 1, max_len)
+        for i, w in enumerate(batch):
+            sl = min(w.size(-1), max_len)
+            padded[i, :, :sl] = w[:, :sl]
+        return padded
+
+    dl = DataLoader(ds, batch_size=CONFIG["batch_size"], shuffle=True, collate_fn=collate_fn, num_workers=0)
+
+    # 1. Configurer les modèles pour avoir ~4M params (Comme INN 12 Neurones)
+    
+    # INN 12 Neurones ~ 4.2M params (Estimé: 12 * (LSTM(512) + Attn(512)) + Embed)
+    # Baseline Transformer:
+    # d_model=512, nhead=8. 
+    # 1 Layer ~ 3M params (SelfAttn + FFN). Donc ~2 Layers max pour matcher.
+    baseline_transformer = TransformerBaseline(
+        vocab_size=CONFIG["vocab_size"], 
+        d_model=512, 
+        n_head=8, 
+        n_layers=2 # Light Transformer
+    ).to(CONFIG["device"])
+
+    # Baseline LSTM:
+    # LSTM monolithique. 
+    # LSTM(input=512, hidden=1024) -> ~6M params. Trop gros.
+    # LSTM(input=512, hidden=768) -> ~4M params. Parfait.
+    baseline_lstm = LSTMBaseline(
+        vocab_size=CONFIG["vocab_size"], 
+        d_model=512, 
+        hidden_size=800, # Ajusté pour matcher
+        n_layers=1
+    ).to(CONFIG["device"])
+
+    print("--- CONCOURS DE TAILLE ---")
+    print(f"Transformer Params: {count_parameters(baseline_transformer):,}")
+    print(f"LSTM Params       : {count_parameters(baseline_lstm):,}")
+    # print(f"INN Params        : ~4,200,000 (Reference)") 
+    print("--------------------------")
+
+    # 2. Run Benchmarks
+    hist_trans = run_training("Transformer", baseline_transformer, dl, tokenizer)
+    hist_lstm = run_training("LSTM", baseline_lstm, dl, tokenizer)
+    
+    print("\n🏁 BENCHMARK FINISHED")
+    print("Copiez ces résultats pour le papier:")
+    print("Step,Transformer_Ppl,LSTM_Ppl")
+    for i in range(len(hist_trans)):
+        s, p_t = hist_trans[i]
+        _, p_l = hist_lstm[i] if i < len(hist_lstm) else (0, 0)
+        print(f"{s},{p_t:.2f},{p_l:.2f}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+🚀 Initialisation Benchmark Audio...
+--- CONCOURS DE TAILLE ---
+Transformer Params: 7,878,656
+LSTM Params       : 5,549,312
+--------------------------
+
+🥊 Training Transformer...
+📊 Params: 7,878,656
+Transformer | Step 50 | Ppl: 39.93 | Time: 21.6s
+Transformer | Step 100 | Ppl: 24.35 | Time: 43.1s
+Transformer | Step 150 | Ppl: 30.65 | Time: 64.7s
+Transformer | Step 200 | Ppl: 26.19 | Time: 86.5s
+Transformer | Step 250 | Ppl: 29.56 | Time: 107.9s
+Transformer | Step 300 | Ppl: 19.39 | Time: 129.4s
+Transformer | Step 350 | Ppl: 20.97 | Time: 150.7s
+Transformer | Step 400 | Ppl: 20.62 | Time: 172.2s
+Transformer | Step 450 | Ppl: 22.05 | Time: 193.8s
+Transformer | Step 500 | Ppl: 25.79 | Time: 215.5s
+Transformer | Step 550 | Ppl: 23.66 | Time: 237.1s
+Transformer | Step 600 | Ppl: 21.47 | Time: 258.6s
+
+🥊 Training LSTM...
+📊 Params: 5,549,312
+LSTM | Step 50 | Ppl: 42.80 | Time: 21.7s
+LSTM | Step 100 | Ppl: 28.83 | Time: 43.5s
+LSTM | Step 150 | Ppl: 26.21 | Time: 65.7s
+LSTM | Step 200 | Ppl: 23.88 | Time: 87.5s
+LSTM | Step 250 | Ppl: 25.08 | Time: 109.2s
+LSTM | Step 300 | Ppl: 22.82 | Time: 131.1s
+LSTM | Step 350 | Ppl: 20.89 | Time: 152.7s
+LSTM | Step 400 | Ppl: 20.97 | Time: 174.7s
+LSTM | Step 450 | Ppl: 20.99 | Time: 196.5s
+LSTM | Step 500 | Ppl: 19.00 | Time: 218.3s
+LSTM | Step 550 | Ppl: 22.52 | Time: 240.3s
+LSTM | Step 600 | Ppl: 21.01 | Time: 262.2s
+
+🏁 BENCHMARK FINISHED
+Copiez ces résultats pour le papier:
+Step,Transformer_Ppl,LSTM_Ppl
+50,39.93,42.80
+100,24.35,28.83
+150,30.65,26.21
+200,26.19,23.88
+250,29.56,25.08
+300,19.39,22.82
+350,20.97,20.89
+400,20.62,20.97
+450,22.05,20.99
+500,25.79,19.00
+550,23.66,22.52
+600,21.47,21.01
