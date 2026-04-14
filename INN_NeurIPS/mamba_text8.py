@@ -1,0 +1,266 @@
+# =============================================================================
+# EXP-1 · Mamba Stack (matched params ~4.1M) vs INN — Text8 100M
+# =============================================================================
+# Repris de benchmark_mamba_full.py (le script qui a produit 3.438 BPC dans
+# le papier). UNE SEULE modification : d_model 256 → 320 pour équilibrer
+# le budget de paramètres avec INN (4.1M vs 2.5M dans le papier).
+#
+# Références papier (Table II, non réentraînées) :
+#   · INN 4.1M         → 1.705 BPC
+#   · MambaStack 2.5M  → 3.438 BPC  ← produit par benchmark_mamba_full.py
+#
+# Résultat attendu : si le Mamba 4.1M diverge aussi → la topologie est
+# la vraie raison de la stabilité, pas le budget de paramètres. ✓
+#
+# Requiert mamba-ssm (A100 recommandé) :
+#   pip install packaging ninja
+#   pip install causal-conv1d>=1.1.0 --no-build-isolation
+#   pip install mamba-ssm --no-build-isolation
+# =============================================================================
+
+import torch
+import torch.autograd
+import torch.nn as nn
+import math
+import time
+import os
+import requests
+import zipfile
+import numpy as np
+import json
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+try:
+    from mamba_ssm import Mamba
+    print("✅ Mamba-SSM CUDA Kernel detected!")
+except ImportError:
+    print("❌ Mamba-SSM not found. Please install via:")
+    print("   pip install packaging ninja")
+    print("   pip install causal-conv1d>=1.1.0 --no-build-isolation")
+    print("   pip install mamba-ssm --no-build-isolation")
+    exit()
+
+# === CONFIGURATION (MATCHING INN EXACTLY + matched params) ===
+CONFIG = {
+    'dataset': 'text8',
+    'vocab_size': 27,
+    'd_model': 320,        # ← MODIFIÉ : 256→320 pour matched params (~4.1M)
+    'n_layers': 6,         # Same depth as INN
+    'dropout': 0.1,
+    'lr': 4e-4,            # Same LR
+    'batch_size': 16,      # Same Batch Size
+    'seq_len': 256,        # Same Context Window
+    'epochs': 1,           # Same Duration (1 epoch on 100M)
+    'subset_size': 100000000, # FULL DATASET
+    'grad_clip': 1.0,
+    'save_every': 5000
+}
+
+device = torch.device("cuda")
+print(f"=== LAUNCHING MAMBA BASELINE (FULL TEXT8) ===")
+print(f"Config: {CONFIG}")
+
+# === DATA LOADING (Shared Logic) ===
+class Text8Corpus:
+    def __init__(self, path, subset_size=None):
+        if not os.path.exists(path):
+            self.download(path)
+        print("Loading text8...")
+        with open(path, 'r') as f: data = f.read()
+        if subset_size: data = data[:subset_size]
+        
+        chars = sorted(list(set(data)))
+        self.vocab_size = len(chars)
+        self.char_to_idx = {ch: i for i, ch in enumerate(chars)}
+        self.train_data = torch.tensor([self.char_to_idx[ch] for ch in data], dtype=torch.long)
+        
+        n = len(self.train_data)
+        train_end = int(n * 0.90)
+        self.valid = self.train_data[train_end:]
+        self.train = self.train_data[:train_end]
+        print(f"Train: {len(self.train):,} | Valid: {len(self.valid):,}")
+
+    def download(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        url = "http://mattmahoney.net/dc/text8.zip"
+        r = requests.get(url)
+        with open("data/text8.zip", "wb") as f: f.write(r.content)
+        with zipfile.ZipFile("data/text8.zip", "r") as z: z.extractall("data")
+
+def get_batch(data, i, seq_len):
+    seq_len = min(seq_len, len(data) - 1 - i)
+    x = data[i:i+seq_len]
+    y = data[i+1:i+1+seq_len]
+    return x.t().to(device), y.t().to(device)
+
+def batchify(data, bsz):
+    nbatch = data.size(0) // bsz
+    data = data.narrow(0, 0, nbatch * bsz)
+    data = data.view(bsz, -1).t().contiguous()
+    return data
+
+# === MAMBA PURE MODEL ===
+class MambaBaseline(nn.Module):
+    def __init__(self, vocab_size, d_model, n_layers, dropout=0.1):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.layers = nn.ModuleList()
+        
+        for _ in range(n_layers):
+            # Standard Mamba Block structure (Pre-Norm usually handled inside or outside)
+            # Here we mimic INN structure: Norm -> Mamba -> Add
+            self.layers.append(nn.ModuleList([
+                nn.LayerNorm(d_model),
+                Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2)
+            ]))
+            
+        self.norm_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size)
+        self.head.weight = self.embedding.weight # Tying weights like INN
+
+    def forward(self, x):
+        # x: (L, B) -> (B, L) for Mamba (batch_first=True usually preferred by Mamba)
+        x = x.transpose(0, 1) 
+        x = self.embedding(x)
+        
+        for norm, mamba in self.layers:
+            x_norm = norm(x)
+            x = x + mamba(x_norm) # Residual connection
+            
+        x = self.norm_f(x)
+        logits = self.head(x)
+        # (B, L, V) -> (L, B, V) to match target shape
+        return logits.transpose(0, 1)
+
+# === TRAINING LOOP ===
+if __name__ == "__main__":
+    os.makedirs("models", exist_ok=True)
+    corpus = Text8Corpus("data/text8", subset_size=CONFIG['subset_size'])
+    
+    model = MambaBaseline(CONFIG['vocab_size'], CONFIG['d_model'], CONFIG['n_layers']).to(device)
+    print(f"Mamba Params: {sum(p.numel() for p in model.parameters()):,}")
+    
+    opt = torch.optim.AdamW(model.parameters(), lr=CONFIG['lr'])
+    train_data = batchify(corpus.train, CONFIG['batch_size'])
+    valid_data = batchify(corpus.valid, CONFIG['batch_size'])
+    
+    # Exact same scheduler as INN
+    batches_per_epoch = len(range(0, train_data.size(0)-1, CONFIG['seq_len']))
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=CONFIG['lr'], total_steps=batches_per_epoch)
+    crit = nn.CrossEntropyLoss()
+    
+    print(f"Starting training for {batches_per_epoch} steps...")
+    model.train()
+    total_loss = 0
+    start = time.time()
+    tokens = 0
+    
+    try:
+        for batch, i in enumerate(range(0, train_data.size(0)-1, CONFIG['seq_len'])):
+            x, y = get_batch(train_data, i, CONFIG['seq_len'])
+            
+            opt.zero_grad()
+            logits = model(x)
+            loss = crit(logits.reshape(-1, CONFIG['vocab_size']), y.reshape(-1))
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG['grad_clip'])
+            opt.step()
+            sched.step()
+            
+            total_loss += loss.item() * len(x) * x.size(1)
+            tokens += len(x) * x.size(1)
+            
+            if (batch+1) % 100 == 0:
+                elapsed = time.time() - start
+                print(f"Batch {batch+1} | Loss: {loss.item():.4f} | BPC: {loss.item()/math.log(2):.3f} | Speed: {tokens/elapsed:.0f} tok/s")
+                start = time.time()
+                tokens = 0
+                
+            if (batch+1) % CONFIG['save_every'] == 0:
+                torch.save(model.state_dict(), f"models/mamba_text8_step{batch+1}.pth")
+                
+    except KeyboardInterrupt:
+        print("Stop.")
+        
+    # Final Eval
+    print("Evaluating...")
+    model.eval()
+    val_loss = 0
+    val_tokens = 0
+    with torch.no_grad():
+        for i in range(0, valid_data.size(0)-1, CONFIG['seq_len']):
+            x, y = get_batch(valid_data, i, CONFIG['seq_len'])
+            loss = crit(model(x).reshape(-1, CONFIG['vocab_size']), y.reshape(-1))
+            val_loss += loss.item() * x.numel()
+            val_tokens += x.numel()
+            
+    final_bpc = (val_loss/val_tokens)/math.log(2)
+    print(f"Valid BPC: {final_bpc:.4f}")
+
+    # ── Résultats & figure ────────────────────────────────────────────────────
+    INN_REFERENCE  = {"label": "INN (4.1M) [papier]",       "bpc": 1.705, "params": 4_120_832}
+    MAMBA_ORIGINAL = {"label": "MambaStack (2.5M) [papier]", "bpc": 3.438, "params": 2_538_752}
+    params_matched = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    print(f"\n{'═'*55}")
+    print(f"  INN 4.1M        [papier]  BPC = {INN_REFERENCE['bpc']:.4f}  ✓")
+    print(f"  MambaStack 2.5M [papier]  BPC = {MAMBA_ORIGINAL['bpc']:.4f}  ✗ diverged")
+    print(f"  MambaStack {params_matched/1e6:.1f}M [EXP-1]  BPC = {final_bpc:.4f}  {'✗ diverged' if final_bpc > 2.5 else '✓ converged'}")
+    print(f"  Params matched  : {params_matched:,} vs INN {INN_REFERENCE['params']:,} ({abs(INN_REFERENCE['params']-params_matched)/INN_REFERENCE['params']*100:.1f}% écart)")
+    print(f"{'═'*55}")
+
+    # Sauvegarde JSON
+    with open("exp1_results.json", "w") as f:
+        json.dump({
+            "inn_reference"  : INN_REFERENCE,
+            "mamba_original" : MAMBA_ORIGINAL,
+            "mamba_matched"  : {"params": params_matched, "valid_bpc": final_bpc},
+            "config"         : CONFIG,
+        }, f, indent=2)
+    print("Résultats sauvegardés : exp1_results.json")
+
+    # Figure
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle("EXP-1 · MambaStack matched params vs INN — Text8 100M\n"
+                 "Protocole identique : AdamW, OneCycleLR, lr=4e-4, batch=16, seq=256",
+                 fontsize=12, fontweight="bold")
+    ax = axes[0]
+    ax.axhline(y=INN_REFERENCE["bpc"], color="#2563EB", linewidth=2,
+               label=f"INN 4.1M [papier] → {INN_REFERENCE['bpc']:.3f}")
+    ax.axhline(y=MAMBA_ORIGINAL["bpc"], color="#9CA3AF", linewidth=1.5, linestyle=":",
+               label=f"MambaStack 2.5M [papier] → {MAMBA_ORIGINAL['bpc']:.3f}")
+    ax.axhline(y=final_bpc, color="#DC2626", linewidth=2, linestyle="--",
+               label=f"MambaStack {params_matched/1e6:.1f}M [EXP-1] → {final_bpc:.3f}")
+    ax.set_xlabel("—"); ax.set_ylabel("Valid BPC")
+    ax.set_title("Résultat final"); ax.legend(fontsize=10); ax.grid(True, alpha=0.3)
+    ax.set_ylim(bottom=1.0)
+    ax2 = axes[1]
+    labels = ["INN 4.1M\n[papier]", "MambaStack 2.5M\n[papier]",
+              f"MambaStack {params_matched/1e6:.1f}M\n[EXP-1]"]
+    bpcs   = [INN_REFERENCE["bpc"], MAMBA_ORIGINAL["bpc"], final_bpc]
+    colors = ["#2563EB", "#9CA3AF", "#DC2626"]
+    bars   = ax2.barh(labels, bpcs, color=colors, height=0.5, alpha=0.88)
+    bars[1].set_hatch("//"); bars[2].set_hatch("..")
+    for bar, bpc in zip(bars, bpcs):
+        ax2.text(bpc + 0.02, bar.get_y() + bar.get_height() / 2,
+                 f"{bpc:.3f}", va="center", fontsize=11, fontweight="bold")
+    ax2.set_xlabel("Valid BPC (↓ better)"); ax2.set_title("Comparaison finale")
+    ax2.grid(True, alpha=0.3, axis="x"); ax2.invert_yaxis()
+    plt.tight_layout()
+    plt.savefig("exp1_training_curves.png", dpi=150, bbox_inches="tight")
+    print("Figure sauvegardée : exp1_training_curves.png")
+
+    print("\n→ Conclusion pour le papier :")
+    if final_bpc > 2.5:
+        print(f"  MambaStack diverge même à {params_matched/1e6:.1f}M params ({final_bpc:.3f} BPC).")
+        print(f"  → Topologie = vraie raison de la stabilité. Argument R1/R2 neutralisé. ✓")
+        print(f"\n  Phrase pour le papier :")
+        print(f"  \"A parameter-matched Mamba Stack ({params_matched/1e6:.1f}M params) trained")
+        print(f"  under the identical protocol also fails to converge ({final_bpc:.3f} BPC),")
+        print(f"  ruling out parameter budget as a confound for the instability.\"")
+    else:
+        print(f"  MambaStack converge à {params_matched/1e6:.1f}M ({final_bpc:.3f} BPC).")
+        print(f"  → Nuancer l'argument de stabilité dans le papier.")
